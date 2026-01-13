@@ -76,7 +76,7 @@ jobs:
 
       - name: Publish framework-dependent
         run: |
-          dotnet publish src/RazorLS.Server -c Release --no-self-contained -o publish
+          dotnet publish src/RazorLS.Server -c Release --no-self-contained -p:PublishSingleFile=false -o publish
 
       - name: Create zip
         run: |
