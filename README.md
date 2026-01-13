@@ -2,7 +2,7 @@
 
 A standalone, IDE-agnostic Language Server Protocol (LSP) server for Razor files (`.razor`, `.cshtml`). Provides language features like completions, hover, go-to-definition, and more for Razor/Blazor development in any LSP-compatible editor.
 
-I made this because I didn't want to wait for Microsoft to release an official solution and because [selyng/roslyn.nvim](https://github.com/seblyng/roslyn.nvim) only works with Neovim. This project is heavily inspired by selyng/roslyn.nvim.
+I made this because I didn't want to wait for Microsoft to release an official solution and because [seblyng/roslyn.nvim](https://github.com/seblyng/roslyn.nvim) only works with Neovim. This project is heavily inspired by seblyng/roslyn.nvim.
 
 By the way, if you're looking for a Tree-sitter parser for Razor files, check out [mine](https://github.com/jlcrochet/tree-sitter-razor).
 
@@ -91,6 +91,21 @@ configs.razorls = {
 lspconfig.razorls.setup({})
 ```
 
+<details>
+<summary>Portable version</summary>
+
+```lua
+configs.razorls = {
+  default_config = {
+    cmd = { 'dotnet', '/path/to/razorls.dll' },
+    filetypes = { 'razor' },
+    root_dir = lspconfig.util.root_pattern('*.sln', '*.csproj'),
+  },
+}
+```
+
+</details>
+
 ### Helix
 
 Add to `~/.config/helix/languages.toml`:
@@ -106,6 +121,24 @@ file-types = ["razor", "cshtml"]
 language-servers = ["razorls"]
 roots = ["*.sln", "*.csproj"]
 ```
+
+<details>
+<summary>Portable version</summary>
+
+```toml
+[language-server.razorls]
+command = "dotnet"
+args = ["/path/to/razorls.dll"]
+
+[[language]]
+name = "razor"
+scope = "source.razor"
+file-types = ["razor", "cshtml"]
+language-servers = ["razorls"]
+roots = ["*.sln", "*.csproj"]
+```
+
+</details>
 
 ### Other Editors
 
