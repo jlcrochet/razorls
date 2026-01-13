@@ -99,19 +99,19 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create checksums
+      - name: Prepare release files
         run: |
-          cd artifacts
-          find . -type f -name 'razorls-*' -exec mv {} . \;
-          sha256sum razorls-* > checksums.txt
+          mkdir -p release
+          # Move files from artifact directories to release folder
+          find artifacts -type f \( -name 'razorls-*' -o -name '*.zip' \) -exec mv {} release/ \;
+          cd release
+          sha256sum * > checksums.txt
           cat checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/razorls-*
-            artifacts/checksums.txt
+          files: release/*
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref, '-') }}
