@@ -8,31 +8,27 @@ By the way, if you're looking for a Tree-sitter parser for Razor files, check ou
 
 ## Installation
 
+### Requirements
+
+- **.NET 10+** - Required for both RazorLS and the Roslyn Language Server dependencies it downloads
+- **Node.js** - Optional, for HTML language server support (see [HTML Language Server](#html-language-server))
+
 ### Pre-built binaries
 
 Download the latest release for your platform from the [Releases](https://github.com/jlcrochet/razorls/releases) page:
 
 | Platform | Download |
 |----------|----------|
-| Linux x64 | `razorls-linux-x64` |
-| Linux ARM64 | `razorls-linux-arm64` |
-| macOS x64 (Intel) | `razorls-osx-x64` |
-| macOS ARM64 (Apple Silicon) | `razorls-osx-arm64` |
-| Windows x64 | `razorls-win-x64.exe` |
-| Portable (.NET required) | `razorls-portable.zip` |
-
-The standalone binaries include the .NET runtime (~65MB). If you already have .NET 10+ installed, use the portable version (~2MB) instead:
+| Linux x64 | `razorls-linux-x64.zip` |
+| Linux ARM64 | `razorls-linux-arm64.zip` |
+| macOS x64 (Intel) | `razorls-osx-x64.zip` |
+| macOS ARM64 (Apple Silicon) | `razorls-osx-arm64.zip` |
+| Windows x64 | `razorls-win-x64.zip` |
 
 ```bash
-# Portable: extract and run with dotnet
-unzip razorls-portable.zip -d ~/.local/share/razorls
+# Extract and install
+unzip razorls-linux-x64.zip -d ~/.local/share/razorls
 # Run with: dotnet ~/.local/share/razorls/razorls.dll
-```
-
-```bash
-# Standalone: make executable and move to PATH
-chmod +x razorls-linux-x64
-sudo mv razorls-linux-x64 /usr/local/bin/razorls
 ```
 
 ### Building from source
@@ -82,7 +78,7 @@ local configs = require('lspconfig.configs')
 
 configs.razorls = {
   default_config = {
-    cmd = { 'razorls' },  -- assumes razorls is in PATH
+    cmd = { 'dotnet', '/path/to/razorls.dll' },
     filetypes = { 'razor' },
     root_dir = lspconfig.util.root_pattern('*.sln', '*.csproj'),
   },
@@ -91,39 +87,9 @@ configs.razorls = {
 lspconfig.razorls.setup({})
 ```
 
-<details>
-<summary>Portable version</summary>
-
-```lua
-configs.razorls = {
-  default_config = {
-    cmd = { 'dotnet', '/path/to/razorls.dll' },
-    filetypes = { 'razor' },
-    root_dir = lspconfig.util.root_pattern('*.sln', '*.csproj'),
-  },
-}
-```
-
-</details>
-
 ### Helix
 
 Add to `~/.config/helix/languages.toml`:
-
-```toml
-[language-server.razorls]
-command = "razorls"
-
-[[language]]
-name = "razor"
-scope = "source.razor"
-file-types = ["razor", "cshtml"]
-language-servers = ["razorls"]
-roots = ["*.sln", "*.csproj"]
-```
-
-<details>
-<summary>Portable version</summary>
 
 ```toml
 [language-server.razorls]
@@ -138,12 +104,10 @@ language-servers = ["razorls"]
 roots = ["*.sln", "*.csproj"]
 ```
 
-</details>
-
 ### Other Editors
 
 Configure your editor's LSP client to:
-1. Run `razorls`
+1. Run `dotnet /path/to/razorls.dll`
 2. Use `stdio` transport
 3. Associate with `.razor` and `.cshtml` files
 
@@ -216,7 +180,8 @@ The HTML language server is enabled by default. To disable it, configure your ed
 
 ```toml
 [language-server.razorls]
-command = "razorls"
+command = "dotnet"
+args = ["/path/to/razorls.dll"]
 config = { html = { enable = false } }
 ```
 
