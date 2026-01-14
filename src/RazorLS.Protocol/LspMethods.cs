@@ -69,6 +69,7 @@ public static class LspMethods
     public const string WindowLogMessage = "window/logMessage";
     public const string WindowWorkDoneProgressCreate = "window/workDoneProgress/create";
     public const string WindowWorkDoneProgressCancel = "window/workDoneProgress/cancel";
+    public const string Progress = "$/progress";
 
     // Diagnostics
     public const string TextDocumentPublishDiagnostics = "textDocument/publishDiagnostics";

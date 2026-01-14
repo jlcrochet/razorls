@@ -284,4 +284,5 @@ public class ConfigurationLoader
             SuppressDotnetRestoreNotification = overlay.SuppressDotnetRestoreNotification ?? baseOpts.SuppressDotnetRestoreNotification
         };
     }
+
 }

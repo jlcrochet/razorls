@@ -4,27 +4,23 @@ using RazorLS.Dependencies;
 using RazorLS.Protocol;
 using RazorLS.Protocol.Messages;
 using RazorLS.Server.Configuration;
-using RazorLS.Server.Html;
 using RazorLS.Server.Roslyn;
-using RazorLS.Server.VirtualDocuments;
 using RazorLS.Server.Workspace;
 using StreamJsonRpc;
 
 namespace RazorLS.Server;
 
 /// <summary>
-/// The main Razor language server that orchestrates Roslyn and HTML language services.
+/// The main Razor language server that orchestrates communication with Roslyn.
 /// </summary>
 public class RazorLanguageServer : IAsyncDisposable
 {
     private readonly ILogger<RazorLanguageServer> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly DependencyManager _dependencyManager;
-    private readonly VirtualDocumentManager _documentManager;
     private readonly WorkspaceManager _workspaceManager;
     private readonly ConfigurationLoader _configurationLoader;
     private RoslynRawClient? _roslynClient;
-    private HtmlLanguageClient? _htmlClient;
     private JsonRpc? _clientRpc;
     private InitializeParams? _initParams;
     private string? _cliSolutionPath;
@@ -42,7 +38,6 @@ public class RazorLanguageServer : IAsyncDisposable
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<RazorLanguageServer>();
         _dependencyManager = dependencyManager;
-        _documentManager = new VirtualDocumentManager(loggerFactory.CreateLogger<VirtualDocumentManager>());
         _workspaceManager = new WorkspaceManager(loggerFactory.CreateLogger<WorkspaceManager>());
         _configurationLoader = new ConfigurationLoader(loggerFactory.CreateLogger<ConfigurationLoader>());
     }
@@ -158,18 +153,10 @@ public class RazorLanguageServer : IAsyncDisposable
 
         _logger.LogInformation("Roslyn initialized");
 
-        // Start HTML language service
-        _htmlClient = new HtmlLanguageClient(
-            _loggerFactory.CreateLogger<HtmlLanguageClient>(),
-            _documentManager);
-
-        await _htmlClient.StartAsync(ct);
-        await _htmlClient.InitializeAsync(@params?.RootUri, ct);
-
-        // Wire up HTML content updates
-        _documentManager.HtmlContentUpdated += OnHtmlContentUpdated;
-
-        return CreateInitializeResult();
+        var result = CreateInitializeResult();
+        _logger.LogDebug("Server capabilities: DiagnosticProvider = {DiagProvider}",
+            result.Capabilities?.DiagnosticProvider != null ? "enabled" : "disabled");
+        return result;
     }
 
     [JsonRpcMethod(LspMethods.Initialized, UseSingleObjectParameterDeserialization = true)]
@@ -256,10 +243,6 @@ public class RazorLanguageServer : IAsyncDisposable
         var uri = @params.TextDocument.Uri;
         _logger.LogDebug("Document opened: {Uri} (language: {Lang})", uri, @params.TextDocument.LanguageId);
 
-        // Track in our document manager
-        _documentManager.Open(uri, @params.TextDocument.LanguageId,
-            @params.TextDocument.Version, @params.TextDocument.Text);
-
         // Wait for Roslyn project to be initialized before forwarding documents
         // Documents opened before project initialization won't have proper context
         if (_roslynClient != null)
@@ -287,32 +270,7 @@ public class RazorLanguageServer : IAsyncDisposable
     [JsonRpcMethod(LspMethods.TextDocumentDidChange, UseSingleObjectParameterDeserialization = true)]
     public async Task HandleDidChangeAsync(JsonElement paramsJson)
     {
-        var @params = JsonSerializer.Deserialize<DidChangeTextDocumentParams>(paramsJson.GetRawText(), JsonOptions);
-        if (@params == null) return;
-
-        var uri = @params.TextDocument.Uri;
-
-        // Get full content from incremental changes
-        if (_documentManager.TryGet(uri, out var doc) && doc != null)
-        {
-            var content = doc.Content;
-            foreach (var change in @params.ContentChanges)
-            {
-                if (change.Range == null)
-                {
-                    // Full document replace
-                    content = change.Text;
-                }
-                else
-                {
-                    // Incremental change - apply it
-                    content = ApplyChange(content, change);
-                }
-            }
-            _documentManager.Update(uri, @params.TextDocument.Version, content);
-        }
-
-        // Forward to Roslyn
+        // Forward to Roslyn - it handles document state internally
         if (_roslynClient != null)
         {
             await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidChange, paramsJson);
@@ -327,14 +285,6 @@ public class RazorLanguageServer : IAsyncDisposable
 
         var uri = @params.TextDocument.Uri;
         _logger.LogDebug("Document closed: {Uri}", uri);
-
-        // Get virtual URI before removing
-        if (_documentManager.TryGet(uri, out var doc) && doc != null && _htmlClient != null)
-        {
-            await _htmlClient.DidCloseAsync(doc.VirtualHtmlUri);
-        }
-
-        _documentManager.Close(uri);
 
         // Forward to Roslyn
         if (_roslynClient != null)
@@ -452,6 +402,18 @@ public class RazorLanguageServer : IAsyncDisposable
     public Task<JsonElement?> HandleExecuteCommandAsync(JsonElement @params, CancellationToken ct)
         => ForwardToRoslynAsync(LspMethods.WorkspaceExecuteCommand, @params, ct);
 
+    [JsonRpcMethod(LspMethods.TextDocumentDiagnostic, UseSingleObjectParameterDeserialization = true)]
+    public async Task<JsonElement?> HandleDiagnosticAsync(JsonElement @params, CancellationToken ct)
+    {
+        _logger.LogDebug("Forwarding textDocument/diagnostic to Roslyn");
+        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, @params, ct);
+        if (result.HasValue)
+        {
+            _logger.LogDebug("Received diagnostic response from Roslyn");
+        }
+        return result;
+    }
+
     #endregion
 
     #region Roslyn Event Handlers
@@ -466,16 +428,20 @@ public class RazorLanguageServer : IAsyncDisposable
             {
                 switch (e.Method)
                 {
-                    case LspMethods.RazorUpdateHtml:
-                        await HandleRazorUpdateHtmlAsync(e.Params);
-                        break;
-
                     case LspMethods.RazorLog:
                         HandleRazorLog(e.Params);
                         break;
 
                     case LspMethods.TextDocumentPublishDiagnostics:
                         // Forward diagnostics to client
+                        if (e.Params.HasValue)
+                        {
+                            var uri = e.Params.Value.TryGetProperty("uri", out var uriProp) ? uriProp.GetString() : "unknown";
+                            var diagCount = e.Params.Value.TryGetProperty("diagnostics", out var diags) && diags.ValueKind == JsonValueKind.Array
+                                ? diags.GetArrayLength()
+                                : 0;
+                            _logger.LogInformation("Publishing {Count} diagnostics for {Uri}", diagCount, uri);
+                        }
                         await ForwardNotificationToClientAsync(e.Method, e.Params);
                         break;
 
@@ -487,6 +453,11 @@ public class RazorLanguageServer : IAsyncDisposable
                     case "window/logMessage":
                     case "window/showMessage":
                         // Forward window messages to client
+                        await ForwardNotificationToClientAsync(e.Method, e.Params);
+                        break;
+
+                    case LspMethods.Progress:
+                        // Forward progress notifications to client for status bar spinners
                         await ForwardNotificationToClientAsync(e.Method, e.Params);
                         break;
 
@@ -504,39 +475,14 @@ public class RazorLanguageServer : IAsyncDisposable
 
     private async Task<JsonElement?> OnRoslynRequestAsync(string method, JsonElement? @params, long requestId, CancellationToken ct)
     {
-        // Roslyn sends "reverse" requests for HTML content
-        // These need to be forwarded to the HTML language server
         _logger.LogDebug("Roslyn reverse request: {Method}", method);
-
-        if (@params == null || _htmlClient == null)
-        {
-            return null;
-        }
 
         try
         {
-            // Parse the forwarded request format: { textDocument, checksum, request }
-            if (@params.Value.TryGetProperty("textDocument", out var textDocElem) &&
-                @params.Value.TryGetProperty("checksum", out var checksumElem) &&
-                @params.Value.TryGetProperty("request", out var requestElem))
+            // Handle progress creation requests - forward to editor for status bar spinners
+            if (method == LspMethods.WindowWorkDoneProgressCreate)
             {
-                var uri = textDocElem.GetProperty("uri").GetString();
-                var checksum = checksumElem.GetString();
-
-                if (uri != null && checksum != null)
-                {
-                    var doc = _documentManager.GetWithValidChecksum(uri, checksum);
-                    if (doc != null)
-                    {
-                        // Modify the request to use the virtual HTML URI
-                        var modifiedRequest = ModifyRequestForHtml(requestElem, doc.VirtualHtmlUri);
-                        return await _htmlClient.SendRequestAsync(method, modifiedRequest, ct);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Checksum mismatch for {Uri}", uri);
-                    }
-                }
+                return await ForwardRequestToClientAsync(method, @params, ct);
             }
         }
         catch (Exception ex)
@@ -545,32 +491,6 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         return null;
-    }
-
-    private Task HandleRazorUpdateHtmlAsync(JsonElement? @params)
-    {
-        if (@params == null)
-        {
-            return Task.CompletedTask;
-        }
-
-        try
-        {
-            var uri = @params.Value.GetProperty("textDocument").GetProperty("uri").GetString();
-            var checksum = @params.Value.GetProperty("checksum").GetString();
-            var text = @params.Value.GetProperty("text").GetString();
-
-            if (uri != null && checksum != null && text != null)
-            {
-                _documentManager.UpdateHtmlContent(uri, checksum, text);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error handling razor/updateHtml");
-        }
-
-        return Task.CompletedTask;
     }
 
     private void HandleRazorLog(JsonElement? @params)
@@ -597,24 +517,6 @@ public class RazorLanguageServer : IAsyncDisposable
         catch
         {
             // Ignore log parsing errors
-        }
-    }
-
-#pragma warning disable VSTHRD100 // Avoid async void methods - event handlers require async void
-    private async void OnHtmlContentUpdated(object? sender, HtmlContentUpdatedEventArgs e)
-#pragma warning restore VSTHRD100
-    {
-        // Notify HTML language server about the updated content
-        if (_htmlClient != null && _documentManager.TryGet(e.Uri, out var doc) && doc != null)
-        {
-            try
-            {
-                await _htmlClient.DidChangeAsync(doc);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error updating HTML content in HTML LS");
-            }
         }
     }
 
@@ -668,6 +570,23 @@ public class RazorLanguageServer : IAsyncDisposable
         else
         {
             await _clientRpc.NotifyAsync(method);
+        }
+    }
+
+    private async Task<JsonElement?> ForwardRequestToClientAsync(string method, JsonElement? @params, CancellationToken ct)
+    {
+        if (_clientRpc == null)
+        {
+            return null;
+        }
+
+        if (@params.HasValue)
+        {
+            return await _clientRpc.InvokeWithParameterObjectAsync<JsonElement?>(method, @params.Value, ct);
+        }
+        else
+        {
+            return await _clientRpc.InvokeAsync<JsonElement?>(method, ct);
         }
     }
 
@@ -840,6 +759,11 @@ public class RazorLanguageServer : IAsyncDisposable
                 {
                     dynamicRegistration = true,
                     resolveSupport = new { properties = new[] { "tooltip", "textEdits", "label.tooltip", "label.location", "label.command" } }
+                },
+                diagnostic = new
+                {
+                    dynamicRegistration = true,
+                    relatedDocumentSupport = true
                 }
             }
         };
@@ -913,66 +837,16 @@ public class RazorLanguageServer : IAsyncDisposable
                     Full = true,
                     Range = true
                 },
-                InlayHintProvider = true
+                InlayHintProvider = true,
+                DiagnosticProvider = new DiagnosticOptions
+                {
+                    Identifier = "razorls",
+                    InterFileDependencies = true,
+                    WorkspaceDiagnostics = false
+                }
             },
             ServerInfo = new ServerInfo("RazorLS", "0.1.0")
         };
-    }
-
-    private static string ApplyChange(string content, Protocol.Types.TextDocumentContentChangeEvent change)
-    {
-        if (change.Range == null)
-        {
-            return change.Text;
-        }
-
-        var lines = content.Split('\n');
-        var startLine = change.Range.Start.Line;
-        var startChar = change.Range.Start.Character;
-        var endLine = change.Range.End.Line;
-        var endChar = change.Range.End.Character;
-
-        // Build the new content
-        var before = string.Join('\n', lines.Take(startLine));
-        if (startLine < lines.Length)
-        {
-            var startLineContent = lines[startLine];
-            if (startChar < startLineContent.Length)
-            {
-                before += (startLine > 0 ? "\n" : "") + startLineContent[..startChar];
-            }
-        }
-
-        var after = "";
-        if (endLine < lines.Length)
-        {
-            var endLineContent = lines[endLine];
-            if (endChar < endLineContent.Length)
-            {
-                after = endLineContent[endChar..];
-            }
-            if (endLine + 1 < lines.Length)
-            {
-                after += "\n" + string.Join('\n', lines.Skip(endLine + 1));
-            }
-        }
-
-        return before + change.Text + after;
-    }
-
-    private static JsonElement ModifyRequestForHtml(JsonElement request, string virtualUri)
-    {
-        // Clone the request and replace the textDocument.uri with the virtual HTML URI
-        var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(request.GetRawText())!;
-
-        if (dict.TryGetValue("textDocument", out var textDoc))
-        {
-            var textDocDict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(textDoc.GetRawText())!;
-            textDocDict["uri"] = JsonSerializer.Deserialize<JsonElement>($"\"{virtualUri}\"");
-            dict["textDocument"] = JsonSerializer.Deserialize<JsonElement>(JsonSerializer.Serialize(textDocDict));
-        }
-
-        return JsonSerializer.Deserialize<JsonElement>(JsonSerializer.Serialize(dict));
     }
 
     #endregion
@@ -985,11 +859,6 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         _disposed = true;
-
-        if (_htmlClient != null)
-        {
-            await _htmlClient.DisposeAsync();
-        }
 
         if (_roslynClient != null)
         {

@@ -287,12 +287,17 @@ public class RoslynRawClient : IAsyncDisposable
                     var sectionName = section.GetString() ?? "";
                     _logger.LogDebug("Config section requested: {Section}", sectionName);
 
-                    // First check hardcoded Razor-specific settings (required for cohosting)
+                    // First check hardcoded settings (required for cohosting and diagnostics)
                     var value = sectionName switch
                     {
                         "razor.format.code_block_brace_on_next_line" => (object?)false,
                         "razor.completion.commit_elements_with_space" => (object?)true,
                         "razor" => new { language_server = new { cohosting_enabled = true } },
+                        // Enable diagnostics for open documents by default
+                        "csharp|background_analysis.dotnet_compiler_diagnostics_scope" => "openFiles",
+                        "csharp|background_analysis.dotnet_analyzer_diagnostics_scope" => "openFiles",
+                        "visual_basic|background_analysis.dotnet_compiler_diagnostics_scope" => "openFiles",
+                        "visual_basic|background_analysis.dotnet_analyzer_diagnostics_scope" => "openFiles",
                         _ => _configurationLoader?.GetConfigurationValue(sectionName)
                     };
                     results.Add(value);

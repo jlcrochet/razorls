@@ -200,15 +200,16 @@ You can also set `OMNISHARPHOME` environment variable to specify a custom global
 
 ## Architecture
 
-RazorLS acts as a proxy between your editor and two backend language servers:
+RazorLS acts as a proxy between your editor and the Roslyn Language Server:
 
 ```
 Editor (LSP client)
     |
     v (stdin/stdout)
 RazorLS
-    |-- Roslyn Language Server (C#/Razor features)
-    |-- HTML Language Server (HTML features)
+    |
+    v
+Roslyn Language Server (C#/Razor features)
 ```
 
 On first run, RazorLS automatically downloads the required Roslyn and Razor extension dependencies from the VS Code C# extension.
