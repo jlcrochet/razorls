@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Buffers.Text;
 using System.Text.Json;
 
@@ -6,10 +5,12 @@ namespace RazorLS.Server.Roslyn;
 
 /// <summary>
 /// Parses LSP messages from a stream.
-/// Optimized to parse JSON directly from bytes and uses ArrayPool to minimize allocations.
+/// Manages its own buffer internally and parses JSON directly from bytes.
 /// </summary>
 public class LspMessageParser
 {
+    byte[] _buffer = new byte[65536];
+    int _length;
     int _contentLength = -1;
 
     // "Content-Length:" as bytes for zero-allocation header parsing
@@ -18,19 +19,40 @@ public class LspMessageParser
     static ReadOnlySpan<byte> LineTerminator => "\r\n"u8;
 
     /// <summary>
+    /// Appends data to the internal buffer.
+    /// </summary>
+    public void Append(byte[] data, int count)
+    {
+        EnsureCapacity(count);
+        Buffer.BlockCopy(data, 0, _buffer, _length, count);
+        _length += count;
+    }
+
+    void EnsureCapacity(int additionalBytes)
+    {
+        var required = _length + additionalBytes;
+        if (required <= _buffer.Length) return;
+
+        var newSize = _buffer.Length;
+        while (newSize < required) newSize *= 2;
+
+        var newBuffer = new byte[newSize];
+        Buffer.BlockCopy(_buffer, 0, newBuffer, 0, _length);
+        _buffer = newBuffer;
+    }
+
+    /// <summary>
     /// Tries to parse a complete LSP message from the buffer.
     /// Returns true if a complete message was parsed, false if more data is needed.
     /// </summary>
-    public bool TryParseMessage(MemoryStream buffer, out JsonDocument? message)
+    public bool TryParseMessage(out JsonDocument? message)
     {
         message = null;
-        var data = buffer.GetBuffer();
-        var dataLength = (int)buffer.Length;
 
         // If we don't have content length yet, look for headers
         if (_contentLength < 0)
         {
-            var span = data.AsSpan(0, dataLength);
+            var span = _buffer.AsSpan(0, _length);
             var headerEnd = span.IndexOf(HeaderTerminator);
             if (headerEnd < 0) return false;
 
@@ -59,59 +81,30 @@ public class LspMessageParser
 
             // Remove headers from buffer
             var contentStart = headerEnd + 4;
-            var remainingLength = dataLength - contentStart;
+            var remainingLength = _length - contentStart;
             if (remainingLength > 0)
             {
-                var contentBytes = ArrayPool<byte>.Shared.Rent(remainingLength);
-                try
-                {
-                    Buffer.BlockCopy(data, contentStart, contentBytes, 0, remainingLength);
-                    buffer.SetLength(0);
-                    buffer.Write(contentBytes, 0, remainingLength);
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(contentBytes);
-                }
-                data = buffer.GetBuffer();
+                Buffer.BlockCopy(_buffer, contentStart, _buffer, 0, remainingLength);
             }
-            else
-            {
-                buffer.SetLength(0);
-            }
-            dataLength = remainingLength;
+            _length = remainingLength;
         }
 
         // Check if we have complete content
-        if (dataLength < _contentLength) return false;
+        if (_length < _contentLength) return false;
 
         // Parse JSON - must allocate since JsonDocument holds a reference to the backing array
         // and remains valid after this method returns
         var jsonBytes = new byte[_contentLength];
-        Buffer.BlockCopy(data, 0, jsonBytes, 0, _contentLength);
+        Buffer.BlockCopy(_buffer, 0, jsonBytes, 0, _contentLength);
         message = JsonDocument.Parse(jsonBytes);
 
         // Remove processed content from buffer
-        var restLength = dataLength - _contentLength;
+        var restLength = _length - _contentLength;
         if (restLength > 0)
         {
-            // Copy remaining data using pooled array
-            var remaining = ArrayPool<byte>.Shared.Rent(restLength);
-            try
-            {
-                Buffer.BlockCopy(data, _contentLength, remaining, 0, restLength);
-                buffer.SetLength(0);
-                buffer.Write(remaining, 0, restLength);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(remaining);
-            }
+            Buffer.BlockCopy(_buffer, _contentLength, _buffer, 0, restLength);
         }
-        else
-        {
-            buffer.SetLength(0);
-        }
+        _length = restLength;
         _contentLength = -1;
 
         return true;
