@@ -107,7 +107,6 @@ public class RoslynRawClient : IAsyncDisposable
     private async Task ReadMessagesAsync(CancellationToken ct)
     {
         var buffer = new byte[65536];
-        var messageBuffer = new MemoryStream();
         var parser = new LspMessageParser();
 
         try
@@ -117,10 +116,10 @@ public class RoslynRawClient : IAsyncDisposable
                 var bytesRead = await _process.StandardOutput.BaseStream.ReadAsync(buffer, ct);
                 if (bytesRead == 0) break;
 
-                messageBuffer.Write(buffer, 0, bytesRead);
+                parser.Append(buffer, bytesRead);
 
                 // Try to parse complete messages from buffer
-                while (parser.TryParseMessage(messageBuffer, out var message))
+                while (parser.TryParseMessage(out var message))
                 {
                     if (message != null)
                     {

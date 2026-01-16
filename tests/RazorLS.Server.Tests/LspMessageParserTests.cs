@@ -6,15 +6,11 @@ namespace RazorLS.Server.Tests;
 
 public class LspMessageParserTests
 {
-    // Helper to create a MemoryStream that exposes GetBuffer()
-    private static MemoryStream CreateBuffer(byte[] data)
+    private static void AppendToParser(LspMessageParser parser, string data)
     {
-        var buffer = new MemoryStream();
-        buffer.Write(data, 0, data.Length);
-        return buffer;
+        var bytes = Encoding.UTF8.GetBytes(data);
+        parser.Append(bytes, bytes.Length);
     }
-
-    private static MemoryStream CreateBuffer(string data) => CreateBuffer(Encoding.UTF8.GetBytes(data));
 
     [Fact]
     public void TryParseMessage_CompleteMessage_ReturnsTrue()
@@ -23,12 +19,12 @@ public class LspMessageParserTests
         var message = """{"jsonrpc":"2.0","id":1,"result":null}""";
         var expectedLength = Encoding.UTF8.GetByteCount(message);
         var lspMessage = $"Content-Length: {expectedLength}\r\n\r\n{message}";
-        var buffer = CreateBuffer(lspMessage);
+        AppendToParser(parser, lspMessage);
 
         // Debug: verify expected length
         Assert.Equal(38, expectedLength);
 
-        var result = parser.TryParseMessage(buffer, out var doc);
+        var result = parser.TryParseMessage(out var doc);
 
         Assert.True(result);
         Assert.NotNull(doc);
@@ -41,9 +37,9 @@ public class LspMessageParserTests
     public void TryParseMessage_IncompleteHeader_ReturnsFalse()
     {
         var parser = new LspMessageParser();
-        var buffer = CreateBuffer("Content-Length: 10\r\n");
+        AppendToParser(parser, "Content-Length: 10\r\n");
 
-        var result = parser.TryParseMessage(buffer, out var doc);
+        var result = parser.TryParseMessage(out var doc);
 
         Assert.False(result);
         Assert.Null(doc);
@@ -53,9 +49,9 @@ public class LspMessageParserTests
     public void TryParseMessage_IncompleteContent_ReturnsFalse()
     {
         var parser = new LspMessageParser();
-        var buffer = CreateBuffer("Content-Length: 100\r\n\r\n{\"partial\":");
+        AppendToParser(parser, "Content-Length: 100\r\n\r\n{\"partial\":");
 
-        var result = parser.TryParseMessage(buffer, out var doc);
+        var result = parser.TryParseMessage(out var doc);
 
         Assert.False(result);
         Assert.Null(doc);
@@ -69,22 +65,22 @@ public class LspMessageParserTests
         var msg2 = """{"id":2}""";
         var combined = $"Content-Length: {Encoding.UTF8.GetByteCount(msg1)}\r\n\r\n{msg1}" +
                        $"Content-Length: {Encoding.UTF8.GetByteCount(msg2)}\r\n\r\n{msg2}";
-        var buffer = CreateBuffer(combined);
+        AppendToParser(parser, combined);
 
         // First message
-        var result1 = parser.TryParseMessage(buffer, out var doc1);
+        var result1 = parser.TryParseMessage(out var doc1);
         Assert.True(result1);
         Assert.Equal(1, doc1!.RootElement.GetProperty("id").GetInt32());
         doc1.Dispose();
 
         // Second message
-        var result2 = parser.TryParseMessage(buffer, out var doc2);
+        var result2 = parser.TryParseMessage(out var doc2);
         Assert.True(result2);
         Assert.Equal(2, doc2!.RootElement.GetProperty("id").GetInt32());
         doc2.Dispose();
 
         // No more messages
-        var result3 = parser.TryParseMessage(buffer, out var doc3);
+        var result3 = parser.TryParseMessage(out var doc3);
         Assert.False(result3);
         Assert.Null(doc3);
     }
@@ -97,17 +93,19 @@ public class LspMessageParserTests
         var lspMessage = $"Content-Length: {Encoding.UTF8.GetByteCount(message)}\r\n\r\n{message}";
         var bytes = Encoding.UTF8.GetBytes(lspMessage);
 
-        var buffer = new MemoryStream();
-
         // Write first half
-        buffer.Write(bytes, 0, bytes.Length / 2);
-        var result1 = parser.TryParseMessage(buffer, out var doc1);
+        parser.Append(bytes, bytes.Length / 2);
+        var result1 = parser.TryParseMessage(out var doc1);
         Assert.False(result1);
         Assert.Null(doc1);
 
-        // Write second half (append to buffer)
-        buffer.Write(bytes, bytes.Length / 2, bytes.Length - bytes.Length / 2);
-        var result2 = parser.TryParseMessage(buffer, out var doc2);
+        // Write second half
+        var secondHalfStart = bytes.Length / 2;
+        var secondHalf = new byte[bytes.Length - secondHalfStart];
+        Buffer.BlockCopy(bytes, secondHalfStart, secondHalf, 0, secondHalf.Length);
+        parser.Append(secondHalf, secondHalf.Length);
+
+        var result2 = parser.TryParseMessage(out var doc2);
         Assert.True(result2);
         Assert.NotNull(doc2);
         Assert.Equal(1, doc2.RootElement.GetProperty("id").GetInt32());
@@ -122,9 +120,9 @@ public class LspMessageParserTests
         var largeContent = new string('x', 100000);
         var message = $$"""{"data":"{{largeContent}}"}""";
         var lspMessage = $"Content-Length: {Encoding.UTF8.GetByteCount(message)}\r\n\r\n{message}";
-        var buffer = CreateBuffer(lspMessage);
+        AppendToParser(parser, lspMessage);
 
-        var result = parser.TryParseMessage(buffer, out var doc);
+        var result = parser.TryParseMessage(out var doc);
 
         Assert.True(result);
         Assert.NotNull(doc);
@@ -139,9 +137,9 @@ public class LspMessageParserTests
         var message = """{"id":1}""";
         // Some LSP implementations send multiple headers
         var lspMessage = $"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {Encoding.UTF8.GetByteCount(message)}\r\n\r\n{message}";
-        var buffer = CreateBuffer(lspMessage);
+        AppendToParser(parser, lspMessage);
 
-        var result = parser.TryParseMessage(buffer, out var doc);
+        var result = parser.TryParseMessage(out var doc);
 
         Assert.True(result);
         Assert.NotNull(doc);
