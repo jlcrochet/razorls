@@ -443,29 +443,52 @@ public class RoslynRawClient : IAsyncDisposable
         await stream.FlushAsync();
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        if (_disposed) return ValueTask.CompletedTask;
+        if (_disposed) return;
         _disposed = true;
 
-        _readCts?.Cancel();
-        // Don't wait for read task - just kill the process
-
+        // Attempt graceful LSP shutdown first
         if (_process != null && !_process.HasExited)
         {
             try
             {
-                _process.Kill(entireProcessTree: true);
+                // Send shutdown request and wait for response
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await SendRequestAsync<object, object>("shutdown", new { }, cts.Token);
+
+                // Send exit notification
+                await SendNotificationAsync("exit", (object?)null);
+
+                // Wait briefly for process to exit gracefully
+                if (!_process.WaitForExit(2000))
+                {
+                    _logger.LogWarning("Roslyn did not exit gracefully, forcing termination");
+                    _process.Kill(entireProcessTree: true);
+                }
+                else
+                {
+                    _logger.LogDebug("Roslyn exited gracefully");
+                }
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore - process may already be dead
+                _logger.LogDebug(ex, "Error during graceful shutdown, forcing termination");
+                try
+                {
+                    _process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Ignore - process may already be dead
+                }
             }
+
             _process.Dispose();
             _process = null;
         }
 
-        return ValueTask.CompletedTask;
+        _readCts?.Cancel();
     }
 
     public static RoslynStartOptions CreateStartOptions(DependencyManager deps, string? logDirectory = null, string? logLevel = null)
