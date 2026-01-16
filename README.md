@@ -215,10 +215,6 @@ RazorSharp
     +---> HTML Language Server (HTML formatting, optional)
 ```
 
-On first run, RazorSharp automatically downloads:
-- **Roslyn Language Server** from [Crashdummyy/roslynLanguageServer](https://github.com/Crashdummyy/roslynLanguageServer) (platform-specific builds)
-- **Razor extension** from the VS Code C# extension
-
 ## Dependencies Cache
 
 Downloaded dependencies are stored in:
