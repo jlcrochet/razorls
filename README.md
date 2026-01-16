@@ -1,6 +1,6 @@
 # RazorSharp
 
-A standalone, IDE-agnostic Language Server Protocol (LSP) server for Razor files (`.razor`, `.cshtml`). Provides language features like completions, hover, go-to-definition, and more for Razor/Blazor development in any LSP-compatible editor.
+A standalone, IDE-agnostic Language Server Protocol (LSP) server for C# and Razor files. Provides language features like completions, hover, go-to-definition, and more for C#, Razor, and Blazor development in any LSP-compatible editor.
 
 I made this because I didn't want to wait for Microsoft to release an official solution and because [seblyng/roslyn.nvim](https://github.com/seblyng/roslyn.nvim) only works with Neovim. This project is heavily inspired by seblyng/roslyn.nvim.
 
@@ -20,7 +20,7 @@ Download `razorsharp.zip` from the [Releases](https://github.com/jlcrochet/razor
 ```bash
 # Extract and install
 unzip razorsharp.zip -d ~/.local/share/razorsharp
-# Run with: dotnet ~/.local/share/razorsharp/razorsharp.dll
+# Run with: dotnet ~/.local/share/razorsharp/razorsharp
 ```
 
 ### Building from source
@@ -48,7 +48,7 @@ dotnet run --project src/RazorSharp.Server -- [options]
 RazorSharp requires the Roslyn Language Server and Razor extension (~100MB) which must be downloaded before first use:
 
 ```bash
-dotnet /path/to/razorsharp.dll --download-dependencies
+dotnet /path/to/razorsharp --download-dependencies
 ```
 
 This only needs to be done once. Dependencies are cached in `~/.cache/razorsharp/` (see [Dependencies Cache](#dependencies-cache)).
@@ -82,7 +82,7 @@ local configs = require('lspconfig.configs')
 configs.razorsharp = {
   default_config = {
     cmd = { 'dotnet', '/path/to/razorsharp.dll' },
-    filetypes = { 'razor' },
+    filetypes = { 'cs', 'razor' },
     root_dir = lspconfig.util.root_pattern('*.sln', '*.csproj'),
   },
 }
@@ -100,6 +100,10 @@ command = "dotnet"
 args = ["/path/to/razorsharp.dll"]
 
 [[language]]
+name = "c-sharp"
+language-servers = ["razorsharp"]
+
+[[language]]
 name = "razor"
 scope = "source.razor"
 file-types = ["razor", "cshtml"]
@@ -110,9 +114,9 @@ roots = ["*.sln", "*.csproj"]
 ### Other Editors
 
 Configure your editor's LSP client to:
-1. Run `dotnet /path/to/razorsharp.dll`
+1. Run `dotnet /path/to/razorsharp`
 2. Use `stdio` transport
-3. Associate with `.razor` and `.cshtml` files
+3. Associate with `.cs`, `.razor`, and `.cshtml` files
 
 ## Configuration
 
