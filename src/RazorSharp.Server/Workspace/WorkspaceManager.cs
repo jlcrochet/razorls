@@ -24,6 +24,7 @@ public class WorkspaceManager
         while (directory != null)
         {
             var solutions = directory.GetFiles("*.sln");
+
             if (solutions.Length > 0)
             {
                 // If multiple solutions, prefer ones that match the directory name

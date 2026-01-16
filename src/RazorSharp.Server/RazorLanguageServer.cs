@@ -31,6 +31,9 @@ public class RazorLanguageServer : IAsyncDisposable
     string _logLevel = "Information";
     bool _disposed;
     readonly TaskCompletionSource _roslynProjectInitialized = new();
+    DateTime _workspaceOpenedAt;
+    readonly HashSet<string> _openDocuments = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, List<JsonElement>> _pendingChanges = new(StringComparer.OrdinalIgnoreCase);
 
     static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -186,9 +189,10 @@ public class RazorLanguageServer : IAsyncDisposable
         await _htmlClient.StartAsync(initOptions?.Html, ct);
         await _htmlClient.InitializeAsync(@params?.RootUri, ct);
 
-        // Wire up Roslyn notifications
+        // Wire up Roslyn events
         _roslynClient.NotificationReceived += OnRoslynNotification;
         _roslynClient.RequestReceived += OnRoslynRequestAsync;
+        _roslynClient.ProcessExited += OnRoslynProcessExited;
 
         // Forward initialize to Roslyn with cohosting enabled
         var roslynInitParams = CreateRoslynInitParams(@params);
@@ -196,6 +200,10 @@ public class RazorLanguageServer : IAsyncDisposable
             LspMethods.Initialize, roslynInitParams, ct);
 
         _logger.LogInformation("Roslyn initialized");
+        if (roslynResult.TryGetProperty("capabilities", out var caps))
+        {
+            _logger.LogTrace("Roslyn capabilities: {Caps}", caps.GetRawText());
+        }
 
         var result = CreateInitializeResult();
         _logger.LogDebug("Server capabilities: DiagnosticProvider = {DiagProvider}",
@@ -314,22 +322,43 @@ public class RazorLanguageServer : IAsyncDisposable
         };
         var roslynParamsJson = JsonSerializer.SerializeToElement(roslynParams, JsonOptions);
 
-        // Wait for Roslyn project to be initialized before forwarding documents
-        // Documents opened before project initialization won't have proper context
+        // Wait briefly for Roslyn project initialization, but don't block forever
+        // If not initialized yet, forward anyway - Roslyn will queue the document
         if (_roslynClient != null)
         {
-            try
+            if (!_roslynProjectInitialized.Task.IsCompleted)
             {
-                // Wait for project initialization with a timeout
-                _logger.LogDebug("Waiting for project initialization before forwarding didOpen...");
-                await _roslynProjectInitialized.Task.WaitAsync(TimeSpan.FromSeconds(60));
-                _logger.LogDebug("Forwarding didOpen to Roslyn for {Uri}", uri);
-                await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidOpen, roslynParamsJson);
+                try
+                {
+                    _logger.LogDebug("Waiting for project initialization before forwarding didOpen...");
+                    await _roslynProjectInitialized.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                }
+                catch (TimeoutException)
+                {
+                    _logger.LogDebug("Project not yet initialized, forwarding didOpen anyway for {Uri}", uri);
+                }
             }
-            catch (TimeoutException)
+
+            _logger.LogDebug("Forwarding didOpen to Roslyn for {Uri}", uri);
+            await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidOpen, roslynParamsJson);
+
+            // Track this document as open so we can forward didChange for it
+            _openDocuments.Add(uri);
+
+            // Replay any buffered changes that came in before didOpen was forwarded
+            List<JsonElement>? pendingChanges = null;
+            if (_pendingChanges.TryGetValue(uri, out pendingChanges))
             {
-                _logger.LogWarning("Timeout waiting for project initialization, forwarding didOpen anyway for {Uri}", uri);
-                await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidOpen, roslynParamsJson);
+                _pendingChanges.Remove(uri);
+            }
+
+            if (pendingChanges != null && pendingChanges.Count > 0)
+            {
+                _logger.LogDebug("Replaying {Count} buffered changes for {Uri}", pendingChanges.Count, uri);
+                foreach (var change in pendingChanges)
+                {
+                    await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidChange, change);
+                }
             }
         }
         else
@@ -356,10 +385,31 @@ public class RazorLanguageServer : IAsyncDisposable
     [JsonRpcMethod(LspMethods.TextDocumentDidChange, UseSingleObjectParameterDeserialization = true)]
     public async Task HandleDidChangeAsync(JsonElement paramsJson)
     {
-        // Forward to Roslyn - it handles document state internally
-        if (_roslynClient != null)
+        // Only forward didChange if we've already forwarded didOpen for this document
+        // Roslyn crashes if it receives didChange for a document it doesn't know about
+        if (_roslynClient != null && _roslynClient.IsRunning)
         {
-            await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidChange, paramsJson);
+            var uri = paramsJson.TryGetProperty("textDocument", out var td) && td.TryGetProperty("uri", out var u)
+                ? u.GetString() : null;
+
+            if (uri != null)
+            {
+                if (_openDocuments.Contains(uri))
+                {
+                    await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidChange, paramsJson);
+                }
+                else
+                {
+                    // Buffer the change to replay after didOpen is forwarded
+                    _logger.LogDebug("Buffering didChange for {Uri} - document not yet open in Roslyn", uri);
+                    if (!_pendingChanges.TryGetValue(uri, out var changes))
+                    {
+                        changes = new List<JsonElement>();
+                        _pendingChanges[uri] = changes;
+                    }
+                    changes.Add(paramsJson.Clone());
+                }
+            }
         }
     }
 
@@ -372,8 +422,12 @@ public class RazorLanguageServer : IAsyncDisposable
         var uri = @params.TextDocument.Uri;
         _logger.LogDebug("Document closed: {Uri}", uri);
 
+        // Remove from open document tracking and clean up pending changes
+        _openDocuments.Remove(uri);
+        _pendingChanges.Remove(uri);
+
         // Forward to Roslyn
-        if (_roslynClient != null)
+        if (_roslynClient != null && _roslynClient.IsRunning)
         {
             await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidClose, paramsJson);
         }
@@ -383,7 +437,7 @@ public class RazorLanguageServer : IAsyncDisposable
     public async Task HandleDidSaveAsync(JsonElement paramsJson)
     {
         // Forward to Roslyn
-        if (_roslynClient != null)
+        if (_roslynClient != null && _roslynClient.IsRunning)
         {
             await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidSave, paramsJson);
         }
@@ -618,8 +672,13 @@ public class RazorLanguageServer : IAsyncDisposable
     }
 
     [JsonRpcMethod(LspMethods.TextDocumentFormatting, UseSingleObjectParameterDeserialization = true)]
-    public Task<JsonElement?> HandleFormattingAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentFormatting, @params, ct);
+    public async Task<JsonElement?> HandleFormattingAsync(JsonElement @params, CancellationToken ct)
+    {
+        _logger.LogTrace("Formatting request params: {Params}", @params.GetRawText());
+        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentFormatting, @params, ct);
+        _logger.LogTrace("Formatting response: {Result}", result?.GetRawText() ?? "null");
+        return result;
+    }
 
     [JsonRpcMethod(LspMethods.TextDocumentRangeFormatting, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleRangeFormattingAsync(JsonElement @params, CancellationToken ct)
@@ -853,6 +912,13 @@ public class RazorLanguageServer : IAsyncDisposable
 
     #region Roslyn Event Handlers
 
+    private void OnRoslynProcessExited(object? sender, int exitCode)
+    {
+        _logger.LogError("Roslyn process exited unexpectedly with code {ExitCode}. Language features will be unavailable.", exitCode);
+        // Mark initialization as failed so new requests don't wait forever
+        _roslynProjectInitialized.TrySetException(new Exception($"Roslyn process exited with code {exitCode}"));
+    }
+
     private void OnRoslynNotification(object? sender, RoslynNotificationEventArgs e)
     {
         _logger.LogDebug("Received notification from Roslyn: {Method}", e.Method);
@@ -886,6 +952,14 @@ public class RazorLanguageServer : IAsyncDisposable
                         break;
 
                     case "window/logMessage":
+                        // Log window messages for debugging
+                        if (e.Params.HasValue && e.Params.Value.TryGetProperty("message", out var msgProp))
+                        {
+                            _logger.LogDebug("[Roslyn] {Message}", msgProp.GetString());
+                        }
+                        await ForwardNotificationToClientAsync(e.Method, e.Params);
+                        break;
+
                     case "window/showMessage":
                         // Forward window messages to client
                         await ForwardNotificationToClientAsync(e.Method, e.Params);
@@ -1102,14 +1176,37 @@ public class RazorLanguageServer : IAsyncDisposable
             return null;
         }
 
-        // Wait for Roslyn project to be fully initialized before forwarding requests
-        try
+        // Check if Roslyn is still running
+        if (!_roslynClient.IsRunning)
         {
-            await _roslynProjectInitialized.Task.WaitAsync(TimeSpan.FromSeconds(60), ct);
+            _logger.LogWarning("Cannot forward {Method} - Roslyn process has exited", method);
+            return null;
         }
-        catch (TimeoutException)
+
+        // Check if Roslyn project is initialized
+        // If not initialized yet, either wait briefly or proceed after a grace period
+        if (!_roslynProjectInitialized.Task.IsCompleted)
         {
-            _logger.LogWarning("Timeout waiting for Roslyn project initialization, proceeding anyway");
+            // After 15 seconds from workspace open, proceed anyway even without initialization
+            // This handles cases where Roslyn never sends projectInitializationComplete
+            var timeSinceOpen = DateTime.UtcNow - _workspaceOpenedAt;
+            if (timeSinceOpen < TimeSpan.FromSeconds(15))
+            {
+                try
+                {
+                    // Wait up to 5 seconds for initialization
+                    await _roslynProjectInitialized.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+                }
+                catch (TimeoutException)
+                {
+                    _logger.LogDebug("Project not yet initialized, cannot forward {Method}", method);
+                    return null;
+                }
+            }
+            else
+            {
+                _logger.LogDebug("Proceeding without initialization complete for {Method} (grace period elapsed)", method);
+            }
         }
 
         try
@@ -1118,6 +1215,12 @@ public class RazorLanguageServer : IAsyncDisposable
             var result = await _roslynClient.SendRequestAsync(method, @params, ct);
             _logger.LogDebug("Received response from Roslyn for {Method}", method);
             return result;
+        }
+        catch (IOException ex)
+        {
+            // Roslyn process died - don't propagate this as an LSP error
+            _logger.LogWarning("Roslyn process died while forwarding {Method}: {Message}", method, ex.Message);
+            return null;
         }
         catch (Exception ex)
         {
@@ -1167,6 +1270,7 @@ public class RazorLanguageServer : IAsyncDisposable
             return;
         }
 
+        _workspaceOpenedAt = DateTime.UtcNow;
         var rootPath = new Uri(rootUri).LocalPath;
         var solution = _workspaceManager.FindSolution(rootPath);
 
@@ -1180,10 +1284,11 @@ public class RazorLanguageServer : IAsyncDisposable
         }
         else
         {
+            // No solution file found - open projects directly
             var projects = _workspaceManager.FindProjects(rootPath);
             if (projects.Length > 0)
             {
-                _logger.LogInformation("Opening {Count} projects", projects.Length);
+                _logger.LogInformation("Opening {Count} projects directly", projects.Length);
                 await _roslynClient.SendNotificationAsync(LspMethods.ProjectOpen, new ProjectOpenParams
                 {
                     Projects = projects.Select(p => new Uri(p).AbsoluteUri).ToArray()

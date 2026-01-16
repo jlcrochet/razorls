@@ -25,7 +25,7 @@ for (int i = 0; i < args.Length; i++)
             }
             break;
         case "-v" or "--verbose":
-            logLevel = LogLevel.Debug;
+            logLevel = LogLevel.Trace;
             break;
         case "--logFile" when nextArg != null:
             logFile = args[++i];
@@ -164,7 +164,7 @@ static void PrintHelp()
         Options:
           -s|--source <path>       Solution or directory for RazorSharp to point at
           -l|--loglevel <level>    Set log level (Trace, Debug, Information, Warning, Error)
-          -v|--verbose             Set log level to Debug
+          -v|--verbose             Set log level to Trace
           --logFile <path>         Write logs to file instead of stderr
           -hpid|--hostPID <pid>    Host process ID (shutdown when host exits)
           --download-dependencies  Download dependencies and exit (does not start server)

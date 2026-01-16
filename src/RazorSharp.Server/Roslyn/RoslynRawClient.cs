@@ -26,6 +26,7 @@ public class RoslynRawClient : IAsyncDisposable
 
     public event EventHandler<RoslynNotificationEventArgs>? NotificationReceived;
     public event Func<string, JsonElement?, long, CancellationToken, Task<JsonElement?>>? RequestReceived;
+    public event EventHandler<int>? ProcessExited;
 
     public RoslynRawClient(ILogger<RoslynRawClient> logger)
     {
@@ -91,6 +92,30 @@ public class RoslynRawClient : IAsyncDisposable
                 {
                     _logger.LogDebug("[Roslyn stderr] {Line}", line);
                 }
+            }
+        }, cancellationToken);
+
+        // Monitor process exit
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _process.WaitForExitAsync(cancellationToken);
+                var exitCode = _process.ExitCode;
+                _logger.LogWarning("Roslyn process exited with code {ExitCode}", exitCode);
+
+                // Fail all pending requests
+                foreach (var kvp in _pendingRequests)
+                {
+                    kvp.Value.TrySetException(new IOException($"Roslyn process exited with code {exitCode}"));
+                }
+                _pendingRequests.Clear();
+
+                ProcessExited?.Invoke(this, exitCode);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected during shutdown
             }
         }, cancellationToken);
 
@@ -428,6 +453,7 @@ public class RoslynRawClient : IAsyncDisposable
     private async Task SendMessageAsync(object message)
     {
         if (_process == null) throw new InvalidOperationException("Process not started");
+        if (_process.HasExited) throw new IOException($"Roslyn process has exited (code {_process.ExitCode})");
 
         // Serialize directly to UTF-8 bytes (no intermediate string)
         var content = JsonSerializer.SerializeToUtf8Bytes(message, SendJsonOptions);
