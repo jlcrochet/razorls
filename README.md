@@ -204,6 +204,89 @@ lspconfig.razorsharp.setup({
 
 Disabling the HTML language server may improve startup times but it will break formatting.
 
+### LSP Initialization Options
+
+RazorSharp supports configuration via LSP `initializationOptions`. In Helix, this is the `config` key in `languages.toml`. These options allow you to enable/disable specific LSP capabilities and customize trigger characters.
+
+#### Available Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `html.enable` | bool | `true` | Enable/disable HTML language server |
+| `capabilities.completionProvider.enabled` | bool | `true` | Enable/disable completion |
+| `capabilities.completionProvider.triggerCharacters` | string[] | `[".", "<", "@", " ", "(", "\"", "'", "=", "/"]` | Characters that trigger completion (must be subset of default) |
+| `capabilities.hoverProvider` | bool | `true` | Enable/disable hover |
+| `capabilities.signatureHelpProvider.enabled` | bool | `true` | Enable/disable signature help |
+| `capabilities.signatureHelpProvider.triggerCharacters` | string[] | `["(", ","]` | Characters that trigger signature help |
+| `capabilities.signatureHelpProvider.retriggerCharacters` | string[] | `[")"]` | Characters that retrigger signature help |
+| `capabilities.definitionProvider` | bool | `true` | Enable/disable go to definition |
+| `capabilities.typeDefinitionProvider` | bool | `true` | Enable/disable go to type definition |
+| `capabilities.implementationProvider` | bool | `true` | Enable/disable go to implementation |
+| `capabilities.referencesProvider` | bool | `true` | Enable/disable find references |
+| `capabilities.documentHighlightProvider` | bool | `true` | Enable/disable document highlight |
+| `capabilities.documentSymbolProvider` | bool | `true` | Enable/disable document symbols |
+| `capabilities.codeActionProvider` | bool | `true` | Enable/disable code actions |
+| `capabilities.documentFormattingProvider` | bool | `true` | Enable/disable document formatting |
+| `capabilities.documentRangeFormattingProvider` | bool | `true` | Enable/disable range formatting |
+| `capabilities.documentOnTypeFormattingProvider.enabled` | bool | `true` | Enable/disable on-type formatting |
+| `capabilities.documentOnTypeFormattingProvider.firstTriggerCharacter` | string | `";"` | First trigger character for on-type formatting |
+| `capabilities.documentOnTypeFormattingProvider.moreTriggerCharacter` | string[] | `["}", "\n"]` | Additional trigger characters for on-type formatting |
+| `capabilities.renameProvider` | bool | `true` | Enable/disable rename |
+| `capabilities.foldingRangeProvider` | bool | `true` | Enable/disable folding range |
+| `capabilities.workspaceSymbolProvider` | bool | `true` | Enable/disable workspace symbol search |
+| `capabilities.semanticTokensProvider.enabled` | bool | `true` | Enable/disable semantic tokens |
+| `capabilities.semanticTokensProvider.range` | bool | `true` | Enable/disable range requests |
+| `capabilities.semanticTokensProvider.full` | bool | `true` | Enable/disable full document requests |
+| `capabilities.inlayHintProvider` | bool | `true` | Enable/disable inlay hints |
+
+#### Example: Disable completion on `(`
+
+To prevent completions from appearing immediately when typing `(` (useful to avoid large completion popups at function arguments):
+
+**Helix:**
+```toml
+[language-server.razorsharp]
+command = "dotnet"
+args = ["/path/to/razorsharp.dll"]
+config.capabilities.completionProvider.triggerCharacters = [".", "<", "@", " ", "\"", "'", "=", "/"]
+```
+
+**Neovim:**
+```lua
+lspconfig.razorsharp.setup({
+  init_options = {
+    capabilities = {
+      completionProvider = {
+        triggerCharacters = { ".", "<", "@", " ", "\"", "'", "=", "/" }
+      }
+    }
+  }
+})
+```
+
+#### Example: Disable inlay hints and semantic tokens
+
+**Helix:**
+```toml
+[language-server.razorsharp]
+command = "dotnet"
+args = ["/path/to/razorsharp.dll"]
+config.capabilities.inlayHintProvider = false
+config.capabilities.semanticTokensProvider.enabled = false
+```
+
+**Neovim:**
+```lua
+lspconfig.razorsharp.setup({
+  init_options = {
+    capabilities = {
+      inlayHintProvider = false,
+      semanticTokensProvider = { enabled = false }
+    }
+  }
+})
+```
+
 ## Architecture
 
 RazorSharp acts as a proxy between your editor and the Roslyn Language Server:

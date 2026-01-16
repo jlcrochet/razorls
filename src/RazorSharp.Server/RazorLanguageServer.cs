@@ -26,6 +26,7 @@ public class RazorLanguageServer : IAsyncDisposable
     RoslynRawClient? _roslynClient;
     JsonRpc? _clientRpc;
     InitializeParams? _initParams;
+    InitializationOptions? _initOptions;
     string? _cliSolutionPath;
     string? _workspaceRoot;
     string _logLevel = "Information";
@@ -167,8 +168,12 @@ public class RazorLanguageServer : IAsyncDisposable
             {
                 initOptions = JsonSerializer.Deserialize<InitializationOptions>(
                     @params.InitializationOptions.Value.GetRawText(), JsonOptions);
-                _logger.LogDebug("Parsed initializationOptions: html.enable={HtmlEnable}",
-                    initOptions?.Html?.Enable);
+                _initOptions = initOptions;
+                _logger.LogDebug("Parsed initializationOptions: html.enable={HtmlEnable}, capabilities.completionProvider.triggerCharacters={TriggerChars}",
+                    initOptions?.Html?.Enable,
+                    initOptions?.Capabilities?.CompletionProvider?.TriggerCharacters != null
+                        ? string.Join(",", initOptions.Capabilities.CompletionProvider.TriggerCharacters)
+                        : "default");
             }
             catch (JsonException ex)
             {
@@ -1458,6 +1463,92 @@ public class RazorLanguageServer : IAsyncDisposable
 
     private InitializeResult CreateInitializeResult()
     {
+        var caps = _initOptions?.Capabilities;
+
+        // Build completion provider if enabled (default: true)
+        CompletionOptions? completionProvider = null;
+        if (caps?.CompletionProvider?.Enabled != false)
+        {
+            string[] validTriggerCharacters = [".", "<", "@", " ", "(", "\"", "'", "=", "/"];
+            string[] triggerCharacters;
+
+            var customTriggers = caps?.CompletionProvider?.TriggerCharacters;
+            if (customTriggers != null)
+            {
+                // Validate that all custom trigger characters are valid
+                var invalidChars = customTriggers.Where(c => !validTriggerCharacters.Contains(c));
+                if (invalidChars.Any())
+                {
+                    _logger.LogWarning(
+                        "Invalid completionProvider.triggerCharacters: {Invalid}. Valid characters are: {Valid}",
+                        string.Join(", ", invalidChars.Select(c => $"\"{c}\"")),
+                        string.Join(", ", validTriggerCharacters.Select(c => $"\"{c}\"")));
+                }
+
+                // Only use valid characters from the custom list
+                triggerCharacters = customTriggers.Where(c => validTriggerCharacters.Contains(c)).ToArray();
+                _logger.LogDebug("Using custom completion trigger characters: {Triggers}", string.Join(", ", triggerCharacters));
+            }
+            else
+            {
+                triggerCharacters = validTriggerCharacters;
+            }
+
+            completionProvider = new CompletionOptions
+            {
+                TriggerCharacters = triggerCharacters,
+                ResolveProvider = true
+            };
+        }
+
+        // Build signature help provider if enabled (default: true)
+        SignatureHelpOptions? signatureHelpProvider = null;
+        if (caps?.SignatureHelpProvider?.Enabled != false)
+        {
+            signatureHelpProvider = new SignatureHelpOptions
+            {
+                TriggerCharacters = caps?.SignatureHelpProvider?.TriggerCharacters ?? ["(", ","],
+                RetriggerCharacters = caps?.SignatureHelpProvider?.RetriggerCharacters ?? [")"]
+            };
+        }
+
+        // Build document on-type formatting provider if enabled (default: true)
+        DocumentOnTypeFormattingOptions? documentOnTypeFormattingProvider = null;
+        if (caps?.DocumentOnTypeFormattingProvider?.Enabled != false)
+        {
+            documentOnTypeFormattingProvider = new DocumentOnTypeFormattingOptions
+            {
+                FirstTriggerCharacter = caps?.DocumentOnTypeFormattingProvider?.FirstTriggerCharacter ?? ";",
+                MoreTriggerCharacter = caps?.DocumentOnTypeFormattingProvider?.MoreTriggerCharacter ?? ["}", "\n"]
+            };
+        }
+
+        // Build semantic tokens provider if enabled (default: true)
+        SemanticTokensOptions? semanticTokensProvider = null;
+        if (caps?.SemanticTokensProvider?.Enabled != false)
+        {
+            semanticTokensProvider = new SemanticTokensOptions
+            {
+                Legend = new SemanticTokensLegend
+                {
+                    TokenTypes =
+                    [
+                        "namespace", "type", "class", "enum", "interface", "struct",
+                        "typeParameter", "parameter", "variable", "property", "enumMember",
+                        "event", "function", "method", "macro", "keyword", "modifier",
+                        "comment", "string", "number", "regexp", "operator", "decorator"
+                    ],
+                    TokenModifiers =
+                    [
+                        "declaration", "definition", "readonly", "static", "deprecated",
+                        "abstract", "async", "modification", "documentation", "defaultLibrary"
+                    ]
+                },
+                Full = caps?.SemanticTokensProvider?.Full ?? true,
+                Range = caps?.SemanticTokensProvider?.Range ?? true
+            };
+        }
+
         return new InitializeResult
         {
             Capabilities = new ServerCapabilities
@@ -1468,60 +1559,29 @@ public class RazorLanguageServer : IAsyncDisposable
                     Change = 2, // Incremental
                     Save = new SaveOptions { IncludeText = false }
                 },
-                CompletionProvider = new CompletionOptions
-                {
-                    TriggerCharacters = [".", "<", "@", " ", "(", "\"", "'", "=", "/"],
-                    ResolveProvider = true
-                },
-                HoverProvider = true,
-                SignatureHelpProvider = new SignatureHelpOptions
-                {
-                    TriggerCharacters = ["(", ","],
-                    RetriggerCharacters = [")"]
-                },
-                DefinitionProvider = true,
-                TypeDefinitionProvider = true,
-                ImplementationProvider = true,
-                ReferencesProvider = true,
-                DocumentHighlightProvider = true,
-                DocumentSymbolProvider = true,
-                CodeActionProvider = true,
+                CompletionProvider = completionProvider,
+                HoverProvider = caps?.HoverProvider ?? true,
+                SignatureHelpProvider = signatureHelpProvider,
+                DefinitionProvider = caps?.DefinitionProvider ?? true,
+                TypeDefinitionProvider = caps?.TypeDefinitionProvider ?? true,
+                ImplementationProvider = caps?.ImplementationProvider ?? true,
+                ReferencesProvider = caps?.ReferencesProvider ?? true,
+                DocumentHighlightProvider = caps?.DocumentHighlightProvider ?? true,
+                DocumentSymbolProvider = caps?.DocumentSymbolProvider ?? true,
+                CodeActionProvider = caps?.CodeActionProvider ?? true,
                 ExecuteCommandProvider = new ExecuteCommandOptions
                 {
                     // Empty array - we forward all commands to Roslyn
                     Commands = []
                 },
-                DocumentFormattingProvider = true,
-                DocumentRangeFormattingProvider = true,
-                DocumentOnTypeFormattingProvider = new DocumentOnTypeFormattingOptions
-                {
-                    FirstTriggerCharacter = ";",
-                    MoreTriggerCharacter = ["}", "\n"]
-                },
-                RenameProvider = true,
-                FoldingRangeProvider = true,
-                WorkspaceSymbolProvider = true,
-                SemanticTokensProvider = new SemanticTokensOptions
-                {
-                    Legend = new SemanticTokensLegend
-                    {
-                        TokenTypes =
-                        [
-                            "namespace", "type", "class", "enum", "interface", "struct",
-                            "typeParameter", "parameter", "variable", "property", "enumMember",
-                            "event", "function", "method", "macro", "keyword", "modifier",
-                            "comment", "string", "number", "regexp", "operator", "decorator"
-                        ],
-                        TokenModifiers =
-                        [
-                            "declaration", "definition", "readonly", "static", "deprecated",
-                            "abstract", "async", "modification", "documentation", "defaultLibrary"
-                        ]
-                    },
-                    Full = true,
-                    Range = true
-                },
-                InlayHintProvider = true,
+                DocumentFormattingProvider = caps?.DocumentFormattingProvider ?? true,
+                DocumentRangeFormattingProvider = caps?.DocumentRangeFormattingProvider ?? true,
+                DocumentOnTypeFormattingProvider = documentOnTypeFormattingProvider,
+                RenameProvider = caps?.RenameProvider ?? true,
+                FoldingRangeProvider = caps?.FoldingRangeProvider ?? true,
+                WorkspaceSymbolProvider = caps?.WorkspaceSymbolProvider ?? true,
+                SemanticTokensProvider = semanticTokensProvider,
+                InlayHintProvider = caps?.InlayHintProvider ?? true,
                 DiagnosticProvider = new DiagnosticOptions
                 {
                     Identifier = "razorsharp",
