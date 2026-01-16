@@ -31,8 +31,6 @@ public class RazorLanguageServer : IAsyncDisposable
     string _logLevel = "Information";
     bool _disposed;
     readonly TaskCompletionSource _roslynProjectInitialized = new();
-    // Track first opened document for warmup - prefer user's file over random workspace file
-    string? _firstOpenedDocumentUri;
 
     static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -263,11 +261,14 @@ public class RazorLanguageServer : IAsyncDisposable
     {
         _logger.LogDebug("Exit requested");
 
-        // Kill subprocesses immediately - don't wait for graceful shutdown
+        // Gracefully shut down subprocesses (they have internal timeouts before force-kill)
         try
         {
-            _roslynClient?.DisposeAsync().AsTask().Wait(100);
-            _htmlClient.DisposeAsync().AsTask().Wait(100);
+            // Run disposal in parallel for both clients
+            Task.WhenAll(
+                _roslynClient?.DisposeAsync().AsTask() ?? Task.CompletedTask,
+                _htmlClient.DisposeAsync().AsTask()
+            ).Wait(TimeSpan.FromSeconds(5));
         }
         catch
         {
@@ -289,13 +290,6 @@ public class RazorLanguageServer : IAsyncDisposable
 
         var uri = @params.TextDocument.Uri;
         _logger.LogDebug("Document opened: {Uri} (language: {Lang})", uri, @params.TextDocument.LanguageId);
-
-        // Capture first opened document for warmup (before waiting for project initialization)
-        // This way warmup uses a file the user is actually editing instead of a random file
-        if (_firstOpenedDocumentUri == null && IsSupportedUri(uri))
-        {
-            _firstOpenedDocumentUri = uri;
-        }
 
         // Transform languageId for Roslyn (Helix sends "c-sharp", Roslyn expects "csharp")
         var languageId = @params.TextDocument.LanguageId;
@@ -889,8 +883,6 @@ public class RazorLanguageServer : IAsyncDisposable
                     case LspMethods.ProjectInitializationComplete:
                         _logger.LogInformation("Roslyn project initialization complete - server ready");
                         _roslynProjectInitialized.TrySetResult();
-                        // Start warm-up in background to prime Roslyn's caches
-                        _ = Task.Run(() => WarmUpRoslynAsync());
                         break;
 
                     case "window/logMessage":
@@ -1436,93 +1428,6 @@ public class RazorLanguageServer : IAsyncDisposable
         };
     }
 
-    /// <summary>
-    /// Warms up Roslyn's caches by requesting symbols for a file.
-    /// Prefers files the user already has open over random workspace files.
-    /// This helps reduce latency for the user's first real request.
-    /// </summary>
-    private async Task WarmUpRoslynAsync()
-    {
-        if (_roslynClient == null)
-        {
-            return;
-        }
-
-        try
-        {
-            _logger.LogDebug("Starting Roslyn warm-up...");
-
-            // Prefer file the user already has open (captured from didOpen before project init)
-            // This warms up the exact file they're likely to interact with first
-            string? warmUpUri = _firstOpenedDocumentUri;
-            bool needsOpen = false;
-
-            if (warmUpUri == null && _workspaceRoot != null)
-            {
-                // Fall back to finding a file in the workspace
-                var warmUpFile = FindSourceFile(_workspaceRoot);
-                if (warmUpFile != null)
-                {
-                    warmUpUri = new Uri(warmUpFile).AbsoluteUri;
-                    needsOpen = true;
-                }
-            }
-
-            if (warmUpUri == null)
-            {
-                _logger.LogDebug("No files found for warm-up");
-                return;
-            }
-
-            _logger.LogInformation("Warming up Roslyn with: {Uri}", warmUpUri);
-
-            // If using a file from the workspace (not user's open file), we need to open it
-            if (needsOpen)
-            {
-                var filePath = new Uri(warmUpUri).LocalPath;
-                var fileContent = await File.ReadAllTextAsync(filePath);
-                var languageId = filePath.EndsWith(".razor", StringComparison.OrdinalIgnoreCase)
-                    || filePath.EndsWith(".cshtml", StringComparison.OrdinalIgnoreCase)
-                    ? "aspnetcorerazor"
-                    : "csharp";
-
-                var didOpenParams = new
-                {
-                    textDocument = new
-                    {
-                        uri = warmUpUri,
-                        languageId,
-                        version = 1,
-                        text = fileContent
-                    }
-                };
-                await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidOpen, JsonSerializer.SerializeToElement(didOpenParams, JsonOptions));
-
-                // Give Roslyn a moment to process the document
-                await Task.Delay(100);
-            }
-
-            // Send a documentSymbol request to warm up semantic analysis
-            // For user's open file, their didOpen will have been forwarded right before this runs
-            var symbolParams = new
-            {
-                textDocument = new { uri = warmUpUri }
-            };
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            await _roslynClient.SendRequestAsync(
-                LspMethods.TextDocumentDocumentSymbol,
-                JsonSerializer.SerializeToElement(symbolParams, JsonOptions),
-                cts.Token);
-
-            _logger.LogInformation("Roslyn warm-up complete");
-        }
-        catch (Exception ex)
-        {
-            // Warm-up failures should not crash the server
-            _logger.LogWarning(ex, "Roslyn warm-up failed (non-fatal)");
-        }
-    }
-
     #endregion
 
     public async ValueTask DisposeAsync()
@@ -1542,49 +1447,5 @@ public class RazorLanguageServer : IAsyncDisposable
         await _htmlClient.DisposeAsync();
 
         _clientRpc?.Dispose();
-    }
-
-    /// <summary>
-    /// Finds the first .razor, .cshtml, or .cs file, skipping bin/obj directories.
-    /// Prefers Razor files for warmup since they exercise more of the pipeline.
-    /// </summary>
-    private static string? FindSourceFile(string dir)
-    {
-        // First pass: look for Razor files (preferred for warmup)
-        var razorFile = FindSourceFileByExtension(dir, IsRazorFile);
-        if (razorFile != null)
-            return razorFile;
-
-        // Second pass: fall back to C# files
-        return FindSourceFileByExtension(dir, IsCSharpFile);
-
-        static bool IsRazorFile(string path) =>
-            path.EndsWith(".razor", StringComparison.OrdinalIgnoreCase) ||
-            path.EndsWith(".cshtml", StringComparison.OrdinalIgnoreCase);
-
-        static bool IsCSharpFile(string path) =>
-            path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string? FindSourceFileByExtension(string dir, Func<string, bool> matcher)
-    {
-        foreach (var file in Directory.EnumerateFiles(dir))
-        {
-            if (matcher(file))
-                return file;
-        }
-
-        foreach (var subdir in Directory.EnumerateDirectories(dir))
-        {
-            var name = Path.GetFileName(subdir);
-            if (name is "bin" or "obj" or "node_modules" or ".git")
-                continue;
-
-            var file = FindSourceFileByExtension(subdir, matcher);
-            if (file != null)
-                return file;
-        }
-
-        return null;
     }
 }

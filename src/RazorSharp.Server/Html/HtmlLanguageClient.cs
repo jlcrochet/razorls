@@ -451,32 +451,83 @@ public class HtmlLanguageClient : IAsyncDisposable
         return null;
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
         if (_disposed)
         {
-            return ValueTask.CompletedTask;
+            return;
         }
 
         _disposed = true;
-        _rpc?.Dispose();
-        _rpc = null;
 
-        if (_process != null && !_process.HasExited)
+        // Attempt graceful LSP shutdown first
+        if (_process != null && !_process.HasExited && _rpc != null && _initialized)
         {
             try
             {
-                _process.Kill(entireProcessTree: true);
+                // Send shutdown request and wait for response
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await _rpc.InvokeWithCancellationAsync<object?>("shutdown", cancellationToken: cts.Token);
+
+                // Send exit notification
+                await _rpc.NotifyAsync("exit");
+
+                // Dispose RPC before waiting (closes streams, signals EOF to process)
+                _rpc.Dispose();
+                _rpc = null;
+
+                // Wait briefly for process to exit gracefully
+                if (!_process.WaitForExit(2000))
+                {
+                    _logger.LogWarning("HTML language server did not exit gracefully, forcing termination");
+                    _process.Kill(entireProcessTree: true);
+                }
+                else
+                {
+                    _logger.LogDebug("HTML language server exited gracefully");
+                }
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore
+                _logger.LogDebug(ex, "Error during graceful shutdown, forcing termination");
+                _rpc?.Dispose();
+                _rpc = null;
+                try
+                {
+                    _process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Ignore - process may already be dead
+                }
             }
+
             _process.Dispose();
             _process = null;
         }
+        else
+        {
+            // Process not running or not initialized, just clean up
+            _rpc?.Dispose();
+            _rpc = null;
 
-        return ValueTask.CompletedTask;
+            if (_process != null)
+            {
+                if (!_process.HasExited)
+                {
+                    try
+                    {
+                        _process.Kill(entireProcessTree: true);
+                    }
+                    catch
+                    {
+                        // Ignore
+                    }
+                }
+                _process.Dispose();
+                _process = null;
+            }
+        }
     }
 }
 
