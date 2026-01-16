@@ -21,6 +21,7 @@ public class RoslynRawClient : IAsyncDisposable
     Task? _readTask;
     long _nextId = 0;
     readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement?>> _pendingRequests = new();
+    readonly SemaphoreSlim _sendLock = new(1, 1);
     ConfigurationLoader? _configurationLoader;
 
     public event EventHandler<RoslynNotificationEventArgs>? NotificationReceived;
@@ -431,16 +432,26 @@ public class RoslynRawClient : IAsyncDisposable
         // Serialize directly to UTF-8 bytes (no intermediate string)
         var content = JsonSerializer.SerializeToUtf8Bytes(message, SendJsonOptions);
 
-        // Build header directly in bytes: "Content-Length: {length}\r\n\r\n"
-        "Content-Length: "u8.CopyTo(_headerBuffer);
-        Utf8Formatter.TryFormat(content.Length, _headerBuffer.AsSpan(16), out var bytesWritten);
-        "\r\n\r\n"u8.CopyTo(_headerBuffer.AsSpan(16 + bytesWritten));
-        var headerLength = 16 + bytesWritten + 4;
+        // Serialize writes to prevent interleaved messages when multiple requests are sent concurrently
+        // The lock also protects _headerBuffer which is a shared instance field
+        await _sendLock.WaitAsync();
+        try
+        {
+            // Build header directly in bytes: "Content-Length: {length}\r\n\r\n"
+            "Content-Length: "u8.CopyTo(_headerBuffer);
+            Utf8Formatter.TryFormat(content.Length, _headerBuffer.AsSpan(16), out var bytesWritten);
+            "\r\n\r\n"u8.CopyTo(_headerBuffer.AsSpan(16 + bytesWritten));
+            var headerLength = 16 + bytesWritten + 4;
 
-        var stream = _process.StandardInput.BaseStream;
-        await stream.WriteAsync(_headerBuffer.AsMemory(0, headerLength));
-        await stream.WriteAsync(content);
-        await stream.FlushAsync();
+            var stream = _process.StandardInput.BaseStream;
+            await stream.WriteAsync(_headerBuffer.AsMemory(0, headerLength));
+            await stream.WriteAsync(content);
+            await stream.FlushAsync();
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -489,6 +500,7 @@ public class RoslynRawClient : IAsyncDisposable
         }
 
         _readCts?.Cancel();
+        _sendLock.Dispose();
     }
 
     public static RoslynStartOptions CreateStartOptions(DependencyManager deps, string? logDirectory = null, string? logLevel = null)
