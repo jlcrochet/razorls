@@ -29,21 +29,21 @@ jobs:
 
       - name: Publish
         run: |
-          dotnet publish src/RazorLS.Server -c Release -o publish -p:Version=${{ steps.version.outputs.VERSION }}
+          dotnet publish src/RazorSharp.Server -c Release -o publish -p:Version=${{ steps.version.outputs.VERSION }}
 
       - name: Create zip
         run: |
           cd publish
-          zip -r ../razorls.zip .
+          zip -r ../razorsharp.zip .
 
       - name: Create checksums
-        run: sha256sum razorls.zip > checksums.txt
+        run: sha256sum razorsharp.zip > checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            razorls.zip
+            razorsharp.zip
             checksums.txt
           generate_release_notes: true
           draft: false
