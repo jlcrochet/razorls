@@ -123,7 +123,7 @@ public class HtmlLanguageClient : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to start HTML language server. Is Node.js installed?");
+            _logger.LogError(ex, "Failed to start HTML language server. Is Node.js installed?");
             return;
         }
 

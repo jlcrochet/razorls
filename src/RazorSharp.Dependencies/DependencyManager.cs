@@ -252,13 +252,13 @@ public class DependencyManager
     {
         Directory.CreateDirectory(destinationDir);
 
-        foreach (var file in Directory.GetFiles(sourceDir))
+        foreach (var file in Directory.EnumerateFiles(sourceDir))
         {
             var destFile = Path.Combine(destinationDir, Path.GetFileName(file));
             File.Copy(file, destFile, overwrite: true);
         }
 
-        foreach (var dir in Directory.GetDirectories(sourceDir))
+        foreach (var dir in Directory.EnumerateDirectories(sourceDir))
         {
             var destDir = Path.Combine(destinationDir, Path.GetFileName(dir));
             CopyDirectory(dir, destDir);

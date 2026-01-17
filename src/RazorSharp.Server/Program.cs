@@ -190,12 +190,27 @@ static async Task<int> DownloadDependenciesAsync()
 
     var depManager = new DependencyManager(logger);
 
+    // Use progress bar if output is a TTY, otherwise use simple line output
+    var isTty = !Console.IsOutputRedirected;
+    var progressBar = isTty ? new ProgressBar() : null;
+
     try
     {
         var success = await depManager.EnsureDependenciesAsync(
             CancellationToken.None,
-            message => Console.WriteLine(message));
+            message =>
+            {
+                if (progressBar != null)
+                {
+                    progressBar.Update(message);
+                }
+                else
+                {
+                    Console.WriteLine(message);
+                }
+            });
 
+        progressBar?.Complete();
         Console.WriteLine();
         if (success)
         {
@@ -210,8 +225,105 @@ static async Task<int> DownloadDependenciesAsync()
     }
     catch (Exception ex)
     {
+        progressBar?.Complete();
         Console.Error.WriteLine($"Error: {ex.Message}");
         return 1;
+    }
+}
+
+/// <summary>
+/// Simple progress bar for TTY output.
+/// </summary>
+internal class ProgressBar
+{
+    int _lastPercent = -1;
+    int _lastOutputLength;
+    const int BarWidth = 30;
+
+    readonly char[] _bar = new char[BarWidth];
+    readonly char[] _padding;
+
+    public ProgressBar()
+    {
+        int width;
+        try { width = Console.WindowWidth; }
+        catch { width = 120; }
+        _padding = new char[width];
+        Array.Fill(_padding, ' ');
+    }
+
+    public void Update(string message)
+    {
+        // Try to extract percentage from messages like "Downloading Roslyn... 50%"
+        if (message.StartsWith("Downloading ") &&
+            message[^1] == '%' &&
+            char.IsDigit(message[^2]))
+        {
+            // Scan backwards to find start of number
+            var numStart = message.Length - 2;
+            while (numStart > 0 && char.IsDigit(message[numStart - 1]))
+            {
+                numStart--;
+            }
+
+            var percent = int.Parse(message.AsSpan(numStart, message.Length - 1 - numStart));
+            var label = message.AsSpan(0, numStart).TrimEnd();
+            RenderProgressBar(label, percent);
+            _lastPercent = percent;
+        }
+        else
+        {
+            ClearLine();
+            Console.WriteLine(message);
+            _lastPercent = -1;
+        }
+    }
+
+    public void Complete()
+    {
+        if (_lastPercent >= 0)
+        {
+            // Clear the progress bar line
+            ClearLine();
+        }
+    }
+
+    private void RenderProgressBar(ReadOnlySpan<char> label, int percent)
+    {
+        var filled = (int)(percent / 100.0 * BarWidth);
+
+        _bar.AsSpan(0, filled).Fill('█');
+        _bar.AsSpan(filled).Fill('░');
+
+        // Truncate label if too long
+        var maxLabelWidth = Math.Max(10, Console.WindowWidth - BarWidth - 10);
+        var labelSpan = label.Length <= maxLabelWidth
+            ? label
+            : label[0..(maxLabelWidth - 3)];
+        var needsEllipsis = label.Length > maxLabelWidth;
+
+        Console.Write('\r');
+        Console.Write(labelSpan);
+        if (needsEllipsis) Console.Write("...");
+        Console.Write(' ');
+        Console.Write(_bar);
+        Console.Write(' ');
+        Console.Write(percent.ToString().PadLeft(3));
+        Console.Write('%');
+
+        // Calculate current output length and clear any leftover chars
+        var outputLength = 1 + labelSpan.Length + (needsEllipsis ? 3 : 0) + 1 + BarWidth + 1 + 4;
+        var toClear = Math.Max(0, _lastOutputLength - outputLength);
+        if (toClear > 0 && toClear <= _padding.Length)
+        {
+            Console.Write(_padding.AsSpan(0, toClear));
+        }
+        _lastOutputLength = outputLength;
+    }
+
+    private static void ClearLine()
+    {
+        Console.Write("\r\x1b[K");
     }
 }
 
@@ -231,7 +343,7 @@ internal class StderrLogger : ILogger
     public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
     {
         var dotIndex = _category.LastIndexOf('.');
-        var shortCategory = dotIndex != -1 ? _category.Substring(dotIndex + 1) : _category;
+        var shortCategory = dotIndex != -1 ? _category.AsSpan(dotIndex + 1) : _category;
         Console.Error.WriteLine($"[{logLevel}] {shortCategory}: {formatter(state, exception)}");
         if (exception != null)
         {
@@ -244,7 +356,7 @@ internal class StderrLogger : ILogger
 internal class FileLoggerProvider : ILoggerProvider
 {
     readonly StreamWriter _writer;
-    readonly object _lock = new();
+    readonly Lock _lock = new();
 
     public FileLoggerProvider(string path)
     {
@@ -264,9 +376,9 @@ internal class FileLogger : ILogger
 {
     readonly string _category;
     readonly StreamWriter _writer;
-    readonly object _lock;
+    readonly Lock _lock;
 
-    public FileLogger(string category, StreamWriter writer, object @lock)
+    public FileLogger(string category, StreamWriter writer, Lock @lock)
     {
         _category = category;
         _writer = writer;
@@ -278,7 +390,7 @@ internal class FileLogger : ILogger
     public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
     {
         var dotIndex = _category.LastIndexOf('.');
-        var shortCategory = dotIndex != -1 ? _category.Substring(dotIndex + 1) : _category;
+        var shortCategory = dotIndex != -1 ? _category.AsSpan(dotIndex + 1) : _category;
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] [{logLevel}] {shortCategory}: {formatter(state, exception)}";
         lock (_lock)
         {

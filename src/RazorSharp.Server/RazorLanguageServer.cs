@@ -472,16 +472,25 @@ public class RazorLanguageServer : IAsyncDisposable
         => ForwardToRoslynAsync(LspMethods.TextDocumentHover, @params, ct);
 
     [JsonRpcMethod(LspMethods.TextDocumentDefinition, UseSingleObjectParameterDeserialization = true)]
-    public Task<JsonElement?> HandleDefinitionAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentDefinition, @params, ct);
+    public async Task<JsonElement?> HandleDefinitionAsync(JsonElement @params, CancellationToken ct)
+    {
+        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentDefinition, @params, ct);
+        return result.HasValue ? TransformSourceGeneratedUris(result.Value) : result;
+    }
 
     [JsonRpcMethod(LspMethods.TextDocumentReferences, UseSingleObjectParameterDeserialization = true)]
-    public Task<JsonElement?> HandleReferencesAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentReferences, @params, ct);
+    public async Task<JsonElement?> HandleReferencesAsync(JsonElement @params, CancellationToken ct)
+    {
+        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentReferences, @params, ct);
+        return result.HasValue ? TransformSourceGeneratedUris(result.Value) : result;
+    }
 
     [JsonRpcMethod(LspMethods.TextDocumentImplementation, UseSingleObjectParameterDeserialization = true)]
-    public Task<JsonElement?> HandleImplementationAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentImplementation, @params, ct);
+    public async Task<JsonElement?> HandleImplementationAsync(JsonElement @params, CancellationToken ct)
+    {
+        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentImplementation, @params, ct);
+        return result.HasValue ? TransformSourceGeneratedUris(result.Value) : result;
+    }
 
     [JsonRpcMethod(LspMethods.TextDocumentDocumentHighlight, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleDocumentHighlightAsync(JsonElement @params, CancellationToken ct)
@@ -1688,8 +1697,170 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             _logger.LogWarning("Duplicate {OptionName}: {Duplicates}",
                 optionName, string.Join(", ", duplicates.Select(c => '"' + c + '"')));
+            return custom.Distinct().ToArray();
         }
-        return custom.Distinct().ToArray();
+        else
+        {
+            return custom;
+        }
+    }
+
+    /// <summary>
+    /// Transforms roslyn-source-generated:// URIs in location responses to file:// URIs
+    /// pointing to the generated files on disk (when EmitCompilerGeneratedFiles is enabled).
+    /// This allows editors like Helix that don't support custom URI schemes to navigate to generated code.
+    /// </summary>
+    private JsonElement TransformSourceGeneratedUris(JsonElement response)
+    {
+        if (_workspaceRoot == null)
+        {
+            return response;
+        }
+
+        // Response can be: null, Location, Location[], LocationLink[]
+        if (response.ValueKind == JsonValueKind.Null)
+        {
+            return response;
+        }
+
+        if (response.ValueKind == JsonValueKind.Array)
+        {
+            var items = response.EnumerateArray().ToArray();
+            var anyChanged = false;
+
+            var transformed = Array.ConvertAll(items, item => {
+                var newItem = TransformLocationElement(item);
+                if (!anyChanged) anyChanged = !item.Equals(newItem);
+                return newItem;
+            });
+
+            if (anyChanged)
+            {
+                return JsonSerializer.SerializeToElement(transformed);
+            }
+            else
+            {
+                return response;
+            }
+        }
+
+        // Single location
+        return TransformLocationElement(response);
+    }
+
+    private JsonElement TransformLocationElement(JsonElement element)
+    {
+        // Check if this is a Location (has "uri") or LocationLink (has "targetUri")
+        if (element.TryGetProperty("uri", out var uriProp))
+        {
+            var uri = uriProp.GetString();
+            if (uri != null && TryMapSourceGeneratedUri(uri, out var filePath))
+            {
+                // Clone and replace uri
+                var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(element.GetRawText())!;
+                dict["uri"] = JsonSerializer.SerializeToElement(new Uri(filePath).AbsoluteUri);
+                return JsonSerializer.SerializeToElement(dict);
+            }
+        }
+        else if (element.TryGetProperty("targetUri", out var targetUriProp))
+        {
+            var uri = targetUriProp.GetString();
+            if (uri != null && TryMapSourceGeneratedUri(uri, out var filePath))
+            {
+                // Clone and replace targetUri
+                var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(element.GetRawText())!;
+                dict["targetUri"] = JsonSerializer.SerializeToElement(new Uri(filePath).AbsoluteUri);
+                return JsonSerializer.SerializeToElement(dict);
+            }
+        }
+
+        return element;
+    }
+
+    /// <summary>
+    /// Tries to map a roslyn-source-generated:// URI to a file path on disk.
+    /// The URI format is: roslyn-source-generated://{projectId}/{hintName}?assemblyName=...&typeName=...&hintName=...
+    /// Generated files are typically at: obj/{Configuration}/{TFM}/generated/{assemblyName}/{typeName}/{hintName}
+    /// </summary>
+    private bool TryMapSourceGeneratedUri(string uri, out string filePath)
+    {
+        filePath = "";
+
+        if (!uri.StartsWith("roslyn-source-generated://", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        try
+        {
+            var parsed = new Uri(uri);
+            var query = System.Web.HttpUtility.ParseQueryString(parsed.Query);
+
+            var assemblyName = query["assemblyName"];
+            var typeName = query["typeName"];
+            var hintName = query["hintName"];
+
+            if (string.IsNullOrEmpty(assemblyName) || string.IsNullOrEmpty(typeName) || string.IsNullOrEmpty(hintName))
+            {
+                _logger.LogDebug("Source generated URI missing required query parameters: {Uri}", uri);
+                return false;
+            }
+
+            // Search for the generated file, preferring Debug over Release
+            var found = FindGeneratedFile(assemblyName, typeName, hintName);
+
+            if (found != null)
+            {
+                filePath = found;
+                _logger.LogDebug("Mapped source generated URI {Uri} to {FilePath}", uri, filePath);
+                return true;
+            }
+
+            _logger.LogDebug("No generated file found for URI: {Uri}", uri);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to parse source generated URI: {Uri}", uri);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Finds the first matching generated file, preferring Debug over other configurations.
+    /// </summary>
+    private string? FindGeneratedFile(string assemblyName, string typeName, string hintName)
+    {
+        // Search in workspace root and all subdirectories (for multi-project solutions)
+        foreach (var objDir in Directory.EnumerateDirectories(_workspaceRoot!, "obj", SearchOption.AllDirectories))
+        {
+            // Enumerate all configuration directories, but check Debug first if it exists
+            var configDirs = Directory.EnumerateDirectories(objDir)
+                .OrderByDescending(d => Path.GetFileName(d).Equals("Debug", StringComparison.OrdinalIgnoreCase));
+
+            foreach (var configDir in configDirs)
+            {
+                var path = FindGeneratedFileInConfig(configDir, assemblyName, typeName, hintName);
+                if (path != null) return path;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? FindGeneratedFileInConfig(string configDir, string assemblyName, string typeName, string hintName)
+    {
+        // Look in all TFM directories (net8.0, net9.0, etc.)
+        foreach (var tfmDir in Directory.EnumerateDirectories(configDir))
+        {
+            var generatedPath = Path.Combine(tfmDir, "generated", assemblyName, typeName, hintName);
+            if (File.Exists(generatedPath))
+            {
+                return generatedPath;
+            }
+        }
+
+        return null;
     }
 
     public async ValueTask DisposeAsync()
