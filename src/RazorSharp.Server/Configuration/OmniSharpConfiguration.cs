@@ -167,6 +167,12 @@ public class CapabilitiesConfig
     /// </summary>
     [JsonPropertyName("inlayHintProvider")]
     public bool? InlayHintProvider { get; set; }
+
+    /// <summary>
+    /// Diagnostic provider configuration.
+    /// </summary>
+    [JsonPropertyName("diagnosticProvider")]
+    public DiagnosticProviderConfig? DiagnosticProvider { get; set; }
 }
 
 /// <summary>
@@ -182,8 +188,7 @@ public class CompletionProviderConfig
 
     /// <summary>
     /// Characters that trigger completion.
-    /// Must be a subset of the valid trigger characters: [".", "<", "@", " ", "(", "\"", "'", "=", "/"]
-    /// Default: all valid trigger characters
+    /// Default: [".", "<", "@", "(", "=", "/"]
     /// </summary>
     [JsonPropertyName("triggerCharacters")]
     public string[]? TriggerCharacters { get; set; }
@@ -239,6 +244,47 @@ public class DocumentOnTypeFormattingProviderConfig
     /// </summary>
     [JsonPropertyName("moreTriggerCharacter")]
     public string[]? MoreTriggerCharacter { get; set; }
+}
+
+/// <summary>
+/// Diagnostic provider configuration.
+/// Controls which diagnostic categories are requested from Roslyn.
+/// </summary>
+public class DiagnosticProviderConfig
+{
+    /// <summary>
+    /// Enable or disable diagnostics entirely. Default: true
+    /// </summary>
+    [JsonPropertyName("enabled")]
+    public bool? Enabled { get; set; }
+
+    /// <summary>
+    /// Enable compiler syntax diagnostics (e.g., missing braces, invalid syntax).
+    /// Default: true
+    /// </summary>
+    [JsonPropertyName("syntax")]
+    public bool? Syntax { get; set; }
+
+    /// <summary>
+    /// Enable compiler semantic diagnostics (e.g., type errors, undefined symbols).
+    /// Default: true
+    /// </summary>
+    [JsonPropertyName("semantic")]
+    public bool? Semantic { get; set; }
+
+    /// <summary>
+    /// Enable analyzer syntax diagnostics.
+    /// Default: false (analyzers can be slow)
+    /// </summary>
+    [JsonPropertyName("analyzerSyntax")]
+    public bool? AnalyzerSyntax { get; set; }
+
+    /// <summary>
+    /// Enable analyzer semantic diagnostics.
+    /// Default: false (analyzers can be slow)
+    /// </summary>
+    [JsonPropertyName("analyzerSemantic")]
+    public bool? AnalyzerSemantic { get; set; }
 }
 
 /// <summary>
