@@ -181,7 +181,7 @@ pnpm install -g vscode-langservers-extracted
 yarn global add vscode-langservers-extracted
 ```
 
-The HTML language server is enabled by default. To disable it, configure your editor's LSP `initializationOptions`:
+The HTML language server is started lazily when the first Razor file is opened, so it won't affect startup time if you're only working with C# files. To disable it entirely, configure your editor's LSP `initializationOptions`:
 
 #### Helix
 
@@ -202,7 +202,7 @@ lspconfig.razorsharp.setup({
 })
 ```
 
-Disabling the HTML language server may improve startup times but it will break formatting.
+Disabling the HTML language server will break formatting in Razor files.
 
 ### LSP Initialization Options
 

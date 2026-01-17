@@ -195,9 +195,8 @@ public class RazorLanguageServer : IAsyncDisposable
 
         await _roslynClient.StartAsync(roslynOptions, ct);
 
-        // Start HTML language server for HTML formatting support
-        await _htmlClient.StartAsync(initOptions?.Html, ct);
-        await _htmlClient.InitializeAsync(@params?.RootUri, ct);
+        // Configure HTML language server (started lazily when first Razor file is opened)
+        _htmlClient.Configure(initOptions?.Html, @params?.RootUri);
 
         // Wire up Roslyn events
         _roslynClient.NotificationReceived += OnRoslynNotification;

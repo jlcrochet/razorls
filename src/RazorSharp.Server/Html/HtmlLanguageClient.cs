@@ -15,11 +15,14 @@ namespace RazorSharp.Server.Html;
 public class HtmlLanguageClient : IAsyncDisposable
 {
     readonly ILogger<HtmlLanguageClient> _logger;
+    readonly SemaphoreSlim _startLock = new(1, 1);
     Process? _process;
     JsonRpc? _rpc;
     bool _initialized;
     bool _disposed;
     bool _enabled = true;
+    bool _startAttempted;
+    string? _rootUri;
 
     // Track HTML projections by checksum (Roslyn uses checksums to identify HTML versions)
     readonly ConcurrentDictionary<string, HtmlProjection> _projections = new();
@@ -40,18 +43,48 @@ public class HtmlLanguageClient : IAsyncDisposable
     public bool IsRunning => _process != null && !_process.HasExited;
 
     /// <summary>
-    /// Starts the HTML language server (vscode-html-language-server).
+    /// Configures the HTML language client. The server will be started lazily
+    /// when the first Razor file is opened.
     /// </summary>
-    public async Task StartAsync(HtmlOptions? options, CancellationToken cancellationToken)
+    public void Configure(HtmlOptions? options, string? rootUri)
     {
-        // Check if HTML LS is explicitly disabled
         if (options?.Enable == false)
         {
             _enabled = false;
             _logger.LogInformation("HTML language server disabled by configuration");
-            return;
         }
+        _rootUri = rootUri;
+    }
 
+    /// <summary>
+    /// Ensures the HTML language server is started. Called lazily when needed.
+    /// </summary>
+    private async Task EnsureStartedAsync(CancellationToken cancellationToken)
+    {
+        if (!_enabled || _initialized || _startAttempted)
+            return;
+
+        await _startLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (_initialized || _startAttempted)
+                return;
+
+            _startAttempted = true;
+            await StartAsync(cancellationToken);
+            await InitializeAsync(cancellationToken);
+        }
+        finally
+        {
+            _startLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Starts the HTML language server (vscode-html-language-server).
+    /// </summary>
+    private async Task StartAsync(CancellationToken cancellationToken)
+    {
         // Find vscode-html-language-server
         var serverPath = FindHtmlLanguageServer();
         if (serverPath == null)
@@ -131,7 +164,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     /// <summary>
     /// Initializes the HTML language server.
     /// </summary>
-    public async Task InitializeAsync(string? rootUri, CancellationToken cancellationToken)
+    private async Task InitializeAsync(CancellationToken cancellationToken)
     {
         if (_rpc == null || _initialized)
         {
@@ -141,7 +174,7 @@ public class HtmlLanguageClient : IAsyncDisposable
         var initParams = new
         {
             processId = Environment.ProcessId,
-            rootUri,
+            rootUri = _rootUri,
             capabilities = new
             {
                 textDocument = new
@@ -163,16 +196,19 @@ public class HtmlLanguageClient : IAsyncDisposable
     /// Updates the HTML projection for a Razor document.
     /// Called when we receive razor/updateHtml from Roslyn.
     /// </summary>
-    public async Task UpdateHtmlProjectionAsync(string razorUri, string checksum, string htmlContent)
+    public async Task UpdateHtmlProjectionAsync(string razorUri, string checksum, string htmlContent, CancellationToken cancellationToken = default)
     {
         if (!_enabled)
         {
             return;
         }
 
+        // Lazily start the HTML language server on first Razor file
+        await EnsureStartedAsync(cancellationToken);
+
+        // Store the projection even if HTML LS failed to start
         if (_rpc == null || !_initialized)
         {
-            // Still store the projection even if HTML LS isn't running
             _projections[checksum] = new HtmlProjection(razorUri, checksum, htmlContent, 1);
             _razorUriToChecksum[razorUri] = checksum;
             return;
