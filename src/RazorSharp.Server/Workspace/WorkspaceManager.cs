@@ -65,12 +65,4 @@ public class WorkspaceManager
             return [];
         }
     }
-
-    /// <summary>
-    /// Checks if the path contains a .NET project or solution.
-    /// </summary>
-    public bool IsDotNetWorkspace(string rootPath)
-    {
-        return FindSolution(rootPath) != null || FindProjects(rootPath).Length > 0;
-    }
 }

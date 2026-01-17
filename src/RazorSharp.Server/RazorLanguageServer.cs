@@ -23,7 +23,7 @@ public class RazorLanguageServer : IAsyncDisposable
     readonly WorkspaceManager _workspaceManager;
     readonly ConfigurationLoader _configurationLoader;
     readonly HtmlLanguageClient _htmlClient;
-    RoslynRawClient? _roslynClient;
+    RoslynClient? _roslynClient;
     JsonRpc? _clientRpc;
     InitializeParams? _initParams;
     InitializationOptions? _initOptions;
@@ -182,7 +182,7 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         // Start Roslyn
-        _roslynClient = new RoslynRawClient(_loggerFactory.CreateLogger<RoslynRawClient>());
+        _roslynClient = new RoslynClient(_loggerFactory.CreateLogger<RoslynClient>());
         _roslynClient.SetConfigurationLoader(_configurationLoader);
 
         var roslynOptions = RoslynClient.CreateStartOptions(_dependencyManager,
