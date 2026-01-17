@@ -166,8 +166,13 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             try
             {
+                // Use strict deserialization to catch unknown properties
+                var strictOptions = new JsonSerializerOptions(JsonOptions)
+                {
+                    UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
+                };
                 initOptions = JsonSerializer.Deserialize<InitializationOptions>(
-                    @params.InitializationOptions.Value.GetRawText(), JsonOptions);
+                    @params.InitializationOptions.Value.GetRawText(), strictOptions);
                 _initOptions = initOptions;
                 _logger.LogDebug("Parsed initializationOptions: html.enable={HtmlEnable}, capabilities.completionProvider.triggerCharacters={TriggerChars}",
                     initOptions?.Html?.Enable,
@@ -177,7 +182,7 @@ public class RazorLanguageServer : IAsyncDisposable
             }
             catch (JsonException ex)
             {
-                _logger.LogWarning(ex, "Failed to parse initializationOptions");
+                _logger.LogWarning(ex, "Failed to parse initializationOptions - check for invalid or unknown properties");
             }
         }
 
@@ -890,27 +895,117 @@ public class RazorLanguageServer : IAsyncDisposable
         var uri = @params.TryGetProperty("textDocument", out var td) && td.TryGetProperty("uri", out var u)
             ? u.GetString() : "unknown";
 
-        // For C# files, we need to request diagnostics with Roslyn's identifier, not ours
-        // Roslyn registers "DocumentCompilerSemantic" for compiler diagnostics
-        JsonElement roslynParams;
-        if (uri?.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) == true)
+        var diagConfig = _initOptions?.Capabilities?.DiagnosticProvider;
+
+        // Check if diagnostics are disabled entirely
+        if (diagConfig?.Enabled == false)
         {
-            var previousResultId = @params.TryGetProperty("previousResultId", out var pr) && pr.ValueKind != JsonValueKind.Null
-                ? pr.GetString() : null;
-            roslynParams = JsonSerializer.SerializeToElement(new
+            return JsonSerializer.SerializeToElement(new
             {
-                identifier = "DocumentCompilerSemantic",
-                previousResultId,
-                textDocument = new { uri }
+                kind = "full",
+                resultId = "disabled",
+                items = Array.Empty<object>()
             }, JsonOptions);
         }
-        else
+
+        // For C# files, request configured diagnostic categories from Roslyn
+        // Roslyn separates diagnostics into categories:
+        // - "syntax" (DocumentCompilerSyntax) for syntax errors like missing braces
+        // - "DocumentCompilerSemantic" for semantic errors like type mismatches
+        // - "DocumentAnalyzerSyntax" for analyzer syntax diagnostics
+        // - "DocumentAnalyzerSemantic" for analyzer semantic diagnostics
+        if (uri?.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) == true)
         {
-            roslynParams = @params;
+            // Determine which categories to request (defaults: syntax=true, semantic=true, analyzers=false)
+            var requestSyntax = diagConfig?.Syntax ?? true;
+            var requestSemantic = diagConfig?.Semantic ?? true;
+            var requestAnalyzerSyntax = diagConfig?.AnalyzerSyntax ?? false;
+            var requestAnalyzerSemantic = diagConfig?.AnalyzerSemantic ?? false;
+
+            var tasks = new List<Task<JsonElement?>>();
+
+            if (requestSyntax)
+            {
+                var syntaxParams = JsonSerializer.SerializeToElement(new
+                {
+                    identifier = "syntax",
+                    textDocument = new { uri }
+                }, JsonOptions);
+                tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, syntaxParams, ct));
+            }
+
+            if (requestSemantic)
+            {
+                var semanticParams = JsonSerializer.SerializeToElement(new
+                {
+                    identifier = "DocumentCompilerSemantic",
+                    textDocument = new { uri }
+                }, JsonOptions);
+                tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, semanticParams, ct));
+            }
+
+            if (requestAnalyzerSyntax)
+            {
+                var analyzerSyntaxParams = JsonSerializer.SerializeToElement(new
+                {
+                    identifier = "DocumentAnalyzerSyntax",
+                    textDocument = new { uri }
+                }, JsonOptions);
+                tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSyntaxParams, ct));
+            }
+
+            if (requestAnalyzerSemantic)
+            {
+                var analyzerSemanticParams = JsonSerializer.SerializeToElement(new
+                {
+                    identifier = "DocumentAnalyzerSemantic",
+                    textDocument = new { uri }
+                }, JsonOptions);
+                tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSemanticParams, ct));
+            }
+
+            if (tasks.Count == 0)
+            {
+                // All categories disabled
+                return JsonSerializer.SerializeToElement(new
+                {
+                    kind = "full",
+                    resultId = "none",
+                    items = Array.Empty<object>()
+                }, JsonOptions);
+            }
+
+            _logger.LogDebug("Requesting {Count} diagnostic categories for {Uri}", tasks.Count, uri);
+
+            // Request all categories in parallel
+            var results = await Task.WhenAll(tasks);
+
+            // Merge the diagnostic items from all responses
+            var mergedItems = new List<JsonElement>();
+            foreach (var result in results)
+            {
+                if (result.HasValue && result.Value.TryGetProperty("items", out var items))
+                {
+                    foreach (var item in items.EnumerateArray())
+                    {
+                        mergedItems.Add(item.Clone());
+                    }
+                }
+            }
+
+            _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedItems.Count, uri);
+
+            return JsonSerializer.SerializeToElement(new
+            {
+                kind = "full",
+                resultId = $"merged:{DateTime.UtcNow.Ticks}",
+                items = mergedItems
+            }, JsonOptions);
         }
 
+        // For non-C# files, forward as-is
         _logger.LogDebug("Forwarding textDocument/diagnostic to Roslyn for {Uri}", uri);
-        return await ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, roslynParams, ct);
+        return await ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, @params, ct);
     }
 
     #endregion
@@ -1469,34 +1564,12 @@ public class RazorLanguageServer : IAsyncDisposable
         CompletionOptions? completionProvider = null;
         if (caps?.CompletionProvider?.Enabled != false)
         {
-            string[] validTriggerCharacters = [".", "<", "@", " ", "(", "\"", "'", "=", "/"];
-            string[] triggerCharacters;
-
-            var customTriggers = caps?.CompletionProvider?.TriggerCharacters;
-            if (customTriggers != null)
-            {
-                // Validate that all custom trigger characters are valid
-                var invalidChars = customTriggers.Where(c => !validTriggerCharacters.Contains(c));
-                if (invalidChars.Any())
-                {
-                    _logger.LogWarning(
-                        "Invalid completionProvider.triggerCharacters: {Invalid}. Valid characters are: {Valid}",
-                        string.Join(", ", invalidChars.Select(c => $"\"{c}\"")),
-                        string.Join(", ", validTriggerCharacters.Select(c => $"\"{c}\"")));
-                }
-
-                // Only use valid characters from the custom list
-                triggerCharacters = customTriggers.Where(c => validTriggerCharacters.Contains(c)).ToArray();
-                _logger.LogDebug("Using custom completion trigger characters: {Triggers}", string.Join(", ", triggerCharacters));
-            }
-            else
-            {
-                triggerCharacters = validTriggerCharacters;
-            }
-
             completionProvider = new CompletionOptions
             {
-                TriggerCharacters = triggerCharacters,
+                TriggerCharacters = DedupeWithWarning(
+                    caps?.CompletionProvider?.TriggerCharacters,
+                    [".", "<", "@", "(", "=", "/"],
+                    "completionProvider.triggerCharacters"),
                 ResolveProvider = true
             };
         }
@@ -1507,8 +1580,14 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             signatureHelpProvider = new SignatureHelpOptions
             {
-                TriggerCharacters = caps?.SignatureHelpProvider?.TriggerCharacters ?? ["(", ","],
-                RetriggerCharacters = caps?.SignatureHelpProvider?.RetriggerCharacters ?? [")"]
+                TriggerCharacters = DedupeWithWarning(
+                    caps?.SignatureHelpProvider?.TriggerCharacters,
+                    ["(", ","],
+                    "signatureHelpProvider.triggerCharacters"),
+                RetriggerCharacters = DedupeWithWarning(
+                    caps?.SignatureHelpProvider?.RetriggerCharacters,
+                    [")"],
+                    "signatureHelpProvider.retriggerCharacters")
             };
         }
 
@@ -1516,10 +1595,15 @@ public class RazorLanguageServer : IAsyncDisposable
         DocumentOnTypeFormattingOptions? documentOnTypeFormattingProvider = null;
         if (caps?.DocumentOnTypeFormattingProvider?.Enabled != false)
         {
+            var moreTriggers = DedupeWithWarning(
+                caps?.DocumentOnTypeFormattingProvider?.MoreTriggerCharacter,
+                ["}", "\n"],
+                "documentOnTypeFormattingProvider.moreTriggerCharacter");
+
             documentOnTypeFormattingProvider = new DocumentOnTypeFormattingOptions
             {
                 FirstTriggerCharacter = caps?.DocumentOnTypeFormattingProvider?.FirstTriggerCharacter ?? ";",
-                MoreTriggerCharacter = caps?.DocumentOnTypeFormattingProvider?.MoreTriggerCharacter ?? ["}", "\n"]
+                MoreTriggerCharacter = moreTriggers
             };
         }
 
@@ -1594,6 +1678,20 @@ public class RazorLanguageServer : IAsyncDisposable
     }
 
     #endregion
+
+    private string[] DedupeWithWarning(string[]? custom, string[] defaults, string optionName)
+    {
+        if (custom == null)
+            return defaults;
+
+        var duplicates = custom.GroupBy(c => c).Where(g => g.Count() > 1).Select(g => g.Key);
+        if (duplicates.Any())
+        {
+            _logger.LogWarning("Duplicate {OptionName}: {Duplicates}",
+                optionName, string.Join(", ", duplicates.Select(c => '"' + c + '"')));
+        }
+        return custom.Distinct().ToArray();
+    }
 
     public async ValueTask DisposeAsync()
     {

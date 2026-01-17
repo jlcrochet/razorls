@@ -214,7 +214,7 @@ RazorSharp supports configuration via LSP `initializationOptions`. In Helix, thi
 |--------|------|---------|-------------|
 | `html.enable` | bool | `true` | Enable/disable HTML language server |
 | `capabilities.completionProvider.enabled` | bool | `true` | Enable/disable completion |
-| `capabilities.completionProvider.triggerCharacters` | string[] | `[".", "<", "@", " ", "(", "\"", "'", "=", "/"]` | Characters that trigger completion (must be subset of default) |
+| `capabilities.completionProvider.triggerCharacters` | string[] | `[".", "<", "@", "(", "=", "/"]` | Characters that trigger completion |
 | `capabilities.hoverProvider` | bool | `true` | Enable/disable hover |
 | `capabilities.signatureHelpProvider.enabled` | bool | `true` | Enable/disable signature help |
 | `capabilities.signatureHelpProvider.triggerCharacters` | string[] | `["(", ","]` | Characters that trigger signature help |
@@ -238,6 +238,11 @@ RazorSharp supports configuration via LSP `initializationOptions`. In Helix, thi
 | `capabilities.semanticTokensProvider.range` | bool | `true` | Enable/disable range requests |
 | `capabilities.semanticTokensProvider.full` | bool | `true` | Enable/disable full document requests |
 | `capabilities.inlayHintProvider` | bool | `true` | Enable/disable inlay hints |
+| `capabilities.diagnosticProvider.enabled` | bool | `true` | Enable/disable all diagnostics |
+| `capabilities.diagnosticProvider.syntax` | bool | `true` | Enable compiler syntax diagnostics (missing braces, etc.) |
+| `capabilities.diagnosticProvider.semantic` | bool | `true` | Enable compiler semantic diagnostics (type errors, etc.) |
+| `capabilities.diagnosticProvider.analyzerSyntax` | bool | `false` | Enable Roslyn analyzer syntax diagnostics |
+| `capabilities.diagnosticProvider.analyzerSemantic` | bool | `false` | Enable Roslyn analyzer semantic diagnostics |
 
 #### Example: Disable completion on `(`
 
@@ -248,7 +253,7 @@ To prevent completions from appearing immediately when typing `(` (useful to avo
 [language-server.razorsharp]
 command = "dotnet"
 args = ["/path/to/razorsharp.dll"]
-config.capabilities.completionProvider.triggerCharacters = [".", "<", "@", " ", "\"", "'", "=", "/"]
+config.capabilities.completionProvider.triggerCharacters = [".", "<", "@", "=", "/"]
 ```
 
 **Neovim:**
@@ -257,7 +262,7 @@ lspconfig.razorsharp.setup({
   init_options = {
     capabilities = {
       completionProvider = {
-        triggerCharacters = { ".", "<", "@", " ", "\"", "'", "=", "/" }
+        triggerCharacters = { ".", "<", "@", "=", "/" }
       }
     }
   }
@@ -286,6 +291,35 @@ lspconfig.razorsharp.setup({
   }
 })
 ```
+
+#### Example: Enable Roslyn analyzer diagnostics
+
+By default, only compiler diagnostics (syntax and semantic) are enabled. To also get diagnostics from Roslyn analyzers:
+
+**Helix:**
+```toml
+[language-server.razorsharp]
+command = "dotnet"
+args = ["/path/to/razorsharp.dll"]
+config.capabilities.diagnosticProvider.analyzerSyntax = true
+config.capabilities.diagnosticProvider.analyzerSemantic = true
+```
+
+**Neovim:**
+```lua
+lspconfig.razorsharp.setup({
+  init_options = {
+    capabilities = {
+      diagnosticProvider = {
+        analyzerSyntax = true,
+        analyzerSemantic = true
+      }
+    }
+  }
+})
+```
+
+Note: Enabling analyzer diagnostics may impact performance on large codebases.
 
 ## Architecture
 
