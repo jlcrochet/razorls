@@ -1,4 +1,3 @@
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RazorSharp.Dependencies;
 using RazorSharp.Server;
@@ -10,6 +9,7 @@ string? solutionPath = null;
 int? hostPid = null;
 bool skipDependencyCheck = false;
 bool downloadDependenciesOnly = false;
+var warnings = new List<string>();
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -18,8 +18,16 @@ for (int i = 0; i < args.Length; i++)
 
     switch (arg)
     {
-        case "-l" or "--loglevel" when nextArg != null:
-            if (Enum.TryParse<LogLevel>(args[++i], true, out var level))
+        case "-l" or "--loglevel":
+            if (nextArg == null || nextArg.StartsWith('-'))
+            {
+                warnings.Add($"Option '{arg}' requires a value (Trace, Debug, Information, Warning, Error).");
+            }
+            else if (!Enum.TryParse<LogLevel>(args[++i], true, out var level))
+            {
+                warnings.Add($"Invalid log level '{args[i]}'. Valid values: Trace, Debug, Information, Warning, Error.");
+            }
+            else
             {
                 logLevel = level;
             }
@@ -27,14 +35,36 @@ for (int i = 0; i < args.Length; i++)
         case "-v" or "--verbose":
             logLevel = LogLevel.Trace;
             break;
-        case "--logFile" when nextArg != null:
-            logFile = args[++i];
+        case "--logFile":
+            if (nextArg == null || nextArg.StartsWith('-'))
+            {
+                warnings.Add($"Option '{arg}' requires a file path.");
+            }
+            else
+            {
+                logFile = args[++i];
+            }
             break;
-        case "-s" or "--source" when nextArg != null:
-            solutionPath = args[++i];
+        case "-s" or "--source":
+            if (nextArg == null || nextArg.StartsWith('-'))
+            {
+                warnings.Add($"Option '{arg}' requires a path.");
+            }
+            else
+            {
+                solutionPath = args[++i];
+            }
             break;
-        case "-hpid" or "--hostPID" when nextArg != null:
-            if (int.TryParse(args[++i], out var pid))
+        case "-hpid" or "--hostPID":
+            if (nextArg == null || nextArg.StartsWith('-'))
+            {
+                warnings.Add($"Option '{arg}' requires a process ID.");
+            }
+            else if (!int.TryParse(args[++i], out var pid))
+            {
+                warnings.Add($"Invalid process ID '{args[i]}'. Must be an integer.");
+            }
+            else
             {
                 hostPid = pid;
             }
@@ -51,7 +81,18 @@ for (int i = 0; i < args.Length; i++)
         case "--version":
             Console.WriteLine($"RazorSharp {VersionHelper.GetAssemblyVersion()}");
             return 0;
+        default:
+            warnings.Add($"Unknown option '{arg}'. Use --help to see available options.");
+            break;
     }
+}
+
+// Print any warnings
+// Use stdout when output is redirected (e.g., editor logs), stderr when interactive
+var warningOutput = Console.IsOutputRedirected ? Console.Out : Console.Error;
+foreach (var warning in warnings)
+{
+    warningOutput.WriteLine($"Warning: {warning}");
 }
 
 // Handle --download-dependencies mode
@@ -60,10 +101,8 @@ if (downloadDependenciesOnly)
     return await DownloadDependenciesAsync();
 }
 
-// Configure services
-var services = new ServiceCollection();
-
-services.AddLogging(builder =>
+// Configure logging
+using var loggerFactory = LoggerFactory.Create(builder =>
 {
     builder.SetMinimumLevel(logLevel);
 
@@ -79,17 +118,11 @@ services.AddLogging(builder =>
     }
 });
 
-services.AddSingleton(sp =>
-    new DependencyManager(sp.GetRequiredService<ILogger<DependencyManager>>()));
-
-services.AddSingleton<RazorLanguageServer>();
-
-var serviceProvider = services.BuildServiceProvider();
+var depManager = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>());
 
 // Check if dependencies are installed (don't download during LSP startup to avoid timeouts)
 if (!skipDependencyCheck)
 {
-    var depManager = serviceProvider.GetRequiredService<DependencyManager>();
     if (!depManager.AreDependenciesComplete())
     {
         Console.Error.WriteLine("ERROR: RazorSharp dependencies are not installed.");
@@ -102,7 +135,7 @@ if (!skipDependencyCheck)
 }
 
 // Run the server
-var server = serviceProvider.GetRequiredService<RazorLanguageServer>();
+var server = new RazorLanguageServer(loggerFactory, depManager);
 server.SetLogLevel(logLevel);
 if (solutionPath != null)
 {
@@ -191,8 +224,7 @@ static async Task<int> DownloadDependenciesAsync()
     var depManager = new DependencyManager(logger);
 
     // Use progress bar if output is a TTY, otherwise use simple line output
-    var isTty = !Console.IsOutputRedirected;
-    var progressBar = isTty ? new ProgressBar() : null;
+    var progressBar = !Console.IsOutputRedirected ? new ProgressBar() : null;
 
     try
     {
@@ -257,11 +289,11 @@ internal class ProgressBar
         // Try to extract percentage from messages like "Downloading Roslyn... 50%"
         if (message.StartsWith("Downloading ") &&
             message[^1] == '%' &&
-            char.IsDigit(message[^2]))
+            char.IsAsciiDigit(message[^2]))
         {
             // Scan backwards to find start of number
             var numStart = message.Length - 2;
-            while (numStart > 0 && char.IsDigit(message[numStart - 1]))
+            while (numStart > 0 && char.IsAsciiDigit(message[numStart - 1]))
             {
                 numStart--;
             }
