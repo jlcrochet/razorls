@@ -1016,7 +1016,20 @@ public class RazorLanguageServer : IAsyncDisposable
 
         // For non-C# files, forward as-is
         _logger.LogDebug("Forwarding textDocument/diagnostic to Roslyn for {Uri}", uri);
-        return await ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, @params, ct);
+        var forwardedResult = await ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, @params, ct);
+
+        // Return empty report if forwarding failed (e.g., project not initialized)
+        if (!forwardedResult.HasValue)
+        {
+            return JsonSerializer.SerializeToElement(new
+            {
+                kind = "full",
+                resultId = "pending",
+                items = Array.Empty<object>()
+            }, JsonOptions);
+        }
+
+        return forwardedResult;
     }
 
     #endregion
