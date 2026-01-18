@@ -19,26 +19,37 @@ public class LspMessageParser
     static ReadOnlySpan<byte> LineTerminator => "\r\n"u8;
 
     /// <summary>
-    /// Appends data to the internal buffer.
+    /// Gets a buffer to read data into directly.
+    /// Call <see cref="Advance"/> after reading to update the length.
     /// </summary>
-    public void Append(byte[] data, int count)
+    public Memory<byte> GetBuffer(int minSize = 4096)
     {
-        EnsureCapacity(count);
-        Buffer.BlockCopy(data, 0, _buffer, _length, count);
-        _length += count;
+        // Ensure there's at least minSize bytes available for reading into
+        var available = _buffer.Length - _length;
+        if (available < minSize)
+        {
+            Grow(minSize);
+        }
+        return _buffer.AsMemory(_length);
     }
 
-    void EnsureCapacity(int additionalBytes)
+    void Grow(int minSize)
     {
-        var required = _length + additionalBytes;
-        if (required <= _buffer.Length) return;
-
         var newSize = _buffer.Length;
+        var required = _length + minSize;
         while (newSize < required) newSize *= 2;
 
         var newBuffer = new byte[newSize];
         Buffer.BlockCopy(_buffer, 0, newBuffer, 0, _length);
         _buffer = newBuffer;
+    }
+
+    /// <summary>
+    /// Advances the buffer position after data has been read into it.
+    /// </summary>
+    public void Advance(int count)
+    {
+        _length += count;
     }
 
     /// <summary>

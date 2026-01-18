@@ -21,12 +21,12 @@ public class DependencyManager
     // VS Code C# extension version - used for Razor extension only
     const string ExtensionVersion = "2.111.2";
 
-    public DependencyManager(ILogger<DependencyManager> logger, string? basePath = null)
+    public DependencyManager(ILogger<DependencyManager> logger, string version, string? basePath = null)
     {
         _logger = logger;
         _basePath = basePath ?? GetDefaultBasePath();
         _httpClient = new HttpClient();
-        _httpClient.DefaultRequestHeaders.Add("User-Agent", $"RazorSharp/{VersionHelper.GetAssemblyVersion()}");
+        _httpClient.DefaultRequestHeaders.Add("User-Agent", $"RazorSharp/{version}");
     }
 
     public string BasePath => _basePath;

@@ -1,6 +1,13 @@
+using System.Reflection;
 using Microsoft.Extensions.Logging;
 using RazorSharp.Dependencies;
 using RazorSharp.Server;
+
+static string GetVersion() =>
+    Assembly.GetExecutingAssembly()
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+    ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
+    ?? "[unknown version]";
 
 // Parse command line arguments
 var logLevel = LogLevel.Information;
@@ -79,7 +86,7 @@ for (int i = 0; i < args.Length; i++)
             PrintHelp();
             return 0;
         case "--version":
-            Console.WriteLine($"RazorSharp {VersionHelper.GetAssemblyVersion()}");
+            Console.WriteLine($"RazorSharp {GetVersion()}");
             return 0;
         default:
             warnings.Add($"Unknown option '{arg}'. Use --help to see available options.");
@@ -118,7 +125,7 @@ using var loggerFactory = LoggerFactory.Create(builder =>
     }
 });
 
-var depManager = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>());
+var depManager = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), GetVersion());
 
 // Check if dependencies are installed (don't download during LSP startup to avoid timeouts)
 if (!skipDependencyCheck)
@@ -207,7 +214,7 @@ static void PrintHelp()
 
         The server communicates via Language Server Protocol over stdin/stdout.
 
-        Before first use, you must download dependencies (~100MB):
+        Before first use, you must download dependencies:
           razorsharp --download-dependencies
         """);
 }
@@ -221,7 +228,7 @@ static async Task<int> DownloadDependenciesAsync()
     using var loggerFactory = LoggerFactory.Create(builder => builder.SetMinimumLevel(LogLevel.Warning));
     var logger = loggerFactory.CreateLogger<DependencyManager>();
 
-    var depManager = new DependencyManager(logger);
+    var depManager = new DependencyManager(logger, GetVersion());
 
     // Use progress bar if output is a TTY, otherwise use simple line output
     var progressBar = !Console.IsOutputRedirected ? new ProgressBar() : null;

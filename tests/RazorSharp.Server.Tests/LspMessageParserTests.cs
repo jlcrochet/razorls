@@ -9,7 +9,9 @@ public class LspMessageParserTests
     private static void AppendToParser(LspMessageParser parser, string data)
     {
         var bytes = Encoding.UTF8.GetBytes(data);
-        parser.Append(bytes, bytes.Length);
+        var buffer = parser.GetBuffer(bytes.Length);
+        bytes.CopyTo(buffer);
+        parser.Advance(bytes.Length);
     }
 
     [Fact]
@@ -94,16 +96,19 @@ public class LspMessageParserTests
         var bytes = Encoding.UTF8.GetBytes(lspMessage);
 
         // Write first half
-        parser.Append(bytes, bytes.Length / 2);
+        var firstHalfLength = bytes.Length / 2;
+        var buffer1 = parser.GetBuffer(firstHalfLength);
+        bytes.AsSpan(0, firstHalfLength).CopyTo(buffer1.Span);
+        parser.Advance(firstHalfLength);
         var result1 = parser.TryParseMessage(out var doc1);
         Assert.False(result1);
         Assert.Null(doc1);
 
         // Write second half
-        var secondHalfStart = bytes.Length / 2;
-        var secondHalf = new byte[bytes.Length - secondHalfStart];
-        Buffer.BlockCopy(bytes, secondHalfStart, secondHalf, 0, secondHalf.Length);
-        parser.Append(secondHalf, secondHalf.Length);
+        var secondHalfLength = bytes.Length - firstHalfLength;
+        var buffer2 = parser.GetBuffer(secondHalfLength);
+        bytes.AsSpan(firstHalfLength).CopyTo(buffer2.Span);
+        parser.Advance(secondHalfLength);
 
         var result2 = parser.TryParseMessage(out var doc2);
         Assert.True(result2);

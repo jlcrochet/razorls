@@ -108,7 +108,6 @@ public class RoslynClient : IAsyncDisposable
                 {
                     kvp.Value.TrySetException(new IOException($"Roslyn process exited with code {exitCode}"));
                 }
-                _pendingRequests.Clear();
 
                 ProcessExited?.Invoke(this, exitCode);
             }
@@ -127,17 +126,17 @@ public class RoslynClient : IAsyncDisposable
 
     private async Task ReadMessagesAsync(CancellationToken ct)
     {
-        var buffer = new byte[65536];
         var parser = new LspMessageParser();
 
         try
         {
             while (!ct.IsCancellationRequested && _process != null && !_process.HasExited)
             {
+                var buffer = parser.GetBuffer();
                 var bytesRead = await _process.StandardOutput.BaseStream.ReadAsync(buffer, ct);
                 if (bytesRead == 0) break;
 
-                parser.Append(buffer, bytesRead);
+                parser.Advance(bytesRead);
 
                 // Try to parse complete messages from buffer
                 while (parser.TryParseMessage(out var message))
@@ -267,7 +266,13 @@ public class RoslynClient : IAsyncDisposable
             {
                 if (item.TryGetProperty("section", out var section))
                 {
-                    var sectionName = section.GetString() ?? "";
+                    var sectionName = section.GetString();
+                    if (string.IsNullOrEmpty(sectionName))
+                    {
+                        _logger.LogWarning("workspace/configuration request contained empty section name");
+                        results.Add(null);
+                        continue;
+                    }
                     _logger.LogDebug("Config section requested: {Section}", sectionName);
 
                     // First check hardcoded settings (required for cohosting and diagnostics)
@@ -287,6 +292,7 @@ public class RoslynClient : IAsyncDisposable
                 }
                 else
                 {
+                    _logger.LogWarning("workspace/configuration request item missing 'section' property");
                     results.Add(null);
                 }
             }

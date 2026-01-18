@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RazorSharp.Dependencies;
@@ -42,9 +43,11 @@ public class RazorLanguageServer : IAsyncDisposable
         PropertyNameCaseInsensitive = true
     };
 
-    static readonly string Version = VersionHelper.GetAssemblyVersion();
+    static readonly string Version = Assembly.GetExecutingAssembly()
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
+        ?? "unknown";
 
-    // Pre-computed arrays for LSP capabilities (avoid allocation on every initialize)
     static readonly int[] SymbolKindValues = Enum.GetValues<SymbolKind>().Cast<int>().ToArray();
     static readonly int[] CompletionItemKindValues = Enum.GetValues<CompletionItemKind>().Cast<int>().ToArray();
 
