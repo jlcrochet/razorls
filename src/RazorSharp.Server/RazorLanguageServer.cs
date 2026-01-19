@@ -241,6 +241,10 @@ public class RazorLanguageServer : IAsyncDisposable
                     // Open solution or projects FIRST - before documents
                     // Documents opened before project load won't have proper context
                     // Priority: CLI path > rootUri > workspaceFolders
+                    _logger.LogDebug("Workspace discovery: cliPath={CliPath}, rootUri={RootUri}, workspaceFolders={WorkspaceFolders}",
+                        _cliSolutionPath,
+                        _initParams?.RootUri,
+                        _initParams?.WorkspaceFolders?.Length ?? 0);
                     if (_cliSolutionPath != null)
                     {
                         await OpenWorkspaceAsync(new Uri(_cliSolutionPath).AbsoluteUri);

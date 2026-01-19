@@ -102,14 +102,17 @@ args = ["/path/to/razorsharp.dll"]
 [[language]]
 name = "c-sharp"
 language-servers = ["razorsharp"]
+roots = ["obj", "bin", ".git", "global.json"]
 
 [[language]]
 name = "razor"
 scope = "source.razor"
 file-types = ["razor", "cshtml"]
 language-servers = ["razorsharp"]
-roots = ["*.sln", "*.csproj"]
+roots = ["obj", "bin", ".git", "global.json"]
 ```
+
+> **Note:** Helix's `roots` configuration requires exact directory/file names, not glob patterns. Using `obj` or `bin` (created by `dotnet build`) ensures Helix finds the project root correctly.
 
 ### Other Editors
 
