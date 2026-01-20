@@ -64,15 +64,15 @@ public class HtmlLanguageClient : IAsyncDisposable
         if (!_enabled || _initialized || _startAttempted)
             return;
 
-        await _startLock.WaitAsync(cancellationToken);
+        await _startLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (_initialized || _startAttempted)
                 return;
 
             _startAttempted = true;
-            await StartAsync(cancellationToken);
-            await InitializeAsync(cancellationToken);
+            await StartAsync(cancellationToken).ConfigureAwait(false);
+            await InitializeAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -185,8 +185,8 @@ public class HtmlLanguageClient : IAsyncDisposable
             }
         };
 
-        await _rpc.InvokeWithParameterObjectAsync<JsonElement>("initialize", initParams, cancellationToken);
-        await _rpc.NotifyAsync("initialized");
+        await _rpc.InvokeWithParameterObjectAsync<JsonElement>("initialize", initParams, cancellationToken).ConfigureAwait(false);
+        await _rpc.NotifyAsync("initialized").ConfigureAwait(false);
 
         _initialized = true;
         _logger.LogInformation("HTML language server initialized");
@@ -204,7 +204,7 @@ public class HtmlLanguageClient : IAsyncDisposable
         }
 
         // Lazily start the HTML language server on first Razor file
-        await EnsureStartedAsync(cancellationToken);
+        await EnsureStartedAsync(cancellationToken).ConfigureAwait(false);
 
         // Store the projection even if HTML LS failed to start
         if (_rpc == null || !_initialized)
@@ -235,7 +235,7 @@ public class HtmlLanguageClient : IAsyncDisposable
             {
                 textDocument = new { uri = virtualUri, version = newVersion },
                 contentChanges = new[] { new { text = htmlContent } }
-            });
+            }).ConfigureAwait(false);
 
             _logger.LogDebug("Updated HTML projection for {Uri} (checksum: {Checksum})", razorUri, checksum);
         }
@@ -254,7 +254,7 @@ public class HtmlLanguageClient : IAsyncDisposable
                     version = 1,
                     text = htmlContent
                 }
-            });
+            }).ConfigureAwait(false);
 
             _logger.LogDebug("Opened HTML projection for {Uri} (checksum: {Checksum})", razorUri, checksum);
         }
@@ -290,7 +290,7 @@ public class HtmlLanguageClient : IAsyncDisposable
             var result = await _rpc.InvokeWithParameterObjectAsync<JsonElement?>(
                 "textDocument/formatting",
                 @params,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
 
             _logger.LogDebug("HTML formatting returned {Count} edits",
                 result?.ValueKind == JsonValueKind.Array ? result.Value.GetArrayLength() : 0);
@@ -339,7 +339,7 @@ public class HtmlLanguageClient : IAsyncDisposable
             return await _rpc.InvokeWithParameterObjectAsync<JsonElement?>(
                 "textDocument/rangeFormatting",
                 @params,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -503,10 +503,10 @@ public class HtmlLanguageClient : IAsyncDisposable
             {
                 // Send shutdown request and wait for response
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                await _rpc.InvokeWithCancellationAsync<object?>("shutdown", cancellationToken: cts.Token);
+                await _rpc.InvokeWithCancellationAsync<object?>("shutdown", cancellationToken: cts.Token).ConfigureAwait(false);
 
                 // Send exit notification
-                await _rpc.NotifyAsync("exit");
+                await _rpc.NotifyAsync("exit").ConfigureAwait(false);
 
                 // Dispose RPC before waiting (closes streams, signals EOF to process)
                 _rpc.Dispose();

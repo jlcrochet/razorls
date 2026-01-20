@@ -286,7 +286,7 @@ internal class ProgressBar
     {
         int width;
         try { width = Console.WindowWidth; }
-        catch { width = 120; }
+        catch (IOException) { width = 120; }  // Console not available (e.g., redirected output)
         _padding = new char[width];
         Array.Fill(_padding, ' ');
     }
