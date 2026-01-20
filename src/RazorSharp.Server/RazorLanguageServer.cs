@@ -36,6 +36,7 @@ public class RazorLanguageServer : IAsyncDisposable
     DateTime _workspaceOpenedAt;
     readonly HashSet<string> _openDocuments = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, List<JsonElement>> _pendingChanges = new(StringComparer.OrdinalIgnoreCase);
+    readonly Lock _documentTrackingLock = new();
 
     static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -56,6 +57,42 @@ public class RazorLanguageServer : IAsyncDisposable
     static readonly JsonElement DefaultFormattingOptions = JsonSerializer.SerializeToElement(new { tabSize = 4, insertSpaces = true });
 
     const string VirtualHtmlSuffix = "__virtual.html";
+
+    // Language identifiers
+    const string LanguageIdAspNetCoreRazor = "aspnetcorerazor";
+    const string LanguageIdCSharp = "csharp";
+
+    // Roslyn client command names
+    const string RoslynClientCommandPrefix = "roslyn.client.";
+    const string NestedCodeActionCommand = "roslyn.client.nestedCodeAction";
+    const string FixAllCodeActionCommand = "roslyn.client.fixAllCodeAction";
+    const string CompletionComplexEditCommand = "roslyn.client.completionComplexEdit";
+
+    // Static arrays for capabilities to avoid repeated allocations
+    static readonly string[] DocumentationFormats = ["markdown", "plaintext"];
+    static readonly string[] CompletionResolveProperties = ["documentation", "detail", "additionalTextEdits"];
+    static readonly string[] CodeActionKindValues =
+    [
+        "quickfix", "refactor", "refactor.extract", "refactor.inline",
+        "refactor.rewrite", "source", "source.organizeImports", "source.fixAll"
+    ];
+    static readonly string[] CodeActionResolveProperties = ["edit"];
+    static readonly int[] DiagnosticTagValues = [1, 2];
+    static readonly string[] FoldingRangeKindValues = ["comment", "imports", "region"];
+    static readonly string[] SemanticTokenTypes =
+    [
+        "namespace", "type", "class", "enum", "interface", "struct",
+        "typeParameter", "parameter", "variable", "property", "enumMember",
+        "event", "function", "method", "macro", "keyword", "modifier",
+        "comment", "string", "number", "regexp", "operator", "decorator"
+    ];
+    static readonly string[] SemanticTokenModifiers =
+    [
+        "declaration", "definition", "readonly", "static", "deprecated",
+        "abstract", "async", "modification", "documentation", "defaultLibrary"
+    ];
+    static readonly string[] SemanticTokenFormats = ["relative"];
+    static readonly string[] InlayHintResolveProperties = ["tooltip", "textEdits", "label.tooltip", "label.location", "label.command"];
 
     public RazorLanguageServer(ILoggerFactory loggerFactory, DependencyManager dependencyManager)
     {
@@ -319,11 +356,11 @@ public class RazorLanguageServer : IAsyncDisposable
         var languageId = @params.TextDocument.LanguageId;
         if (IsRazorUri(uri))
         {
-            languageId = "aspnetcorerazor";
+            languageId = LanguageIdAspNetCoreRazor;
         }
         else if (IsCSharpUri(uri) || languageId == "c-sharp")
         {
-            languageId = "csharp";
+            languageId = LanguageIdCSharp;
         }
 
         var roslynParams = new
@@ -358,14 +395,16 @@ public class RazorLanguageServer : IAsyncDisposable
             _logger.LogDebug("Forwarding didOpen to Roslyn for {Uri}", uri);
             await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidOpen, roslynParamsJson);
 
-            // Track this document as open so we can forward didChange for it
-            _openDocuments.Add(uri);
-
-            // Replay any buffered changes that came in before didOpen was forwarded
+            // Track this document as open and retrieve any buffered changes atomically
+            // to prevent race conditions with HandleDidChangeAsync
             List<JsonElement>? pendingChanges = null;
-            if (_pendingChanges.TryGetValue(uri, out pendingChanges))
+            lock (_documentTrackingLock)
             {
-                _pendingChanges.Remove(uri);
+                _openDocuments.Add(uri);
+                if (_pendingChanges.TryGetValue(uri, out pendingChanges))
+                {
+                    _pendingChanges.Remove(uri);
+                }
             }
 
             if (pendingChanges != null && pendingChanges.Count > 0)
@@ -410,20 +449,28 @@ public class RazorLanguageServer : IAsyncDisposable
 
             if (uri != null)
             {
-                if (_openDocuments.Contains(uri))
+                // Check document state and buffer if needed atomically
+                // to prevent race conditions with HandleDidOpenAsync
+                bool isOpen;
+                lock (_documentTrackingLock)
+                {
+                    isOpen = _openDocuments.Contains(uri);
+                    if (!isOpen)
+                    {
+                        // Buffer the change to replay after didOpen is forwarded
+                        _logger.LogDebug("Buffering didChange for {Uri} - document not yet open in Roslyn", uri);
+                        if (!_pendingChanges.TryGetValue(uri, out var changes))
+                        {
+                            changes = new List<JsonElement>();
+                            _pendingChanges[uri] = changes;
+                        }
+                        changes.Add(paramsJson.Clone());
+                    }
+                }
+
+                if (isOpen)
                 {
                     await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidChange, paramsJson);
-                }
-                else
-                {
-                    // Buffer the change to replay after didOpen is forwarded
-                    _logger.LogDebug("Buffering didChange for {Uri} - document not yet open in Roslyn", uri);
-                    if (!_pendingChanges.TryGetValue(uri, out var changes))
-                    {
-                        changes = new List<JsonElement>();
-                        _pendingChanges[uri] = changes;
-                    }
-                    changes.Add(paramsJson.Clone());
                 }
             }
         }
@@ -548,107 +595,117 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             var title = action.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : "(no title)";
 
-            // Check if this action has a roslyn.client.nestedCodeAction command
-            if (action.TryGetProperty("command", out var command) &&
-                command.TryGetProperty("command", out var commandName) &&
-                commandName.GetString() == "roslyn.client.nestedCodeAction" &&
-                command.TryGetProperty("arguments", out var arguments) &&
-                arguments.GetArrayLength() > 0)
+            if (TryGetNestedCodeActions(action, out var nestedActions))
             {
                 nestedCount++;
-                var arg = arguments[0];
-                if (arg.TryGetProperty("NestedCodeActions", out var nestedActions))
-                {
-                    var nestedActionCount = nestedActions.GetArrayLength();
-                    _logger.LogDebug("Expanding nested action '{Title}' with {Count} sub-actions", title, nestedActionCount);
-
-                    // Expand each nested action as a top-level action
-                    foreach (var nested in nestedActions.EnumerateArray())
-                    {
-                        // Get the nested action's title, falling back to parent title if empty
-                        var originalTitle = nested.TryGetProperty("title", out var nestedTitleProp)
-                            ? nestedTitleProp.GetString()
-                            : null;
-                        var nestedTitle = string.IsNullOrEmpty(originalTitle) ? title : originalTitle;
-                        if (string.IsNullOrEmpty(nestedTitle))
-                        {
-                            _logger.LogError("Skipping nested code action with no title");
-                            continue;
-                        }
-
-                        // Check if action needs resolution (has data but no edit)
-                        var hasEdit = nested.TryGetProperty("edit", out _);
-                        var hasData = nested.TryGetProperty("data", out _);
-
-                        JsonElement finalAction;
-                        if (!hasEdit && hasData)
-                        {
-                            // Pre-resolve the action to get the edit
-                            _logger.LogDebug("  Pre-resolving action: {Title}", nestedTitle);
-                            var resolved = await ForwardToRoslynAsync(LspMethods.CodeActionResolve, nested, ct);
-                            if (resolved.HasValue)
-                            {
-                                finalAction = resolved.Value;
-                                _logger.LogDebug("  Resolved action: {Title}", nestedTitle);
-                            }
-                            else
-                            {
-                                // Resolution failed, use original
-                                finalAction = nested;
-                                _logger.LogWarning("  Failed to resolve action: {Title}", nestedTitle);
-                            }
-                        }
-                        else
-                        {
-                            // Already has edit or no data, use as-is
-                            finalAction = nested;
-                        }
-
-                        // Only clone if we need to change the title
-                        if (string.IsNullOrEmpty(originalTitle))
-                        {
-                            finalAction = CloneWithNewTitle(finalAction, nestedTitle);
-                        }
-
-                        expandedActions.Add(finalAction);
-                        _logger.LogDebug("  Added expanded action: {Title}", nestedTitle);
-                    }
-                }
-                else
-                {
-                    _logger.LogDebug("Nested action '{Title}' has no NestedCodeActions, keeping original", title);
-                    expandedActions.Add(action);
-                }
+                _logger.LogDebug("Expanding nested action '{Title}' with {Count} sub-actions", title, nestedActions.GetArrayLength());
+                await ExpandNestedActionsAsync(nestedActions, title, expandedActions, ct);
+            }
+            else if (IsNestedCodeActionWithoutChildren(action))
+            {
+                _logger.LogDebug("Nested action '{Title}' has no NestedCodeActions, keeping original", title);
+                expandedActions.Add(action);
             }
             else
             {
-                // Not a nested action - check if it needs resolution
-                var hasEdit = action.TryGetProperty("edit", out _);
-                var hasData = action.TryGetProperty("data", out _);
-
-                if (!hasEdit && hasData)
-                {
-                    // Pre-resolve the action
-                    _logger.LogDebug("Pre-resolving non-nested action: {Title}", title);
-                    var resolved = await ForwardToRoslynAsync(LspMethods.CodeActionResolve, action, ct);
-                    if (resolved.HasValue)
-                    {
-                        expandedActions.Add(resolved.Value);
-                    }
-                    else
-                    {
-                        expandedActions.Add(action);
-                    }
-                }
-                else
-                {
-                    expandedActions.Add(action);
-                }
+                var resolved = await ResolveCodeActionIfNeededAsync(action, title, ct);
+                expandedActions.Add(resolved);
             }
         }
 
         _logger.LogDebug("Expanded {NestedCount} nested actions, returning {TotalCount} total actions", nestedCount, expandedActions.Count);
         return JsonSerializer.SerializeToElement(expandedActions, JsonOptions);
+    }
+
+    /// <summary>
+    /// Checks if the action is a roslyn.client.nestedCodeAction and extracts the nested actions.
+    /// </summary>
+    private static bool TryGetNestedCodeActions(JsonElement action, out JsonElement nestedActions)
+    {
+        nestedActions = default;
+
+        if (action.TryGetProperty("command", out var command) &&
+            command.TryGetProperty("command", out var commandName) &&
+            commandName.GetString() == NestedCodeActionCommand &&
+            command.TryGetProperty("arguments", out var arguments) &&
+            arguments.GetArrayLength() > 0)
+        {
+            var arg = arguments[0];
+            if (arg.TryGetProperty("NestedCodeActions", out nestedActions))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Checks if the action has a nestedCodeAction command but no actual nested actions.
+    /// </summary>
+    private static bool IsNestedCodeActionWithoutChildren(JsonElement action)
+    {
+        return action.TryGetProperty("command", out var command) &&
+               command.TryGetProperty("command", out var commandName) &&
+               commandName.GetString() == NestedCodeActionCommand;
+    }
+
+    /// <summary>
+    /// Expands nested code actions into the result list, resolving each if needed.
+    /// </summary>
+    private async Task ExpandNestedActionsAsync(
+        JsonElement nestedActions,
+        string? parentTitle,
+        List<JsonElement> expandedActions,
+        CancellationToken ct)
+    {
+        foreach (var nested in nestedActions.EnumerateArray())
+        {
+            var originalTitle = nested.TryGetProperty("title", out var nestedTitleProp)
+                ? nestedTitleProp.GetString()
+                : null;
+            var nestedTitle = string.IsNullOrEmpty(originalTitle) ? parentTitle : originalTitle;
+
+            if (string.IsNullOrEmpty(nestedTitle))
+            {
+                _logger.LogError("Skipping nested code action with no title");
+                continue;
+            }
+
+            var finalAction = await ResolveCodeActionIfNeededAsync(nested, nestedTitle, ct);
+
+            // Clone with parent title if the nested action had no title
+            if (string.IsNullOrEmpty(originalTitle))
+            {
+                finalAction = CloneWithNewTitle(finalAction, nestedTitle);
+            }
+
+            expandedActions.Add(finalAction);
+            _logger.LogDebug("  Added expanded action: {Title}", nestedTitle);
+        }
+    }
+
+    /// <summary>
+    /// Resolves a code action if it has data but no edit.
+    /// </summary>
+    private async Task<JsonElement> ResolveCodeActionIfNeededAsync(JsonElement action, string? title, CancellationToken ct)
+    {
+        var hasEdit = action.TryGetProperty("edit", out _);
+        var hasData = action.TryGetProperty("data", out _);
+
+        if (!hasEdit && hasData)
+        {
+            _logger.LogDebug("Pre-resolving action: {Title}", title);
+            var resolved = await ForwardToRoslynAsync(LspMethods.CodeActionResolve, action, ct);
+            if (resolved.HasValue)
+            {
+                _logger.LogDebug("Resolved action: {Title}", title);
+                return resolved.Value;
+            }
+            _logger.LogWarning("Failed to resolve action: {Title}", title);
+        }
+
+        return action;
     }
 
     /// <summary>
@@ -756,7 +813,7 @@ public class RazorLanguageServer : IAsyncDisposable
         if (@params.TryGetProperty("command", out var commandProp))
         {
             var command = commandProp.GetString();
-            if (command != null && command.StartsWith("roslyn.client."))
+            if (command != null && command.StartsWith(RoslynClientCommandPrefix, StringComparison.Ordinal))
             {
                 return await HandleRoslynClientCommandAsync(command, @params, ct);
             }
@@ -775,14 +832,14 @@ public class RazorLanguageServer : IAsyncDisposable
 
         switch (command)
         {
-            case "roslyn.client.nestedCodeAction":
+            case NestedCodeActionCommand:
                 return await HandleNestedCodeActionAsync(@params, ct);
 
-            case "roslyn.client.fixAllCodeAction":
+            case FixAllCodeActionCommand:
                 // Fix All actions need special handling - forward to Roslyn's fix all resolver
                 return await HandleFixAllCodeActionAsync(@params, ct);
 
-            case "roslyn.client.completionComplexEdit":
+            case CompletionComplexEditCommand:
                 // Complex completion edits - these should be handled by the editor
                 // We can't do much here as they require cursor positioning
                 _logger.LogDebug("completionComplexEdit: Ignoring (editor should handle)");
@@ -1152,9 +1209,18 @@ public class RazorLanguageServer : IAsyncDisposable
     {
         try
         {
-            var uri = @params.GetProperty("textDocument").GetProperty("uri").GetString();
-            var checksum = @params.GetProperty("checksum").GetString();
-            var text = @params.GetProperty("text").GetString();
+            if (!@params.TryGetProperty("textDocument", out var textDocument) ||
+                !textDocument.TryGetProperty("uri", out var uriProp) ||
+                !@params.TryGetProperty("checksum", out var checksumProp) ||
+                !@params.TryGetProperty("text", out var textProp))
+            {
+                _logger.LogWarning("razor/updateHtml missing required properties");
+                return;
+            }
+
+            var uri = uriProp.GetString();
+            var checksum = checksumProp.GetString();
+            var text = textProp.GetString();
 
             if (uri != null && checksum != null && text != null)
             {
@@ -1462,11 +1528,11 @@ public class RazorLanguageServer : IAsyncDisposable
                     {
                         snippetSupport = true,
                         commitCharactersSupport = true,
-                        documentationFormat = new[] { "markdown", "plaintext" },
+                        documentationFormat = DocumentationFormats,
                         deprecatedSupport = true,
                         preselectSupport = true,
                         insertReplaceSupport = true,
-                        resolveSupport = new { properties = new[] { "documentation", "detail", "additionalTextEdits" } }
+                        resolveSupport = new { properties = CompletionResolveProperties }
                     },
                     completionItemKind = new { valueSet = CompletionItemKindValues },
                     contextSupport = true
@@ -1474,14 +1540,14 @@ public class RazorLanguageServer : IAsyncDisposable
                 hover = new
                 {
                     dynamicRegistration = true,
-                    contentFormat = new[] { "markdown", "plaintext" }
+                    contentFormat = DocumentationFormats
                 },
                 signatureHelp = new
                 {
                     dynamicRegistration = true,
                     signatureInformation = new
                     {
-                        documentationFormat = new[] { "markdown", "plaintext" },
+                        documentationFormat = DocumentationFormats,
                         parameterInformation = new { labelOffsetSupport = true },
                         activeParameterSupport = true
                     },
@@ -1505,17 +1571,13 @@ public class RazorLanguageServer : IAsyncDisposable
                     {
                         codeActionKind = new
                         {
-                            valueSet = new[]
-                            {
-                                "quickfix", "refactor", "refactor.extract", "refactor.inline",
-                                "refactor.rewrite", "source", "source.organizeImports", "source.fixAll"
-                            }
+                            valueSet = CodeActionKindValues
                         }
                     },
                     isPreferredSupport = true,
                     disabledSupport = true,
                     dataSupport = true,
-                    resolveSupport = new { properties = new[] { "edit" } }
+                    resolveSupport = new { properties = CodeActionResolveProperties }
                 },
                 formatting = new { dynamicRegistration = true },
                 rangeFormatting = new { dynamicRegistration = true },
@@ -1530,7 +1592,7 @@ public class RazorLanguageServer : IAsyncDisposable
                 publishDiagnostics = new
                 {
                     relatedInformation = true,
-                    tagSupport = new { valueSet = new[] { 1, 2 } },
+                    tagSupport = new { valueSet = DiagnosticTagValues },
                     versionSupport = true,
                     codeDescriptionSupport = true,
                     dataSupport = true
@@ -1540,32 +1602,22 @@ public class RazorLanguageServer : IAsyncDisposable
                     dynamicRegistration = true,
                     rangeLimit = 5000,
                     lineFoldingOnly = false,
-                    foldingRangeKind = new { valueSet = new[] { "comment", "imports", "region" } }
+                    foldingRangeKind = new { valueSet = FoldingRangeKindValues }
                 },
                 semanticTokens = new
                 {
                     dynamicRegistration = true,
                     requests = new { range = true, full = new { delta = true } },
-                    tokenTypes = new[]
-                    {
-                        "namespace", "type", "class", "enum", "interface", "struct",
-                        "typeParameter", "parameter", "variable", "property", "enumMember",
-                        "event", "function", "method", "macro", "keyword", "modifier",
-                        "comment", "string", "number", "regexp", "operator", "decorator"
-                    },
-                    tokenModifiers = new[]
-                    {
-                        "declaration", "definition", "readonly", "static", "deprecated",
-                        "abstract", "async", "modification", "documentation", "defaultLibrary"
-                    },
-                    formats = new[] { "relative" },
+                    tokenTypes = SemanticTokenTypes,
+                    tokenModifiers = SemanticTokenModifiers,
+                    formats = SemanticTokenFormats,
                     overlappingTokenSupport = false,
                     multilineTokenSupport = true
                 },
                 inlayHint = new
                 {
                     dynamicRegistration = true,
-                    resolveSupport = new { properties = new[] { "tooltip", "textEdits", "label.tooltip", "label.location", "label.command" } }
+                    resolveSupport = new { properties = InlayHintResolveProperties }
                 },
                 diagnostic = new
                 {
@@ -1776,10 +1828,7 @@ public class RazorLanguageServer : IAsyncDisposable
             var uri = uriProp.GetString();
             if (uri != null && TryMapSourceGeneratedUri(uri, out var filePath))
             {
-                // Clone and replace uri
-                var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(element.GetRawText())!;
-                dict["uri"] = JsonSerializer.SerializeToElement(new Uri(filePath).AbsoluteUri);
-                return JsonSerializer.SerializeToElement(dict);
+                return CloneJsonElementWithReplacedProperty(element, "uri", new Uri(filePath).AbsoluteUri);
             }
         }
         else if (element.TryGetProperty("targetUri", out var targetUriProp))
@@ -1787,14 +1836,38 @@ public class RazorLanguageServer : IAsyncDisposable
             var uri = targetUriProp.GetString();
             if (uri != null && TryMapSourceGeneratedUri(uri, out var filePath))
             {
-                // Clone and replace targetUri
-                var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(element.GetRawText())!;
-                dict["targetUri"] = JsonSerializer.SerializeToElement(new Uri(filePath).AbsoluteUri);
-                return JsonSerializer.SerializeToElement(dict);
+                return CloneJsonElementWithReplacedProperty(element, "targetUri", new Uri(filePath).AbsoluteUri);
             }
         }
 
         return element;
+    }
+
+    /// <summary>
+    /// Clones a JsonElement, replacing a single string property value.
+    /// Uses Utf8JsonWriter to avoid expensive Dictionary deserialization/serialization.
+    /// </summary>
+    private static JsonElement CloneJsonElementWithReplacedProperty(JsonElement element, string propertyName, string newValue)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            foreach (var prop in element.EnumerateObject())
+            {
+                if (prop.Name == propertyName)
+                {
+                    writer.WriteString(propertyName, newValue);
+                }
+                else
+                {
+                    prop.WriteTo(writer);
+                }
+            }
+            writer.WriteEndObject();
+        }
+
+        return JsonDocument.Parse(stream.GetBuffer().AsMemory(0, (int)stream.Length)).RootElement.Clone();
     }
 
     /// <summary>
@@ -1855,8 +1928,9 @@ public class RazorLanguageServer : IAsyncDisposable
         foreach (var objDir in Directory.EnumerateDirectories(_workspaceRoot!, "obj", SearchOption.AllDirectories))
         {
             // Enumerate all configuration directories, but check Debug first if it exists
+            // OrderByDescending with bool puts true (Debug match) first since true > false
             var configDirs = Directory.EnumerateDirectories(objDir)
-                .OrderByDescending(d => Path.GetFileName(d).Equals("Debug", StringComparison.OrdinalIgnoreCase));
+                .OrderByDescending(d => Path.GetFileName(d).Equals("Debug", StringComparison.OrdinalIgnoreCase) ? 1 : 0);
 
             foreach (var configDir in configDirs)
             {
