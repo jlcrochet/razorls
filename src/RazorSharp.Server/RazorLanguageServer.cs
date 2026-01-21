@@ -1757,15 +1757,15 @@ public class RazorLanguageServer : IAsyncDisposable
 
         // Use HashSet for O(n) duplicate detection in a single pass
         var seen = new HashSet<string>();
-        List<string>? duplicates = null;
+        HashSet<string>? duplicates = null;
 
         foreach (var item in custom)
         {
             if (!seen.Add(item))
             {
+                // HashSet.Add returns false for duplicates, so just add to duplicates set
                 duplicates ??= [];
-                if (!duplicates.Contains(item))
-                    duplicates.Add(item);
+                duplicates.Add(item);
             }
         }
 
@@ -1773,7 +1773,7 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             _logger.LogWarning("Duplicate {OptionName}: {Duplicates}",
                 optionName, string.Join(", ", duplicates.Select(c => '"' + c + '"')));
-            return seen.ToArray();
+            return [.. seen];
         }
 
         return custom;
@@ -1799,23 +1799,40 @@ public class RazorLanguageServer : IAsyncDisposable
 
         if (response.ValueKind == JsonValueKind.Array)
         {
-            var items = response.EnumerateArray().ToArray();
-            var anyChanged = false;
+            // First pass: check if any items need transformation
+            List<JsonElement>? transformed = null;
+            var index = 0;
 
-            var transformed = Array.ConvertAll(items, item => {
+            foreach (var item in response.EnumerateArray())
+            {
                 var newItem = TransformLocationElement(item);
-                if (!anyChanged) anyChanged = !item.Equals(newItem);
-                return newItem;
-            });
 
-            if (anyChanged)
+                if (transformed != null)
+                {
+                    // Already started collecting, add this item
+                    transformed.Add(newItem);
+                }
+                else if (item.GetRawText() != newItem.GetRawText())
+                {
+                    // First changed item - copy all previous items and this one
+                    transformed = new List<JsonElement>(response.GetArrayLength());
+                    var prevIndex = 0;
+                    foreach (var prev in response.EnumerateArray())
+                    {
+                        if (prevIndex >= index) break;
+                        transformed.Add(prev);
+                        prevIndex++;
+                    }
+                    transformed.Add(newItem);
+                }
+                index++;
+            }
+
+            if (transformed != null)
             {
                 return JsonSerializer.SerializeToElement(transformed);
             }
-            else
-            {
-                return response;
-            }
+            return response;
         }
 
         // Single location
@@ -1929,13 +1946,24 @@ public class RazorLanguageServer : IAsyncDisposable
         // Search in workspace root and all subdirectories (for multi-project solutions)
         foreach (var objDir in Directory.EnumerateDirectories(_workspaceRoot!, "obj", SearchOption.AllDirectories))
         {
-            // Enumerate all configuration directories, but check Debug first if it exists
-            // OrderByDescending with bool puts true (Debug match) first since true > false
-            var configDirs = Directory.EnumerateDirectories(objDir)
-                .OrderByDescending(d => Path.GetFileName(d).Equals("Debug", StringComparison.OrdinalIgnoreCase) ? 1 : 0);
+            // Check Debug first if it exists, then other configurations
+            string? debugDir = null;
 
-            foreach (var configDir in configDirs)
+            foreach (var configDir in Directory.EnumerateDirectories(objDir))
             {
+                if (Path.GetFileName(configDir).Equals("Debug", StringComparison.OrdinalIgnoreCase))
+                {
+                    debugDir = configDir;
+                    var path = FindGeneratedFileInConfig(configDir, assemblyName, typeName, hintName);
+                    if (path != null) return path;
+                    break;
+                }
+            }
+
+            // Check remaining configurations
+            foreach (var configDir in Directory.EnumerateDirectories(objDir))
+            {
+                if (configDir == debugDir) continue;
                 var path = FindGeneratedFileInConfig(configDir, assemblyName, typeName, hintName);
                 if (path != null) return path;
             }
