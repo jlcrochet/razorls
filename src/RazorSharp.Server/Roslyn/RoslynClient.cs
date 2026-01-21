@@ -18,6 +18,8 @@ public class RoslynClient : IAsyncDisposable
     bool _disposed;
     CancellationTokenSource? _readCts;
     Task? _readTask;
+    Task? _stderrTask;
+    Task? _exitMonitorTask;
     long _nextId = 0;
     readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement?>> _pendingRequests = new();
     readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -81,21 +83,26 @@ public class RoslynClient : IAsyncDisposable
             throw new InvalidOperationException("Failed to start Roslyn process");
         }
 
-        // Capture stderr for logging
-        _ = Task.Run(async () =>
+        // Capture stderr for logging (track task for cleanup)
+        _stderrTask = Task.Run(async () =>
         {
-            while (!_process.HasExited)
+            try
             {
-                var line = await _process.StandardError.ReadLineAsync(cancellationToken);
-                if (line != null)
+                while (!_process.HasExited)
                 {
-                    _logger.LogDebug("[Roslyn stderr] {Line}", line);
+                    var line = await _process.StandardError.ReadLineAsync(cancellationToken);
+                    if (line != null)
+                    {
+                        _logger.LogDebug("[Roslyn stderr] {Line}", line);
+                    }
                 }
             }
+            catch (OperationCanceledException) { }
+            catch (ObjectDisposedException) { }
         }, cancellationToken);
 
-        // Monitor process exit
-        _ = Task.Run(async () =>
+        // Monitor process exit (track task for cleanup)
+        _exitMonitorTask = Task.Run(async () =>
         {
             try
             {
@@ -531,6 +538,21 @@ public class RoslynClient : IAsyncDisposable
         }
 
         _readCts?.Cancel();
+
+        // Wait briefly for background tasks to complete
+        try
+        {
+            var tasksToWait = new List<Task>();
+            if (_stderrTask != null) tasksToWait.Add(_stderrTask);
+            if (_exitMonitorTask != null) tasksToWait.Add(_exitMonitorTask);
+            if (_readTask != null) tasksToWait.Add(_readTask);
+            if (tasksToWait.Count > 0)
+            {
+                await Task.WhenAll(tasksToWait).WaitAsync(TimeSpan.FromSeconds(1));
+            }
+        }
+        catch { /* Ignore timeout or task exceptions during cleanup */ }
+
         _sendLock.Dispose();
     }
 

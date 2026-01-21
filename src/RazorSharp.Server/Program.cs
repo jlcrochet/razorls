@@ -379,7 +379,7 @@ internal class StderrLogger : ILogger
     public StderrLogger(string category) => _category = category;
     public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
     public bool IsEnabled(LogLevel logLevel) => true;
-    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    public void Log<TState>(LogLevel logLevel, EventId _, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
     {
         var dotIndex = _category.LastIndexOf('.');
         var shortCategory = dotIndex != -1 ? _category.AsSpan(dotIndex + 1) : _category;
@@ -426,7 +426,7 @@ internal class FileLogger : ILogger
 
     public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
     public bool IsEnabled(LogLevel logLevel) => true;
-    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    public void Log<TState>(LogLevel logLevel, EventId _, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
     {
         var dotIndex = _category.LastIndexOf('.');
         var shortCategory = dotIndex != -1 ? _category.AsSpan(dotIndex + 1) : _category;

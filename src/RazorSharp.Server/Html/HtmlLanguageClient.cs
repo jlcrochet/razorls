@@ -18,6 +18,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     readonly SemaphoreSlim _startLock = new(1, 1);
     Process? _process;
     JsonRpc? _rpc;
+    Task? _stderrTask;
     bool _initialized;
     bool _disposed;
     bool _enabled = true;
@@ -133,17 +134,22 @@ public class HtmlLanguageClient : IAsyncDisposable
             return;
         }
 
-        // Capture stderr
-        _ = Task.Run(async () =>
+        // Capture stderr (track task for cleanup)
+        _stderrTask = Task.Run(async () =>
         {
-            while (_process != null && !_process.HasExited)
+            try
             {
-                var line = await _process.StandardError.ReadLineAsync(cancellationToken);
-                if (line != null)
+                while (_process != null && !_process.HasExited)
                 {
-                    _logger.LogDebug("[HTML LS stderr] {Line}", line);
+                    var line = await _process.StandardError.ReadLineAsync(cancellationToken);
+                    if (line != null)
+                    {
+                        _logger.LogDebug("[HTML LS stderr] {Line}", line);
+                    }
                 }
             }
+            catch (OperationCanceledException) { }
+            catch (ObjectDisposedException) { }
         }, cancellationToken);
 
         var formatter = new SystemTextJsonFormatter
@@ -474,8 +480,8 @@ public class HtmlLanguageClient : IAsyncDisposable
                 if (process.ExitCode == 0 && !string.IsNullOrEmpty(output))
                 {
                     // 'where' on Windows may return multiple lines; take the first
-                    var firstLine = output.Split(['\r', '\n'], 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-                    return firstLine;
+                    var newlineIdx = output.IndexOfAny(['\r', '\n']);
+                    return newlineIdx >= 0 ? output[..newlineIdx] : output;
                 }
             }
         }
@@ -521,6 +527,13 @@ public class HtmlLanguageClient : IAsyncDisposable
                 else
                 {
                     _logger.LogDebug("HTML language server exited gracefully");
+                }
+
+                // Wait for stderr task to complete
+                if (_stderrTask != null)
+                {
+                    try { await _stderrTask.WaitAsync(TimeSpan.FromSeconds(1)); }
+                    catch { /* Ignore timeout */ }
                 }
             }
             catch (Exception ex)
