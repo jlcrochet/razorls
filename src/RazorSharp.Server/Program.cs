@@ -125,7 +125,7 @@ using var loggerFactory = LoggerFactory.Create(builder =>
     }
 });
 
-var depManager = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), GetVersion());
+using var depManager = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), GetVersion());
 
 // Check if dependencies are installed (don't download during LSP startup to avoid timeouts)
 if (!skipDependencyCheck)
@@ -228,7 +228,7 @@ static async Task<int> DownloadDependenciesAsync()
     using var loggerFactory = LoggerFactory.Create(builder => builder.SetMinimumLevel(LogLevel.Warning));
     var logger = loggerFactory.CreateLogger<DependencyManager>();
 
-    var depManager = new DependencyManager(logger, GetVersion());
+    using var depManager = new DependencyManager(logger, GetVersion());
 
     // Use progress bar if output is a TTY, otherwise use simple line output
     var progressBar = !Console.IsOutputRedirected ? new ProgressBar() : null;

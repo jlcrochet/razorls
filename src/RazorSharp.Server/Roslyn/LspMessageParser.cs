@@ -103,8 +103,8 @@ public class LspMessageParser
         // Check if we have complete content
         if (_length < _contentLength) return false;
 
-        // Parse JSON - must allocate since JsonDocument holds a reference to the backing array
-        // and remains valid after this method returns
+        // Parse JSON - must copy because JsonDocument holds a reference to the backing array
+        // and our _buffer is reused for subsequent messages
         var jsonBytes = new byte[_contentLength];
         Buffer.BlockCopy(_buffer, 0, jsonBytes, 0, _contentLength);
         message = JsonDocument.Parse(jsonBytes);

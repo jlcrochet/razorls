@@ -328,7 +328,7 @@ public class RoslynClient : IAsyncDisposable
             var result = await tcs.Task.WaitAsync(cts.Token);
             if (result == null) return default;
 
-            return JsonSerializer.Deserialize<TResponse>(result.Value.GetRawText());
+            return JsonSerializer.Deserialize<TResponse>(result.Value);
         }
         finally
         {

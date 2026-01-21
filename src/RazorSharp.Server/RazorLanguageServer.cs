@@ -49,8 +49,8 @@ public class RazorLanguageServer : IAsyncDisposable
         ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
         ?? "unknown";
 
-    static readonly int[] SymbolKindValues = Enum.GetValues<SymbolKind>().Cast<int>().ToArray();
-    static readonly int[] CompletionItemKindValues = Enum.GetValues<CompletionItemKind>().Cast<int>().ToArray();
+    static readonly int[] SymbolKindValues = Array.ConvertAll(Enum.GetValues<SymbolKind>(), v => (int)v);
+    static readonly int[] CompletionItemKindValues = Array.ConvertAll(Enum.GetValues<CompletionItemKind>(), v => (int)v);
 
     // Cached JSON elements for common responses
     static readonly JsonElement EmptyArrayResponse = JsonSerializer.SerializeToElement(Array.Empty<object>());
@@ -175,7 +175,7 @@ public class RazorLanguageServer : IAsyncDisposable
     public async Task<InitializeResult> HandleInitializeAsync(JsonElement paramsJson, CancellationToken ct)
     {
         // Deserialize manually to avoid StreamJsonRpc parameter matching issues
-        var @params = JsonSerializer.Deserialize<InitializeParams>(paramsJson.GetRawText(), JsonOptions);
+        var @params = JsonSerializer.Deserialize<InitializeParams>(paramsJson, JsonOptions);
         _logger.LogInformation("Received initialize request from {Client}", @params?.ClientInfo?.Name ?? "unknown");
         _initParams = @params;
 
@@ -346,7 +346,7 @@ public class RazorLanguageServer : IAsyncDisposable
     [JsonRpcMethod(LspMethods.TextDocumentDidOpen, UseSingleObjectParameterDeserialization = true)]
     public async Task HandleDidOpenAsync(JsonElement paramsJson)
     {
-        var @params = JsonSerializer.Deserialize<DidOpenTextDocumentParams>(paramsJson.GetRawText(), JsonOptions);
+        var @params = JsonSerializer.Deserialize<DidOpenTextDocumentParams>(paramsJson, JsonOptions);
         if (@params == null) return;
 
         var uri = @params.TextDocument.Uri;
@@ -479,15 +479,19 @@ public class RazorLanguageServer : IAsyncDisposable
     [JsonRpcMethod(LspMethods.TextDocumentDidClose, UseSingleObjectParameterDeserialization = true)]
     public async Task HandleDidCloseAsync(JsonElement paramsJson)
     {
-        var @params = JsonSerializer.Deserialize<DidCloseTextDocumentParams>(paramsJson.GetRawText(), JsonOptions);
+        var @params = JsonSerializer.Deserialize<DidCloseTextDocumentParams>(paramsJson, JsonOptions);
         if (@params == null) return;
 
         var uri = @params.TextDocument.Uri;
         _logger.LogDebug("Document closed: {Uri}", uri);
 
         // Remove from open document tracking and clean up pending changes
-        _openDocuments.Remove(uri);
-        _pendingChanges.Remove(uri);
+        // Must use lock to prevent race with HandleDidOpenAsync and HandleDidChangeAsync
+        lock (_documentTrackingLock)
+        {
+            _openDocuments.Remove(uri);
+            _pendingChanges.Remove(uri);
+        }
 
         // Forward to Roslyn
         if (_roslynClient != null && _roslynClient.IsRunning)
@@ -710,24 +714,11 @@ public class RazorLanguageServer : IAsyncDisposable
 
     /// <summary>
     /// Creates a copy of a code action with a new title.
+    /// Uses Utf8JsonWriter to avoid Dictionary allocation.
     /// </summary>
     private static JsonElement CloneWithNewTitle(JsonElement action, string newTitle)
     {
-        var dict = new Dictionary<string, JsonElement>();
-
-        foreach (var prop in action.EnumerateObject())
-        {
-            if (prop.Name == "title")
-            {
-                dict["title"] = JsonSerializer.SerializeToElement(newTitle);
-            }
-            else
-            {
-                dict[prop.Name] = prop.Value.Clone();
-            }
-        }
-
-        return JsonSerializer.SerializeToElement(dict);
+        return CloneJsonElementWithReplacedProperty(action, "title", newTitle);
     }
 
     [JsonRpcMethod(LspMethods.CodeActionResolve, UseSingleObjectParameterDeserialization = true)]
@@ -1764,17 +1755,28 @@ public class RazorLanguageServer : IAsyncDisposable
         if (custom == null)
             return defaults;
 
-        var duplicates = custom.GroupBy(c => c).Where(g => g.Count() > 1).Select(g => g.Key);
-        if (duplicates.Any())
+        // Use HashSet for O(n) duplicate detection in a single pass
+        var seen = new HashSet<string>();
+        List<string>? duplicates = null;
+
+        foreach (var item in custom)
+        {
+            if (!seen.Add(item))
+            {
+                duplicates ??= [];
+                if (!duplicates.Contains(item))
+                    duplicates.Add(item);
+            }
+        }
+
+        if (duplicates != null)
         {
             _logger.LogWarning("Duplicate {OptionName}: {Duplicates}",
                 optionName, string.Join(", ", duplicates.Select(c => '"' + c + '"')));
-            return custom.Distinct().ToArray();
+            return seen.ToArray();
         }
-        else
-        {
-            return custom;
-        }
+
+        return custom;
     }
 
     /// <summary>

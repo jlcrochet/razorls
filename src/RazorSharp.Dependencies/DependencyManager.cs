@@ -8,11 +8,12 @@ namespace RazorSharp.Dependencies;
 /// <summary>
 /// Manages downloading and caching of Roslyn and Razor dependencies.
 /// </summary>
-public class DependencyManager
+public class DependencyManager : IDisposable
 {
     readonly ILogger<DependencyManager> _logger;
     readonly string _basePath;
     readonly HttpClient _httpClient;
+    bool _disposed;
 
     // Roslyn Language Server version from Crashdummyy/roslynLanguageServer
     // This provides platform-specific builds that actually work
@@ -351,6 +352,15 @@ public class DependencyManager
 
         var json = JsonSerializer.Serialize(info, new JsonSerializerOptions { WriteIndented = true });
         File.WriteAllText(VersionFilePath, json);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        _httpClient.Dispose();
     }
 }
 
