@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -8,6 +9,7 @@ using RazorSharp.Protocol.Types;
 using RazorSharp.Server.Configuration;
 using RazorSharp.Server.Html;
 using RazorSharp.Server.Roslyn;
+using RazorSharp.Server.Utilities;
 using RazorSharp.Server.Workspace;
 using StreamJsonRpc;
 
@@ -55,6 +57,27 @@ public class RazorLanguageServer : IAsyncDisposable
     // Cached JSON elements for common responses
     static readonly JsonElement EmptyArrayResponse = JsonSerializer.SerializeToElement(Array.Empty<object>());
     static readonly JsonElement DefaultFormattingOptions = JsonSerializer.SerializeToElement(new { tabSize = 4, insertSpaces = true });
+
+    // Cached diagnostic response templates (static parts that don't change per-request)
+    static readonly JsonElement DiagnosticResponseDisabled = JsonSerializer.SerializeToElement(new
+    {
+        kind = "full",
+        resultId = "disabled",
+        items = Array.Empty<object>()
+    });
+    static readonly JsonElement DiagnosticResponseNone = JsonSerializer.SerializeToElement(new
+    {
+        kind = "full",
+        resultId = "none",
+        items = Array.Empty<object>()
+    });
+    static readonly JsonElement DiagnosticResponsePending = JsonSerializer.SerializeToElement(new
+    {
+        kind = "full",
+        resultId = "pending",
+        items = Array.Empty<object>()
+    });
+    static readonly JsonElement SuccessResponse = JsonSerializer.SerializeToElement(new { success = true });
 
     const string VirtualHtmlSuffix = "__virtual.html";
 
@@ -432,11 +455,6 @@ public class RazorLanguageServer : IAsyncDisposable
         return uri.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool IsSupportedUri(string uri)
-    {
-        return IsRazorUri(uri) || IsCSharpUri(uri);
-    }
-
     [JsonRpcMethod(LspMethods.TextDocumentDidChange, UseSingleObjectParameterDeserialization = true)]
     public async Task HandleDidChangeAsync(JsonElement paramsJson)
     {
@@ -592,33 +610,40 @@ public class RazorLanguageServer : IAsyncDisposable
         var originalCount = codeActions.GetArrayLength();
         _logger.LogDebug("Processing {Count} code actions from Roslyn", originalCount);
 
-        var expandedActions = new List<JsonElement>();
-        var nestedCount = 0;
-
-        foreach (var action in codeActions.EnumerateArray())
+        var expandedActions = ListPool<JsonElement>.Rent(originalCount);
+        try
         {
-            var title = action.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : "(no title)";
+            var nestedCount = 0;
 
-            if (TryGetNestedCodeActions(action, out var nestedActions))
+            foreach (var action in codeActions.EnumerateArray())
             {
-                nestedCount++;
-                _logger.LogDebug("Expanding nested action '{Title}' with {Count} sub-actions", title, nestedActions.GetArrayLength());
-                await ExpandNestedActionsAsync(nestedActions, title, expandedActions, ct);
+                var title = action.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : "(no title)";
+
+                if (TryGetNestedCodeActions(action, out var nestedActions))
+                {
+                    nestedCount++;
+                    _logger.LogDebug("Expanding nested action '{Title}' with {Count} sub-actions", title, nestedActions.GetArrayLength());
+                    await ExpandNestedActionsAsync(nestedActions, title, expandedActions, ct);
+                }
+                else if (IsNestedCodeActionWithoutChildren(action))
+                {
+                    _logger.LogDebug("Nested action '{Title}' has no NestedCodeActions, keeping original", title);
+                    expandedActions.Add(action);
+                }
+                else
+                {
+                    var resolved = await ResolveCodeActionIfNeededAsync(action, title, ct);
+                    expandedActions.Add(resolved);
+                }
             }
-            else if (IsNestedCodeActionWithoutChildren(action))
-            {
-                _logger.LogDebug("Nested action '{Title}' has no NestedCodeActions, keeping original", title);
-                expandedActions.Add(action);
-            }
-            else
-            {
-                var resolved = await ResolveCodeActionIfNeededAsync(action, title, ct);
-                expandedActions.Add(resolved);
-            }
+
+            _logger.LogDebug("Expanded {NestedCount} nested actions, returning {TotalCount} total actions", nestedCount, expandedActions.Count);
+            return JsonSerializer.SerializeToElement(expandedActions, JsonOptions);
         }
-
-        _logger.LogDebug("Expanded {NestedCount} nested actions, returning {TotalCount} total actions", nestedCount, expandedActions.Count);
-        return JsonSerializer.SerializeToElement(expandedActions, JsonOptions);
+        finally
+        {
+            ListPool<JsonElement>.Return(expandedActions);
+        }
     }
 
     /// <summary>
@@ -885,7 +910,7 @@ public class RazorLanguageServer : IAsyncDisposable
                 // Apply the workspace edit via the client
                 _logger.LogDebug("nestedCodeAction: Applying workspace edit");
                 await _clientRpc!.NotifyAsync(LspMethods.WorkspaceApplyEdit, new { edit });
-                return JsonSerializer.SerializeToElement(new { success = true }, JsonOptions);
+                return SuccessResponse;
             }
 
             _logger.LogWarning("nestedCodeAction: No edit in resolved action");
@@ -938,7 +963,7 @@ public class RazorLanguageServer : IAsyncDisposable
                 {
                     _logger.LogDebug("fixAllCodeAction: Applying workspace edit");
                     await _clientRpc!.NotifyAsync(LspMethods.WorkspaceApplyEdit, new { edit });
-                    return JsonSerializer.SerializeToElement(new { success = true }, JsonOptions);
+                    return SuccessResponse;
                 }
             }
 
@@ -963,12 +988,7 @@ public class RazorLanguageServer : IAsyncDisposable
         // Check if diagnostics are disabled entirely
         if (diagConfig?.Enabled == false)
         {
-            return JsonSerializer.SerializeToElement(new
-            {
-                kind = "full",
-                resultId = "disabled",
-                items = Array.Empty<object>()
-            }, JsonOptions);
+            return DiagnosticResponseDisabled;
         }
 
         // For C# files, request configured diagnostic categories from Roslyn
@@ -985,7 +1005,7 @@ public class RazorLanguageServer : IAsyncDisposable
             var requestAnalyzerSyntax = diagConfig?.AnalyzerSyntax ?? false;
             var requestAnalyzerSemantic = diagConfig?.AnalyzerSemantic ?? false;
 
-            var tasks = new List<Task<JsonElement?>>();
+            var tasks = ListPool<Task<JsonElement?>>.Rent(4);
 
             if (requestSyntax)
             {
@@ -1030,40 +1050,44 @@ public class RazorLanguageServer : IAsyncDisposable
             if (tasks.Count == 0)
             {
                 // All categories disabled
-                return JsonSerializer.SerializeToElement(new
-                {
-                    kind = "full",
-                    resultId = "none",
-                    items = Array.Empty<object>()
-                }, JsonOptions);
+                ListPool<Task<JsonElement?>>.Return(tasks);
+                return DiagnosticResponseNone;
             }
 
             _logger.LogDebug("Requesting {Count} diagnostic categories for {Uri}", tasks.Count, uri);
 
             // Request all categories in parallel
             var results = await Task.WhenAll(tasks);
+            ListPool<Task<JsonElement?>>.Return(tasks);
 
             // Merge the diagnostic items from all responses
-            var mergedItems = new List<JsonElement>();
-            foreach (var result in results)
+            var mergedItems = ListPool<JsonElement>.Rent();
+            try
             {
-                if (result.HasValue && result.Value.TryGetProperty("items", out var items))
+                foreach (var result in results)
                 {
-                    foreach (var item in items.EnumerateArray())
+                    if (result.HasValue && result.Value.TryGetProperty("items", out var items))
                     {
-                        mergedItems.Add(item.Clone());
+                        foreach (var item in items.EnumerateArray())
+                        {
+                            mergedItems.Add(item.Clone());
+                        }
                     }
                 }
+
+                _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedItems.Count, uri);
+
+                return JsonSerializer.SerializeToElement(new
+                {
+                    kind = "full",
+                    resultId = $"merged:{DateTime.UtcNow.Ticks}",
+                    items = mergedItems
+                }, JsonOptions);
             }
-
-            _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedItems.Count, uri);
-
-            return JsonSerializer.SerializeToElement(new
+            finally
             {
-                kind = "full",
-                resultId = $"merged:{DateTime.UtcNow.Ticks}",
-                items = mergedItems
-            }, JsonOptions);
+                ListPool<JsonElement>.Return(mergedItems);
+            }
         }
 
         // For non-C# files, forward as-is
@@ -1073,12 +1097,7 @@ public class RazorLanguageServer : IAsyncDisposable
         // Return empty report if forwarding failed (e.g., project not initialized)
         if (!forwardedResult.HasValue)
         {
-            return JsonSerializer.SerializeToElement(new
-            {
-                kind = "full",
-                resultId = "pending",
-                items = Array.Empty<object>()
-            }, JsonOptions);
+            return DiagnosticResponsePending;
         }
 
         return forwardedResult;
@@ -1864,29 +1883,36 @@ public class RazorLanguageServer : IAsyncDisposable
 
     /// <summary>
     /// Clones a JsonElement, replacing a single string property value.
-    /// Uses Utf8JsonWriter to avoid expensive Dictionary deserialization/serialization.
+    /// Uses Utf8JsonWriter with pooled buffers to avoid allocations.
     /// </summary>
     private static JsonElement CloneJsonElementWithReplacedProperty(JsonElement element, string propertyName, string newValue)
     {
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream))
+        var bufferWriter = new ArrayPoolBufferWriter();
+        try
         {
-            writer.WriteStartObject();
-            foreach (var prop in element.EnumerateObject())
+            using (var writer = new Utf8JsonWriter(bufferWriter))
             {
-                if (prop.Name == propertyName)
+                writer.WriteStartObject();
+                foreach (var prop in element.EnumerateObject())
                 {
-                    writer.WriteString(propertyName, newValue);
+                    if (prop.Name == propertyName)
+                    {
+                        writer.WriteString(propertyName, newValue);
+                    }
+                    else
+                    {
+                        prop.WriteTo(writer);
+                    }
                 }
-                else
-                {
-                    prop.WriteTo(writer);
-                }
+                writer.WriteEndObject();
             }
-            writer.WriteEndObject();
-        }
 
-        return JsonDocument.Parse(stream.GetBuffer().AsMemory(0, (int)stream.Length)).RootElement.Clone();
+            return JsonDocument.Parse(bufferWriter.WrittenMemory).RootElement.Clone();
+        }
+        finally
+        {
+            bufferWriter.Dispose();
+        }
     }
 
     /// <summary>

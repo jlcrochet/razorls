@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -26,15 +25,20 @@ public class HtmlLanguageClient : IAsyncDisposable
     string? _rootUri;
 
     // Track HTML projections by checksum (Roslyn uses checksums to identify HTML versions)
-    readonly ConcurrentDictionary<string, HtmlProjection> _projections = new();
+    readonly Dictionary<string, HtmlProjection> _projections = new();
     // Secondary index for O(1) lookup by Razor URI
-    readonly ConcurrentDictionary<string, string> _razorUriToChecksum = new();
+    readonly Dictionary<string, string> _razorUriToChecksum = new();
+    // Lock for atomic updates to both projection dictionaries
+    readonly Lock _projectionsLock = new();
 
     static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true
     };
+
+    // Cached suffix for virtual HTML URIs to avoid repeated string allocations
+    const string VirtualHtmlSuffix = "__virtual.html";
 
     public HtmlLanguageClient(ILogger<HtmlLanguageClient> logger)
     {
@@ -215,28 +219,39 @@ public class HtmlLanguageClient : IAsyncDisposable
         // Store the projection even if HTML LS failed to start
         if (_rpc == null || !_initialized)
         {
-            _projections[checksum] = new HtmlProjection(razorUri, checksum, htmlContent, 1);
-            _razorUriToChecksum[razorUri] = checksum;
+            lock (_projectionsLock)
+            {
+                _projections[checksum] = new HtmlProjection(razorUri, checksum, htmlContent, 1);
+                _razorUriToChecksum[razorUri] = checksum;
+            }
             return;
         }
 
         var virtualUri = GetVirtualHtmlUri(razorUri);
 
-        // Use secondary index for O(1) lookup
+        // Atomically check and update projections
         HtmlProjection? existingByUri = null;
-        if (_razorUriToChecksum.TryGetValue(razorUri, out var existingChecksum))
+        int newVersion = 1;
+        lock (_projectionsLock)
         {
-            _projections.TryGetValue(existingChecksum, out existingByUri);
+            if (_razorUriToChecksum.TryGetValue(razorUri, out var existingChecksum))
+            {
+                _projections.TryGetValue(existingChecksum, out existingByUri);
+            }
+
+            if (existingByUri != null)
+            {
+                // Update existing document
+                newVersion = existingByUri.Version + 1;
+                _projections.Remove(existingByUri.Checksum);
+            }
+
+            _projections[checksum] = new HtmlProjection(razorUri, checksum, htmlContent, newVersion);
+            _razorUriToChecksum[razorUri] = checksum;
         }
 
         if (existingByUri != null)
         {
-            // Update existing document
-            var newVersion = existingByUri.Version + 1;
-            _projections.TryRemove(existingByUri.Checksum, out _);
-            _projections[checksum] = new HtmlProjection(razorUri, checksum, htmlContent, newVersion);
-            _razorUriToChecksum[razorUri] = checksum;
-
             await _rpc.NotifyWithParameterObjectAsync("textDocument/didChange", new
             {
                 textDocument = new { uri = virtualUri, version = newVersion },
@@ -247,10 +262,6 @@ public class HtmlLanguageClient : IAsyncDisposable
         }
         else
         {
-            // Open new document
-            _projections[checksum] = new HtmlProjection(razorUri, checksum, htmlContent, 1);
-            _razorUriToChecksum[razorUri] = checksum;
-
             await _rpc.NotifyWithParameterObjectAsync("textDocument/didOpen", new
             {
                 textDocument = new
@@ -277,7 +288,13 @@ public class HtmlLanguageClient : IAsyncDisposable
             return null;
         }
 
-        if (!_projections.TryGetValue(checksum, out var projection))
+        HtmlProjection? projection;
+        lock (_projectionsLock)
+        {
+            _projections.TryGetValue(checksum, out projection);
+        }
+
+        if (projection == null)
         {
             _logger.LogDebug("No HTML projection found for checksum {Checksum}", checksum);
             return null;
@@ -325,7 +342,13 @@ public class HtmlLanguageClient : IAsyncDisposable
             return null;
         }
 
-        if (!_projections.TryGetValue(checksum, out _))
+        bool hasProjection;
+        lock (_projectionsLock)
+        {
+            hasProjection = _projections.ContainsKey(checksum);
+        }
+
+        if (!hasProjection)
         {
             _logger.LogDebug("No HTML projection found for checksum {Checksum}", checksum);
             return null;
@@ -359,8 +382,11 @@ public class HtmlLanguageClient : IAsyncDisposable
     /// </summary>
     public HtmlProjection? GetProjection(string checksum)
     {
-        _projections.TryGetValue(checksum, out var projection);
-        return projection;
+        lock (_projectionsLock)
+        {
+            _projections.TryGetValue(checksum, out var projection);
+            return projection;
+        }
     }
 
     /// <summary>
@@ -368,17 +394,20 @@ public class HtmlLanguageClient : IAsyncDisposable
     /// </summary>
     public HtmlProjection? GetProjectionByRazorUri(string razorUri)
     {
-        if (_razorUriToChecksum.TryGetValue(razorUri, out var checksum))
+        lock (_projectionsLock)
         {
-            _projections.TryGetValue(checksum, out var projection);
-            return projection;
+            if (_razorUriToChecksum.TryGetValue(razorUri, out var checksum))
+            {
+                _projections.TryGetValue(checksum, out var projection);
+                return projection;
+            }
+            return null;
         }
-        return null;
     }
 
     private static string GetVirtualHtmlUri(string razorUri)
     {
-        return razorUri + "__virtual.html";
+        return string.Concat(razorUri, VirtualHtmlSuffix);
     }
 
     /// <summary>

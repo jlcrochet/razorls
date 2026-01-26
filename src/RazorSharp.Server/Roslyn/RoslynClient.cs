@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Text;
 using System.Diagnostics;
 using System.Text.Json;
@@ -5,6 +6,7 @@ using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using RazorSharp.Dependencies;
 using RazorSharp.Server.Configuration;
+using RazorSharp.Server.Utilities;
 
 namespace RazorSharp.Server.Roslyn;
 
@@ -133,7 +135,7 @@ public class RoslynClient : IAsyncDisposable
 
     private async Task ReadMessagesAsync(CancellationToken ct)
     {
-        var parser = new LspMessageParser();
+        using var parser = new LspMessageParser();
 
         try
         {
@@ -146,11 +148,19 @@ public class RoslynClient : IAsyncDisposable
                 parser.Advance(bytesRead);
 
                 // Try to parse complete messages from buffer
-                while (parser.TryParseMessage(out var message))
+                while (parser.TryParseMessage(out var pooledDoc))
                 {
-                    if (message != null)
+                    // Use try-finally to ensure pooled buffer is returned even on exceptions
+                    try
                     {
-                        await ProcessMessageAsync(message, ct);
+                        if (pooledDoc.Document != null)
+                        {
+                            await ProcessMessageAsync(pooledDoc.Document, ct);
+                        }
+                    }
+                    finally
+                    {
+                        pooledDoc.Dispose();
                     }
                 }
             }
@@ -256,8 +266,8 @@ public class RoslynClient : IAsyncDisposable
                 });
             }
         }
-
-        doc.Dispose();
+        // Note: Document disposal is handled by the caller (ReadMessagesAsync)
+        // which disposes the PooledJsonDocument wrapper
     }
 
     private object?[] HandleWorkspaceConfiguration(JsonElement? @params)
@@ -268,7 +278,13 @@ public class RoslynClient : IAsyncDisposable
 
         if (@params.Value.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
         {
-            var results = new List<object?>();
+            // Pre-allocate array to avoid List + ToArray() double allocation
+            var itemCount = items.GetArrayLength();
+            if (itemCount == 0) return [];
+
+            var results = new object?[itemCount];
+            var index = 0;
+
             foreach (var item in items.EnumerateArray())
             {
                 if (item.TryGetProperty("section", out var section))
@@ -277,13 +293,13 @@ public class RoslynClient : IAsyncDisposable
                     if (string.IsNullOrEmpty(sectionName))
                     {
                         _logger.LogWarning("workspace/configuration request contained empty section name");
-                        results.Add(null);
+                        results[index++] = null;
                         continue;
                     }
                     _logger.LogDebug("Config section requested: {Section}", sectionName);
 
                     // First check hardcoded settings (required for cohosting and diagnostics)
-                    var value = sectionName switch
+                    results[index++] = sectionName switch
                     {
                         "razor.format.code_block_brace_on_next_line" => (object?)false,
                         "razor.completion.commit_elements_with_space" => (object?)true,
@@ -295,15 +311,14 @@ public class RoslynClient : IAsyncDisposable
                         "visual_basic|background_analysis.dotnet_analyzer_diagnostics_scope" => "openFiles",
                         _ => _configurationLoader?.GetConfigurationValue(sectionName)
                     };
-                    results.Add(value);
                 }
                 else
                 {
                     _logger.LogWarning("workspace/configuration request item missing 'section' property");
-                    results.Add(null);
+                    results[index++] = null;
                 }
             }
-            return results.ToArray();
+            return results;
         }
         return [];
     }
@@ -316,8 +331,6 @@ public class RoslynClient : IAsyncDisposable
         var id = Interlocked.Increment(ref _nextId);
         var tcs = new TaskCompletionSource<JsonElement?>();
         _pendingRequests[id] = tcs;
-
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         try
         {
@@ -332,7 +345,7 @@ public class RoslynClient : IAsyncDisposable
             await SendMessageAsync(request);
             _logger.LogDebug("Sent request to Roslyn: {Method} (id:{Id})", method, id);
 
-            var result = await tcs.Task.WaitAsync(cts.Token);
+            var result = await tcs.Task.WaitAsync(cancellationToken);
             if (result == null) return default;
 
             return JsonSerializer.Deserialize<TResponse>(result.Value);
@@ -351,8 +364,6 @@ public class RoslynClient : IAsyncDisposable
         var id = Interlocked.Increment(ref _nextId);
         var tcs = new TaskCompletionSource<JsonElement?>();
         _pendingRequests[id] = tcs;
-
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         try
         {
@@ -380,7 +391,7 @@ public class RoslynClient : IAsyncDisposable
             await SendMessageAsync(request);
             _logger.LogDebug("Sent request to Roslyn: {Method} (id:{Id})", method, id);
 
-            return await tcs.Task.WaitAsync(cts.Token);
+            return await tcs.Task.WaitAsync(cancellationToken);
         }
         finally
         {
@@ -462,19 +473,24 @@ public class RoslynClient : IAsyncDisposable
     // Reusable header buffer for outbound messages (thread-safe via lock in SendMessageAsync)
     readonly byte[] _headerBuffer = new byte[32]; // "Content-Length: " (16) + digits (max 10) + "\r\n\r\n" (4)
 
+    // Pooled buffer writer for JSON serialization (protected by _sendLock)
+    readonly ArrayPoolBufferWriter _sendBufferWriter = new();
+
     private async Task SendMessageAsync(object message)
     {
         if (_process == null) throw new InvalidOperationException("Process not started");
         if (_process.HasExited) throw new IOException($"Roslyn process has exited (code {_process.ExitCode})");
 
-        // Serialize directly to UTF-8 bytes (no intermediate string)
-        var content = JsonSerializer.SerializeToUtf8Bytes(message, SendJsonOptions);
-
         // Serialize writes to prevent interleaved messages when multiple requests are sent concurrently
-        // The lock also protects _headerBuffer which is a shared instance field
+        // The lock also protects _headerBuffer and _sendBufferWriter which are shared instance fields
         await _sendLock.WaitAsync();
         try
         {
+            // Serialize to pooled buffer (reset clears previous content but keeps pooled memory)
+            _sendBufferWriter.Reset();
+            JsonSerializer.Serialize(new Utf8JsonWriter(_sendBufferWriter), message, SendJsonOptions);
+            var content = _sendBufferWriter.WrittenSpan;
+
             // Build header directly in bytes: "Content-Length: {length}\r\n\r\n"
             "Content-Length: "u8.CopyTo(_headerBuffer);
             Utf8Formatter.TryFormat(content.Length, _headerBuffer.AsSpan(16), out var bytesWritten);
@@ -483,7 +499,7 @@ public class RoslynClient : IAsyncDisposable
 
             var stream = _process.StandardInput.BaseStream;
             await stream.WriteAsync(_headerBuffer.AsMemory(0, headerLength));
-            await stream.WriteAsync(content);
+            await stream.WriteAsync(_sendBufferWriter.WrittenMemory);
             await stream.FlushAsync();
         }
         finally
@@ -539,21 +555,25 @@ public class RoslynClient : IAsyncDisposable
 
         _readCts?.Cancel();
 
-        // Wait briefly for background tasks to complete
+        // Wait briefly for background tasks to complete (use stackalloc-friendly pattern)
         try
         {
-            var tasksToWait = new List<Task>();
-            if (_stderrTask != null) tasksToWait.Add(_stderrTask);
-            if (_exitMonitorTask != null) tasksToWait.Add(_exitMonitorTask);
-            if (_readTask != null) tasksToWait.Add(_readTask);
-            if (tasksToWait.Count > 0)
+            // Build array inline to avoid List allocation
+            var taskCount = (_stderrTask != null ? 1 : 0) + (_exitMonitorTask != null ? 1 : 0) + (_readTask != null ? 1 : 0);
+            if (taskCount > 0)
             {
+                var tasksToWait = new Task[taskCount];
+                var i = 0;
+                if (_stderrTask != null) tasksToWait[i++] = _stderrTask;
+                if (_exitMonitorTask != null) tasksToWait[i++] = _exitMonitorTask;
+                if (_readTask != null) tasksToWait[i++] = _readTask;
                 await Task.WhenAll(tasksToWait).WaitAsync(TimeSpan.FromSeconds(1));
             }
         }
         catch { /* Ignore timeout or task exceptions during cleanup */ }
 
         _sendLock.Dispose();
+        _sendBufferWriter.Dispose();
     }
 
     public static RoslynStartOptions CreateStartOptions(DependencyManager deps, string? logDirectory = null, string logLevel = "Information")

@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Text;
 using System.Text.Json;
 
@@ -6,12 +7,21 @@ namespace RazorSharp.Server.Roslyn;
 /// <summary>
 /// Parses LSP messages from a stream.
 /// Manages its own buffer internally and parses JSON directly from bytes.
+/// Uses ArrayPool to reduce GC pressure from buffer allocations.
 /// </summary>
-public class LspMessageParser
+public class LspMessageParser : IDisposable
 {
-    byte[] _buffer = new byte[65536];
+    static readonly ArrayPool<byte> Pool = ArrayPool<byte>.Shared;
+
+    byte[] _buffer;
     int _length;
     int _contentLength = -1;
+    bool _disposed;
+
+    public LspMessageParser()
+    {
+        _buffer = Pool.Rent(65536);
+    }
 
     // "Content-Length:" as bytes for zero-allocation header parsing
     static ReadOnlySpan<byte> ContentLengthHeader => "Content-Length:"u8;
@@ -39,8 +49,12 @@ public class LspMessageParser
         var required = _length + minSize;
         while (newSize < required) newSize *= 2;
 
-        var newBuffer = new byte[newSize];
+        var newBuffer = Pool.Rent(newSize);
         Buffer.BlockCopy(_buffer, 0, newBuffer, 0, _length);
+
+        // Return old buffer to pool
+        Pool.Return(_buffer);
+
         _buffer = newBuffer;
     }
 
@@ -55,10 +69,11 @@ public class LspMessageParser
     /// <summary>
     /// Tries to parse a complete LSP message from the buffer.
     /// Returns true if a complete message was parsed, false if more data is needed.
+    /// The returned PooledJsonDocument MUST be disposed to return the buffer to the pool.
     /// </summary>
-    public bool TryParseMessage(out JsonDocument? message)
+    public bool TryParseMessage(out PooledJsonDocument message)
     {
-        message = null;
+        message = default;
 
         // If we don't have content length yet, look for headers
         if (_contentLength < 0)
@@ -77,7 +92,7 @@ public class LspMessageParser
                 if (line.StartsWith(ContentLengthHeader))
                 {
                     var valueSpan = line.Slice(ContentLengthHeader.Length).Trim((byte)' ');
-                    if (Utf8Parser.TryParse(valueSpan, out int contentLength, out _))
+                    if (Utf8Parser.TryParse(valueSpan, out int contentLength, out _) && contentLength >= 0)
                     {
                         _contentLength = contentLength;
                         break;
@@ -103,11 +118,12 @@ public class LspMessageParser
         // Check if we have complete content
         if (_length < _contentLength) return false;
 
-        // Parse JSON - must copy because JsonDocument holds a reference to the backing array
-        // and our _buffer is reused for subsequent messages
-        var jsonBytes = new byte[_contentLength];
+        // Parse JSON using a pooled buffer - JsonDocument holds a reference to the backing array
+        // so we wrap it in PooledJsonDocument which returns the buffer on dispose
+        var jsonBytes = Pool.Rent(_contentLength);
         Buffer.BlockCopy(_buffer, 0, jsonBytes, 0, _contentLength);
-        message = JsonDocument.Parse(jsonBytes);
+        var doc = JsonDocument.Parse(jsonBytes.AsMemory(0, _contentLength));
+        message = new PooledJsonDocument(doc, jsonBytes);
 
         // Remove processed content from buffer
         var restLength = _length - _contentLength;
@@ -119,5 +135,39 @@ public class LspMessageParser
         _contentLength = -1;
 
         return true;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        Pool.Return(_buffer);
+    }
+}
+
+/// <summary>
+/// Wraps a JsonDocument with a pooled byte array backing buffer.
+/// Disposing this struct returns the buffer to the pool and disposes the document.
+/// </summary>
+public readonly struct PooledJsonDocument : IDisposable
+{
+    static readonly ArrayPool<byte> Pool = ArrayPool<byte>.Shared;
+
+    public JsonDocument? Document { get; }
+    readonly byte[]? _rentedBuffer;
+
+    public PooledJsonDocument(JsonDocument document, byte[] rentedBuffer)
+    {
+        Document = document;
+        _rentedBuffer = rentedBuffer;
+    }
+
+    public void Dispose()
+    {
+        Document?.Dispose();
+        if (_rentedBuffer != null)
+        {
+            Pool.Return(_rentedBuffer);
+        }
     }
 }

@@ -14,6 +14,15 @@
     <MinVerTagPrefix>v</MinVerTagPrefix>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <!-- Ahead-of-time compilation for faster startup -->
+    <PublishReadyToRun>true</PublishReadyToRun>
+
+    <!-- Strip debug symbols from output -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="MinVer" Version="6.0.0" PrivateAssets="all" />
     <PackageReference Include="StreamJsonRpc" Version="2.21.69" />
