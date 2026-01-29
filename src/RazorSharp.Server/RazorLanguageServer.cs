@@ -29,6 +29,7 @@ public class RazorLanguageServer : IAsyncDisposable
     readonly HtmlLanguageClient _htmlClient;
     RoslynClient? _roslynClient;
     JsonRpc? _clientRpc;
+    IProgressRpc? _progressRpc;
     InitializeParams? _initParams;
     InitializationOptions? _initOptions;
     string? _cliSolutionPath;
@@ -47,9 +48,14 @@ public class RazorLanguageServer : IAsyncDisposable
     DateTime _sourceGeneratedIndexLastScan;
     bool _sourceGeneratedIndexBuilt;
     int _sourceGeneratedIndexRefreshInProgress;
+    WorkDoneProgressScope? _workspaceInitProgress;
+    long _workDoneProgressCounter;
+    Func<string, JsonElement, CancellationToken, Task<JsonElement?>>? _forwardToRoslynOverride;
     readonly Channel<NotificationWorkItem> _notificationChannel;
     readonly CancellationTokenSource _notificationCts;
     readonly Task _notificationTask;
+    const int DiagnosticsProgressDelayMs = 250;
+    const int WorkDoneProgressCreateTimeoutMs = 2000;
     const int MaxFastStartDelayMs = 60000;
     static readonly TimeSpan SourceGeneratedIndexRefreshInterval = TimeSpan.FromSeconds(60);
 
@@ -157,6 +163,18 @@ public class RazorLanguageServer : IAsyncDisposable
     public ConfigurationLoader ConfigurationLoader => _configurationLoader;
 
     private bool FastStartEnabled => _initOptions?.FastStart != false;
+    private bool SupportsWorkDoneProgress => _initParams?.Capabilities?.Window?.WorkDoneProgress == true;
+
+    internal void SetProgressRpcForTests(IProgressRpc progressRpc) => _progressRpc = progressRpc;
+    internal void SetInitializeParamsForTests(InitializeParams? initParams) => _initParams = initParams;
+    internal void SetForwardToRoslynOverrideForTests(Func<string, JsonElement, CancellationToken, Task<JsonElement?>>? overrideFunc)
+        => _forwardToRoslynOverride = overrideFunc;
+    internal Task HandleRoslynNotificationForTests(string method, JsonElement? @params, CancellationToken ct)
+        => HandleRoslynNotificationAsync(new NotificationWorkItem(method, @params), ct);
+    internal void HandleRoslynProcessExitedForTests(int exitCode)
+        => OnRoslynProcessExited(this, exitCode);
+    internal Task<bool> SendWorkDoneProgressBeginForTests(string token, string title, string? message, CancellationToken ct)
+        => SendWorkDoneProgressBeginAsync(token, title, message, ct);
 
     private int FastStartDelayMs
     {
@@ -205,6 +223,7 @@ public class RazorLanguageServer : IAsyncDisposable
         var handler = new HeaderDelimitedMessageHandler(stdout, stdin, formatter);
 
         _clientRpc = new JsonRpc(handler);
+        _progressRpc = new JsonRpcProgressClient(_clientRpc);
 
         // Register this instance as the RPC target - methods with [JsonRpcMethod] will be called
         _clientRpc.AddLocalRpcTarget(this, new JsonRpcTargetOptions
@@ -332,6 +351,13 @@ public class RazorLanguageServer : IAsyncDisposable
             _workspaceOpenedAt = DateTime.UtcNow;
         }
 
+        _workspaceInitProgress ??= BeginWorkDoneProgress(
+            "razorsharp.init",
+            "RazorSharp",
+            "Initializing workspace",
+            delayMs: 0,
+            CancellationToken.None);
+
         // Forward to Roslyn - run in background but track completion
         _ = Task.Run(async () =>
         {
@@ -371,6 +397,7 @@ public class RazorLanguageServer : IAsyncDisposable
             {
                 _logger.LogError(ex, "Error during Roslyn initialization");
                 _roslynProjectInitialized.TrySetException(ex);
+                await EndWorkspaceInitializationProgressAsync();
             }
         });
     }
@@ -1034,123 +1061,141 @@ public class RazorLanguageServer : IAsyncDisposable
             return DiagnosticResponseDisabled;
         }
 
-        // For C# files, request configured diagnostic categories from Roslyn
-        // Roslyn separates diagnostics into categories:
-        // - "syntax" (DocumentCompilerSyntax) for syntax errors like missing braces
-        // - "DocumentCompilerSemantic" for semantic errors like type mismatches
-        // - "DocumentAnalyzerSyntax" for analyzer syntax diagnostics
-        // - "DocumentAnalyzerSemantic" for analyzer semantic diagnostics
-        if (uri?.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) == true)
+        WorkDoneProgressScope? progress = null;
+        try
         {
-            // Determine which categories to request (defaults: syntax=true, semantic=true, analyzers=false)
-            var requestSyntax = diagConfig?.Syntax ?? true;
-            var requestSemantic = diagConfig?.Semantic ?? true;
-            var requestAnalyzerSyntax = diagConfig?.AnalyzerSyntax ?? false;
-            var requestAnalyzerSemantic = diagConfig?.AnalyzerSemantic ?? false;
+            progress = BeginWorkDoneProgress(
+                "razorsharp.diagnostics",
+                "RazorSharp",
+                "Diagnostics",
+                DiagnosticsProgressDelayMs,
+                ct);
 
-            var tasks = ListPool<Task<JsonElement?>>.Rent(4);
-
-            if (requestSyntax)
+            // For C# files, request configured diagnostic categories from Roslyn
+            // Roslyn separates diagnostics into categories:
+            // - "syntax" (DocumentCompilerSyntax) for syntax errors like missing braces
+            // - "DocumentCompilerSemantic" for semantic errors like type mismatches
+            // - "DocumentAnalyzerSyntax" for analyzer syntax diagnostics
+            // - "DocumentAnalyzerSemantic" for analyzer semantic diagnostics
+            if (uri?.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) == true)
             {
-                var syntaxParams = JsonSerializer.SerializeToElement(new
+                // Determine which categories to request (defaults: syntax=true, semantic=true, analyzers=false)
+                var requestSyntax = diagConfig?.Syntax ?? true;
+                var requestSemantic = diagConfig?.Semantic ?? true;
+                var requestAnalyzerSyntax = diagConfig?.AnalyzerSyntax ?? false;
+                var requestAnalyzerSemantic = diagConfig?.AnalyzerSemantic ?? false;
+
+                var tasks = ListPool<Task<JsonElement?>>.Rent(4);
+
+                if (requestSyntax)
                 {
-                    identifier = "syntax",
-                    textDocument = new { uri }
-                }, JsonOptions);
-                tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, syntaxParams, ct));
-            }
-
-            if (requestSemantic)
-            {
-                var semanticParams = JsonSerializer.SerializeToElement(new
-                {
-                    identifier = "DocumentCompilerSemantic",
-                    textDocument = new { uri }
-                }, JsonOptions);
-                tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, semanticParams, ct));
-            }
-
-            if (requestAnalyzerSyntax)
-            {
-                var analyzerSyntaxParams = JsonSerializer.SerializeToElement(new
-                {
-                    identifier = "DocumentAnalyzerSyntax",
-                    textDocument = new { uri }
-                }, JsonOptions);
-                tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSyntaxParams, ct));
-            }
-
-            if (requestAnalyzerSemantic)
-            {
-                var analyzerSemanticParams = JsonSerializer.SerializeToElement(new
-                {
-                    identifier = "DocumentAnalyzerSemantic",
-                    textDocument = new { uri }
-                }, JsonOptions);
-                tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSemanticParams, ct));
-            }
-
-            if (tasks.Count == 0)
-            {
-                // All categories disabled
-                ListPool<Task<JsonElement?>>.Return(tasks);
-                return DiagnosticResponseNone;
-            }
-
-            _logger.LogDebug("Requesting {Count} diagnostic categories for {Uri}", tasks.Count, uri);
-
-            // Request all categories in parallel
-            var results = await Task.WhenAll(tasks);
-            ListPool<Task<JsonElement?>>.Return(tasks);
-
-            var bufferWriter = new ArrayPoolBufferWriter();
-            try
-            {
-                using var writer = new Utf8JsonWriter(bufferWriter);
-                writer.WriteStartObject();
-                writer.WriteString("kind", "full");
-                writer.WriteString("resultId", $"merged:{DateTime.UtcNow.Ticks}");
-                writer.WritePropertyName("items");
-                writer.WriteStartArray();
-
-                var mergedCount = 0;
-                foreach (var result in results)
-                {
-                    if (result.HasValue && result.Value.TryGetProperty("items", out var items))
+                    var syntaxParams = JsonSerializer.SerializeToElement(new
                     {
-                        foreach (var item in items.EnumerateArray())
-                        {
-                            item.WriteTo(writer);
-                            mergedCount++;
-                        }
-                    }
+                        identifier = "syntax",
+                        textDocument = new { uri }
+                    }, JsonOptions);
+                    tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, syntaxParams, ct));
                 }
 
-                writer.WriteEndArray();
-                writer.WriteEndObject();
-                writer.Flush();
+                if (requestSemantic)
+                {
+                    var semanticParams = JsonSerializer.SerializeToElement(new
+                    {
+                        identifier = "DocumentCompilerSemantic",
+                        textDocument = new { uri }
+                    }, JsonOptions);
+                    tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, semanticParams, ct));
+                }
 
-                _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedCount, uri);
+                if (requestAnalyzerSyntax)
+                {
+                    var analyzerSyntaxParams = JsonSerializer.SerializeToElement(new
+                    {
+                        identifier = "DocumentAnalyzerSyntax",
+                        textDocument = new { uri }
+                    }, JsonOptions);
+                    tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSyntaxParams, ct));
+                }
 
-                return JsonDocument.Parse(bufferWriter.WrittenMemory).RootElement.Clone();
+                if (requestAnalyzerSemantic)
+                {
+                    var analyzerSemanticParams = JsonSerializer.SerializeToElement(new
+                    {
+                        identifier = "DocumentAnalyzerSemantic",
+                        textDocument = new { uri }
+                    }, JsonOptions);
+                    tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSemanticParams, ct));
+                }
+
+                if (tasks.Count == 0)
+                {
+                    // All categories disabled
+                    ListPool<Task<JsonElement?>>.Return(tasks);
+                    return DiagnosticResponseNone;
+                }
+
+                _logger.LogDebug("Requesting {Count} diagnostic categories for {Uri}", tasks.Count, uri);
+
+                // Request all categories in parallel
+                var results = await Task.WhenAll(tasks);
+                ListPool<Task<JsonElement?>>.Return(tasks);
+
+                var bufferWriter = new ArrayPoolBufferWriter();
+                try
+                {
+                    using var writer = new Utf8JsonWriter(bufferWriter);
+                    writer.WriteStartObject();
+                    writer.WriteString("kind", "full");
+                    writer.WriteString("resultId", $"merged:{DateTime.UtcNow.Ticks}");
+                    writer.WritePropertyName("items");
+                    writer.WriteStartArray();
+
+                    var mergedCount = 0;
+                    foreach (var result in results)
+                    {
+                        if (result.HasValue && result.Value.TryGetProperty("items", out var items))
+                        {
+                            foreach (var item in items.EnumerateArray())
+                            {
+                                item.WriteTo(writer);
+                                mergedCount++;
+                            }
+                        }
+                    }
+
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                    writer.Flush();
+
+                    _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedCount, uri);
+
+                    return JsonDocument.Parse(bufferWriter.WrittenMemory).RootElement.Clone();
+                }
+                finally
+                {
+                    bufferWriter.Dispose();
+                }
             }
-            finally
+
+            // For non-C# files, forward as-is
+            _logger.LogDebug("Forwarding textDocument/diagnostic to Roslyn for {Uri}", uri);
+            var forwardedResult = await ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, @params, ct);
+
+            // Return empty report if forwarding failed (e.g., project not initialized)
+            if (!forwardedResult.HasValue)
             {
-                bufferWriter.Dispose();
+                return DiagnosticResponsePending;
+            }
+
+            return forwardedResult;
+        }
+        finally
+        {
+            if (progress != null)
+            {
+                await progress.DisposeAsync();
             }
         }
-
-        // For non-C# files, forward as-is
-        _logger.LogDebug("Forwarding textDocument/diagnostic to Roslyn for {Uri}", uri);
-        var forwardedResult = await ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, @params, ct);
-
-        // Return empty report if forwarding failed (e.g., project not initialized)
-        if (!forwardedResult.HasValue)
-        {
-            return DiagnosticResponsePending;
-        }
-
-        return forwardedResult;
     }
 
     #endregion
@@ -1162,6 +1207,7 @@ public class RazorLanguageServer : IAsyncDisposable
         _logger.LogError("Roslyn process exited unexpectedly with code {ExitCode}. Language features will be unavailable.", exitCode);
         // Mark initialization as failed so new requests don't wait forever
         _roslynProjectInitialized.TrySetException(new Exception($"Roslyn process exited with code {exitCode}"));
+        _ = EndWorkspaceInitializationProgressAsync();
 
         lock (_documentTrackingLock)
         {
@@ -1219,6 +1265,7 @@ public class RazorLanguageServer : IAsyncDisposable
                 case LspMethods.ProjectInitializationComplete:
                     _logger.LogInformation("Roslyn project initialization complete - server ready");
                     _roslynProjectInitialized.TrySetResult();
+                    await EndWorkspaceInitializationProgressAsync();
                     await FlushPendingOpensAsync();
                     break;
 
@@ -1473,8 +1520,184 @@ public class RazorLanguageServer : IAsyncDisposable
 
     #region Helper Methods
 
+    private WorkDoneProgressScope? BeginWorkDoneProgress(
+        string tokenPrefix,
+        string title,
+        string? message,
+        int delayMs,
+        CancellationToken ct)
+    {
+        if (!SupportsWorkDoneProgress || _progressRpc == null)
+        {
+            return null;
+        }
+
+        var token = CreateWorkDoneProgressToken(tokenPrefix);
+        return new WorkDoneProgressScope(this, token, title, message, delayMs, ct);
+    }
+
+    private string CreateWorkDoneProgressToken(string prefix)
+    {
+        var id = Interlocked.Increment(ref _workDoneProgressCounter);
+        return $"{prefix}:{id}";
+    }
+
+    private async Task<bool> SendWorkDoneProgressBeginAsync(
+        string token,
+        string title,
+        string? message,
+        CancellationToken ct)
+    {
+        if (_progressRpc == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(WorkDoneProgressCreateTimeoutMs));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+            await _progressRpc.InvokeWithParameterObjectAsync(
+                LspMethods.WindowWorkDoneProgressCreate,
+                new { token },
+                linkedCts.Token);
+
+            await _progressRpc.NotifyWithParameterObjectAsync(LspMethods.Progress, new
+            {
+                token,
+                value = new
+                {
+                    kind = "begin",
+                    title,
+                    message,
+                    cancellable = false
+                }
+            });
+
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to start work done progress {Token}", token);
+            return false;
+        }
+    }
+
+    private async Task SendWorkDoneProgressEndAsync(string token, string? message)
+    {
+        if (_progressRpc == null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _progressRpc.NotifyWithParameterObjectAsync(LspMethods.Progress, new
+            {
+                token,
+                value = new
+                {
+                    kind = "end",
+                    message
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to end work done progress {Token}", token);
+        }
+    }
+
+    private async Task EndWorkspaceInitializationProgressAsync()
+    {
+        var progress = Interlocked.Exchange(ref _workspaceInitProgress, null);
+        if (progress != null)
+        {
+            await progress.DisposeAsync();
+        }
+    }
+
+    private sealed class WorkDoneProgressScope : IAsyncDisposable
+    {
+        readonly RazorLanguageServer _server;
+        readonly string _token;
+        readonly string _title;
+        readonly string? _message;
+        readonly CancellationTokenSource _delayCts;
+        readonly Task<bool> _startTask;
+
+        public WorkDoneProgressScope(
+            RazorLanguageServer server,
+            string token,
+            string title,
+            string? message,
+            int delayMs,
+            CancellationToken ct)
+        {
+            _server = server;
+            _token = token;
+            _title = title;
+            _message = message;
+            _delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _startTask = StartAsync(delayMs, _delayCts.Token);
+        }
+
+        async Task<bool> StartAsync(int delayMs, CancellationToken delayToken)
+        {
+            if (delayMs > 0)
+            {
+                try
+                {
+                    await Task.Delay(delayMs, delayToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    return false;
+                }
+            }
+
+            return await _server.SendWorkDoneProgressBeginAsync(
+                _token,
+                _title,
+                _message,
+                CancellationToken.None);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _delayCts.Cancel();
+            bool started = false;
+            try
+            {
+                started = await _startTask;
+            }
+            catch
+            {
+                // Ignore failures during progress initialization
+            }
+            finally
+            {
+                _delayCts.Dispose();
+            }
+
+            if (started)
+            {
+                await _server.SendWorkDoneProgressEndAsync(_token, message: null);
+            }
+        }
+    }
+
     private async Task<JsonElement?> ForwardToRoslynAsync(string method, JsonElement @params, CancellationToken ct)
     {
+        if (_forwardToRoslynOverride != null)
+        {
+            return await _forwardToRoslynOverride(method, @params, ct);
+        }
+
         if (_roslynClient == null)
         {
             _logger.LogWarning("Cannot forward {Method} - Roslyn client not initialized", method);
@@ -1782,6 +2005,8 @@ public class RazorLanguageServer : IAsyncDisposable
 
     private object CreateRoslynInitParams(InitializeParams? clientParams)
     {
+        var workDoneProgress = clientParams?.Capabilities?.Window?.WorkDoneProgress == true;
+
         // Build capabilities that Roslyn/Razor expects
         var capabilities = new
         {
@@ -1799,7 +2024,7 @@ public class RazorLanguageServer : IAsyncDisposable
             },
             window = new
             {
-                workDoneProgress = true
+                workDoneProgress
             },
             textDocument = new
             {
@@ -2470,4 +2695,26 @@ public class RazorLanguageServer : IAsyncDisposable
         }
         _notificationCts.Dispose();
     }
+}
+
+internal interface IProgressRpc
+{
+    Task<JsonElement?> InvokeWithParameterObjectAsync(string method, object @params, CancellationToken ct);
+    Task NotifyWithParameterObjectAsync(string method, object @params);
+}
+
+internal sealed class JsonRpcProgressClient : IProgressRpc
+{
+    readonly JsonRpc _rpc;
+
+    public JsonRpcProgressClient(JsonRpc rpc)
+    {
+        _rpc = rpc;
+    }
+
+    public Task<JsonElement?> InvokeWithParameterObjectAsync(string method, object @params, CancellationToken ct)
+        => _rpc.InvokeWithParameterObjectAsync<JsonElement?>(method, @params, ct);
+
+    public Task NotifyWithParameterObjectAsync(string method, object @params)
+        => _rpc.NotifyWithParameterObjectAsync(method, @params);
 }
