@@ -12,6 +12,7 @@ namespace RazorSharp.Server.Roslyn;
 public class LspMessageParser : IDisposable
 {
     static readonly ArrayPool<byte> Pool = ArrayPool<byte>.Shared;
+    const int MaxContentLength = 128 * 1024 * 1024;
 
     byte[] _buffer;
     int _length;
@@ -89,11 +90,15 @@ public class LspMessageParser : IDisposable
                 var lineEnd = headers.IndexOf(LineTerminator);
                 var line = lineEnd < 0 ? headers : headers.Slice(0, lineEnd);
 
-                if (line.StartsWith(ContentLengthHeader))
+                if (StartsWithHeaderIgnoreCase(line, ContentLengthHeader))
                 {
                     var valueSpan = line.Slice(ContentLengthHeader.Length).Trim((byte)' ');
                     if (Utf8Parser.TryParse(valueSpan, out int contentLength, out _) && contentLength >= 0)
                     {
+                        if (contentLength > MaxContentLength)
+                        {
+                            throw new InvalidOperationException($"LSP message too large: {contentLength} bytes (max {MaxContentLength}).");
+                        }
                         _contentLength = contentLength;
                         break;
                     }
@@ -142,6 +147,40 @@ public class LspMessageParser : IDisposable
         if (_disposed) return;
         _disposed = true;
         Pool.Return(_buffer);
+    }
+
+    static bool StartsWithHeaderIgnoreCase(ReadOnlySpan<byte> line, ReadOnlySpan<byte> header)
+    {
+        if (line.Length < header.Length)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < header.Length; i++)
+        {
+            var left = line[i];
+            var right = header[i];
+
+            if (left == right)
+            {
+                continue;
+            }
+
+            if ((uint)(left - 'A') <= 25)
+            {
+                left = (byte)(left + 32);
+            }
+            if ((uint)(right - 'A') <= 25)
+            {
+                right = (byte)(right + 32);
+            }
+            if (left != right)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 }
 

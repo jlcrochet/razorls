@@ -200,7 +200,7 @@ public class DependencyManager : IDisposable
             await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
             totalRead += bytesRead;
 
-            if (totalBytes.HasValue)
+            if (totalBytes.HasValue && totalBytes.Value > 0)
             {
                 var percent = (int)(totalRead * 100 / totalBytes.Value);
                 // Only log/report every 10% to avoid spamming

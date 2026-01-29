@@ -158,7 +158,18 @@ public class RoslynClient : IAsyncDisposable
                     {
                         if (pooledDoc.Document != null)
                         {
-                            await ProcessMessageAsync(pooledDoc.Document, ct);
+                            try
+                            {
+                                await ProcessMessageAsync(pooledDoc.Document, ct);
+                            }
+                            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                            {
+                                throw;
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Error processing Roslyn message");
+                            }
                         }
                     }
                     finally
@@ -217,7 +228,14 @@ public class RoslynClient : IAsyncDisposable
             if (root.TryGetProperty("id", out var reqIdProp))
             {
                 // It's a request - we need to respond
-                long reqId = reqIdProp.ValueKind == JsonValueKind.Number ? reqIdProp.GetInt64() : 0;
+                var reqIdElement = reqIdProp.Clone();
+                var reqId = reqIdProp.ValueKind == JsonValueKind.Number && reqIdProp.TryGetInt64(out var idValue)
+                    ? idValue
+                    : 0;
+                if (reqId == 0 && reqIdProp.ValueKind != JsonValueKind.Number)
+                {
+                    _logger.LogDebug("Received request from Roslyn with non-numeric id ({Kind})", reqIdProp.ValueKind);
+                }
                 _logger.LogDebug("Received request from Roslyn: {Method} (id:{Id})", method, reqId);
 
                 // Handle workspace/configuration specially
@@ -225,7 +243,7 @@ public class RoslynClient : IAsyncDisposable
                 {
                     _logger.LogDebug("Handling workspace/configuration request");
                     var result = HandleWorkspaceConfiguration(@params);
-                    await SendResponseAsync(reqId, result);
+                    await SendResponseAsync(reqIdElement, result);
                     return;
                 }
 
@@ -233,7 +251,7 @@ public class RoslynClient : IAsyncDisposable
                 if (method == "client/registerCapability")
                 {
                     _logger.LogDebug("Accepting client/registerCapability request");
-                    await SendResponseAsync(reqId, new { });
+                    await SendResponseAsync(reqIdElement, new { });
                     return;
                 }
 
@@ -241,7 +259,7 @@ public class RoslynClient : IAsyncDisposable
                 if (method == "client/unregisterCapability")
                 {
                     _logger.LogDebug("Accepting client/unregisterCapability request");
-                    await SendResponseAsync(reqId, new { });
+                    await SendResponseAsync(reqIdElement, new { });
                     return;
                 }
 
@@ -250,13 +268,13 @@ public class RoslynClient : IAsyncDisposable
                 {
                     _logger.LogDebug("Forwarding request from Roslyn: {Method} (id:{Id})", method, reqId);
                     var result = await RequestReceived.Invoke(method, @params, reqId, ct);
-                    await SendResponseAsync(reqId, result);
+                    await SendResponseAsync(reqIdElement, result);
                 }
                 else
                 {
                     // Send empty response for unhandled requests
                     _logger.LogWarning("No handler for request from Roslyn: {Method} (id:{Id})", method, reqId);
-                    await SendResponseAsync(reqId, null);
+                    await SendResponseAsync(reqIdElement, null);
                 }
             }
             else
@@ -454,7 +472,7 @@ public class RoslynClient : IAsyncDisposable
         _logger.LogDebug("Sent notification to Roslyn: {Method}", method);
     }
 
-    private async Task SendResponseAsync(long id, object? result)
+    private async Task SendResponseAsync(JsonElement id, object? result)
     {
         var response = new
         {
