@@ -42,11 +42,16 @@ public class RazorLanguageServer : IAsyncDisposable
     readonly Dictionary<string, List<JsonElement>> _pendingChanges = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock _documentTrackingLock = new();
     readonly Dictionary<string, string> _sourceGeneratedUriCache = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, SourceGeneratedEntry> _sourceGeneratedIndex = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock _sourceGeneratedCacheLock = new();
+    DateTime _sourceGeneratedIndexLastScan;
+    bool _sourceGeneratedIndexBuilt;
+    int _sourceGeneratedIndexRefreshInProgress;
     readonly Channel<NotificationWorkItem> _notificationChannel;
     readonly CancellationTokenSource _notificationCts;
     readonly Task _notificationTask;
     const int MaxFastStartDelayMs = 60000;
+    static readonly TimeSpan SourceGeneratedIndexRefreshInterval = TimeSpan.FromSeconds(60);
 
     static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -126,6 +131,7 @@ public class RazorLanguageServer : IAsyncDisposable
     static readonly string[] InlayHintResolveProperties = ["tooltip", "textEdits", "label.tooltip", "label.location", "label.command"];
 
     readonly record struct NotificationWorkItem(string Method, JsonElement? Params);
+    readonly record struct SourceGeneratedEntry(string Path, bool IsDebug, DateTime LastWriteUtc);
 
     public RazorLanguageServer(ILoggerFactory loggerFactory, DependencyManager dependencyManager)
     {
@@ -139,7 +145,7 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             SingleReader = true,
             SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropWrite
+            FullMode = BoundedChannelFullMode.DropOldest
         });
         _notificationCts = new CancellationTokenSource();
         _notificationTask = Task.Run(() => ProcessNotificationsAsync(_notificationCts.Token));
@@ -1338,7 +1344,14 @@ public class RazorLanguageServer : IAsyncDisposable
     /// </summary>
     private (string? razorUri, HtmlProjection? projection, JsonElement options, JsonElement range) ExtractHtmlFormattingParams(JsonElement @params)
     {
-        var uri = @params.GetProperty("textDocument").GetProperty("uri").GetString();
+        if (!@params.TryGetProperty("textDocument", out var textDocument) ||
+            !textDocument.TryGetProperty("uri", out var uriProp))
+        {
+            _logger.LogWarning("HTML formatting request missing textDocument.uri");
+            return (null, null, default, default);
+        }
+
+        var uri = uriProp.GetString();
         if (uri == null)
         {
             return (null, null, default, default);
@@ -2030,7 +2043,7 @@ public class RazorLanguageServer : IAsyncDisposable
         if (custom == null)
             return defaults;
 
-        // Use HashSet for O(n) duplicate detection in a single pass
+        // Use HashSet for O(n) duplicate detection while preserving original order.
         var seen = new HashSet<string>();
         HashSet<string>? duplicates = null;
 
@@ -2038,20 +2051,29 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             if (!seen.Add(item))
             {
-                // HashSet.Add returns false for duplicates, so just add to duplicates set
                 duplicates ??= [];
                 duplicates.Add(item);
             }
         }
 
-        if (duplicates != null)
+        if (duplicates == null)
         {
-            _logger.LogWarning("Duplicate {OptionName}: {Duplicates}",
-                optionName, string.Join(", ", duplicates.Select(c => '"' + c + '"')));
-            return [.. seen];
+            return custom;
         }
 
-        return custom;
+        var ordered = new List<string>(custom.Length);
+        seen.Clear();
+        foreach (var item in custom)
+        {
+            if (seen.Add(item))
+            {
+                ordered.Add(item);
+            }
+        }
+
+        _logger.LogWarning("Duplicate {OptionName}: {Duplicates}",
+            optionName, string.Join(", ", duplicates.Select(c => '"' + c + '"')));
+        return [.. ordered];
     }
 
     /// <summary>
@@ -2217,10 +2239,8 @@ public class RazorLanguageServer : IAsyncDisposable
                 return false;
             }
 
-            // Search for the generated file, preferring Debug over Release
-            var found = FindGeneratedFile(assemblyName, typeName, hintName);
-
-            if (found != null)
+            var key = MakeSourceGeneratedKey(assemblyName, typeName, hintName);
+            if (TryGetSourceGeneratedPath(key, out var found))
             {
                 filePath = found;
                 lock (_sourceGeneratedCacheLock)
@@ -2241,53 +2261,183 @@ public class RazorLanguageServer : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Finds the first matching generated file, preferring Debug over other configurations.
-    /// </summary>
-    private string? FindGeneratedFile(string assemblyName, string typeName, string hintName)
-    {
-        // Search in workspace root and all subdirectories (for multi-project solutions)
-        foreach (var objDir in Directory.EnumerateDirectories(_workspaceRoot!, "obj", SearchOption.AllDirectories))
-        {
-            // Check Debug first if it exists, then other configurations
-            string? debugDir = null;
+    private static string MakeSourceGeneratedKey(string assemblyName, string typeName, string hintName)
+        => string.Concat(assemblyName, "\0", typeName, "\0", hintName);
 
-            foreach (var configDir in Directory.EnumerateDirectories(objDir))
+    private bool TryGetSourceGeneratedPath(string key, out string filePath)
+    {
+        filePath = "";
+        var now = DateTime.UtcNow;
+        SourceGeneratedEntry entry;
+        var shouldRefresh = false;
+
+        lock (_sourceGeneratedCacheLock)
+        {
+            shouldRefresh = !_sourceGeneratedIndexBuilt ||
+                            (now - _sourceGeneratedIndexLastScan) > SourceGeneratedIndexRefreshInterval;
+
+            if (_sourceGeneratedIndex.TryGetValue(key, out entry))
             {
-                if (Path.GetFileName(configDir).Equals("Debug", StringComparison.OrdinalIgnoreCase))
+                if (File.Exists(entry.Path) && !shouldRefresh)
                 {
-                    debugDir = configDir;
-                    var path = FindGeneratedFileInConfig(configDir, assemblyName, typeName, hintName);
-                    if (path != null) return path;
-                    break;
+                    filePath = entry.Path;
+                    return true;
+                }
+
+                if (!File.Exists(entry.Path))
+                {
+                    _sourceGeneratedIndex.Remove(key);
+                    shouldRefresh = true;
+                }
+            }
+        }
+
+        if (shouldRefresh)
+        {
+            RefreshSourceGeneratedIndex();
+            lock (_sourceGeneratedCacheLock)
+            {
+                if (_sourceGeneratedIndex.TryGetValue(key, out entry) && File.Exists(entry.Path))
+                {
+                    filePath = entry.Path;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void RefreshSourceGeneratedIndex()
+    {
+        if (_workspaceRoot == null)
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _sourceGeneratedIndexRefreshInProgress, 1) == 1)
+        {
+            return;
+        }
+
+        try
+        {
+            var newIndex = new Dictionary<string, SourceGeneratedEntry>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var objDir in Directory.EnumerateDirectories(_workspaceRoot, "obj", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    foreach (var configDir in Directory.EnumerateDirectories(objDir))
+                    {
+                        var configName = Path.GetFileName(configDir);
+                        var isDebug = string.Equals(configName, "Debug", StringComparison.OrdinalIgnoreCase);
+
+                        foreach (var tfmDir in Directory.EnumerateDirectories(configDir))
+                        {
+                            var generatedRoot = Path.Combine(tfmDir, "generated");
+                            if (!Directory.Exists(generatedRoot))
+                            {
+                                continue;
+                            }
+
+                            foreach (var assemblyDir in Directory.EnumerateDirectories(generatedRoot))
+                            {
+                                var assemblyName = Path.GetFileName(assemblyDir);
+                                if (string.IsNullOrEmpty(assemblyName))
+                                {
+                                    continue;
+                                }
+
+                                foreach (var typeDir in Directory.EnumerateDirectories(assemblyDir))
+                                {
+                                    var typeName = Path.GetFileName(typeDir);
+                                    if (string.IsNullOrEmpty(typeName))
+                                    {
+                                        continue;
+                                    }
+
+                                    foreach (var file in Directory.EnumerateFiles(typeDir))
+                                    {
+                                        var hintName = Path.GetFileName(file);
+                                        if (string.IsNullOrEmpty(hintName))
+                                        {
+                                            continue;
+                                        }
+
+                                        var key = MakeSourceGeneratedKey(assemblyName, typeName, hintName);
+                                        AddOrUpdateSourceGeneratedEntry(newIndex, key, file, isDebug);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Error scanning generated files under {ObjDir}", objDir);
                 }
             }
 
-            // Check remaining configurations
-            foreach (var configDir in Directory.EnumerateDirectories(objDir))
+            var scanTime = DateTime.UtcNow;
+            lock (_sourceGeneratedCacheLock)
             {
-                if (configDir == debugDir) continue;
-                var path = FindGeneratedFileInConfig(configDir, assemblyName, typeName, hintName);
-                if (path != null) return path;
+                _sourceGeneratedIndex.Clear();
+                foreach (var kvp in newIndex)
+                {
+                    _sourceGeneratedIndex[kvp.Key] = kvp.Value;
+                }
+                _sourceGeneratedIndexBuilt = true;
+                _sourceGeneratedIndexLastScan = scanTime;
             }
         }
-
-        return null;
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to refresh source-generated file index");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _sourceGeneratedIndexRefreshInProgress, 0);
+        }
     }
 
-    private static string? FindGeneratedFileInConfig(string configDir, string assemblyName, string typeName, string hintName)
+    private static void AddOrUpdateSourceGeneratedEntry(
+        Dictionary<string, SourceGeneratedEntry> index,
+        string key,
+        string path,
+        bool isDebug)
     {
-        // Look in all TFM directories (net8.0, net9.0, etc.)
-        foreach (var tfmDir in Directory.EnumerateDirectories(configDir))
+        DateTime lastWriteUtc;
+        try
         {
-            var generatedPath = Path.Combine(tfmDir, "generated", assemblyName, typeName, hintName);
-            if (File.Exists(generatedPath))
-            {
-                return generatedPath;
-            }
+            lastWriteUtc = File.GetLastWriteTimeUtc(path);
+        }
+        catch
+        {
+            lastWriteUtc = DateTime.MinValue;
         }
 
-        return null;
+        var candidate = new SourceGeneratedEntry(path, isDebug, lastWriteUtc);
+        if (index.TryGetValue(key, out var existing))
+        {
+            if (IsBetterSourceGeneratedEntry(candidate, existing))
+            {
+                index[key] = candidate;
+            }
+            return;
+        }
+
+        index[key] = candidate;
+    }
+
+    private static bool IsBetterSourceGeneratedEntry(SourceGeneratedEntry candidate, SourceGeneratedEntry existing)
+    {
+        if (candidate.IsDebug != existing.IsDebug)
+        {
+            return candidate.IsDebug;
+        }
+
+        return candidate.LastWriteUtc > existing.LastWriteUtc;
     }
 
     public async ValueTask DisposeAsync()

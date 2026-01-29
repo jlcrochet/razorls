@@ -76,7 +76,11 @@ public class HtmlLanguageClient : IAsyncDisposable
                 return;
 
             _startAttempted = true;
-            await StartAsync(cancellationToken).ConfigureAwait(false);
+            var started = await StartAsync(cancellationToken).ConfigureAwait(false);
+            if (!started)
+            {
+                return;
+            }
             await InitializeAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -88,14 +92,14 @@ public class HtmlLanguageClient : IAsyncDisposable
     /// <summary>
     /// Starts the HTML language server (vscode-html-language-server).
     /// </summary>
-    private async Task StartAsync(CancellationToken cancellationToken)
+    private async Task<bool> StartAsync(CancellationToken cancellationToken)
     {
         // Find vscode-html-language-server
         var serverPath = FindHtmlLanguageServer();
         if (serverPath == null)
         {
-            _logger.LogWarning("HTML language server not found. HTML formatting will be limited. Install with: `npm install -g vscode-langservers-extracted` or `pnpm install -g vscode-langservers-extracted` or `yarn global add vscode-langservers-extracted`");
-            return;
+            DisableHtmlServer("HTML language server not found. Install with: npm/pnpm/yarn global vscode-langservers-extracted.");
+            return false;
         }
 
         // Determine how to run the server:
@@ -128,14 +132,14 @@ public class HtmlLanguageClient : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to start HTML language server. Is Node.js installed?");
-            return;
+            DisableHtmlServer("Failed to start HTML language server. Is Node.js installed?", ex);
+            return false;
         }
 
         if (_process == null)
         {
-            _logger.LogError("Failed to start HTML language server");
-            return;
+            DisableHtmlServer("Failed to start HTML language server (process was null).");
+            return false;
         }
 
         // Capture stderr (track task for cleanup)
@@ -169,6 +173,7 @@ public class HtmlLanguageClient : IAsyncDisposable
         _rpc.StartListening();
 
         _logger.LogInformation("HTML language server started (PID: {Pid})", _process.Id);
+        return true;
     }
 
     /// <summary>
@@ -195,11 +200,18 @@ public class HtmlLanguageClient : IAsyncDisposable
             }
         };
 
-        await _rpc.InvokeWithParameterObjectAsync<JsonElement>("initialize", initParams, cancellationToken).ConfigureAwait(false);
-        await _rpc.NotifyAsync("initialized").ConfigureAwait(false);
+        try
+        {
+            await _rpc.InvokeWithParameterObjectAsync<JsonElement>("initialize", initParams, cancellationToken).ConfigureAwait(false);
+            await _rpc.NotifyAsync("initialized").ConfigureAwait(false);
 
-        _initialized = true;
-        _logger.LogInformation("HTML language server initialized");
+            _initialized = true;
+            _logger.LogInformation("HTML language server initialized");
+        }
+        catch (Exception ex)
+        {
+            DisableHtmlServer("Failed to initialize HTML language server.", ex);
+        }
     }
 
     /// <summary>
@@ -215,6 +227,10 @@ public class HtmlLanguageClient : IAsyncDisposable
 
         // Lazily start the HTML language server on first Razor file
         await EnsureStartedAsync(cancellationToken).ConfigureAwait(false);
+        if (!_enabled)
+        {
+            return;
+        }
 
         // Store the projection even if HTML LS failed to start
         if (_rpc == null || !_initialized)
@@ -520,6 +536,27 @@ public class HtmlLanguageClient : IAsyncDisposable
         }
 
         return null;
+    }
+
+    private void DisableHtmlServer(string reason, Exception? ex = null)
+    {
+        _enabled = false;
+        _initialized = false;
+
+        if (ex != null)
+        {
+            _logger.LogError(ex, "HTML language server disabled: {Reason}", reason);
+        }
+        else
+        {
+            _logger.LogError("HTML language server disabled: {Reason}", reason);
+        }
+
+        lock (_projectionsLock)
+        {
+            _projections.Clear();
+            _razorUriToChecksum.Clear();
+        }
     }
 
     public async ValueTask DisposeAsync()

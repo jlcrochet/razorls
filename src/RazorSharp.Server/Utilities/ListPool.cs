@@ -48,6 +48,7 @@ public static class ListPool<T>
         if (Pool.Count >= MaxPoolSize)
         {
             // Pool is full, let GC handle this one
+            list.Clear();
             return;
         }
 
