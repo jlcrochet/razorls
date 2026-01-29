@@ -221,7 +221,7 @@ public class HtmlLanguageClient : IAsyncDisposable
         {
             lock (_projectionsLock)
             {
-                _projections[checksum] = new HtmlProjection(razorUri, checksum, htmlContent, 1);
+                _projections[checksum] = new HtmlProjection(razorUri, checksum, 1);
                 _razorUriToChecksum[razorUri] = checksum;
             }
             return;
@@ -246,7 +246,7 @@ public class HtmlLanguageClient : IAsyncDisposable
                 _projections.Remove(existingByUri.Checksum);
             }
 
-            _projections[checksum] = new HtmlProjection(razorUri, checksum, htmlContent, newVersion);
+            _projections[checksum] = new HtmlProjection(razorUri, checksum, newVersion);
             _razorUriToChecksum[razorUri] = checksum;
         }
 
@@ -612,4 +612,4 @@ public class HtmlLanguageClient : IAsyncDisposable
 /// <summary>
 /// Represents an HTML projection of a Razor document.
 /// </summary>
-public record HtmlProjection(string RazorUri, string Checksum, string HtmlContent, int Version);
+public record HtmlProjection(string RazorUri, string Checksum, int Version);

@@ -23,7 +23,17 @@ public class WorkspaceManager
 
         while (directory != null)
         {
-            var solutions = directory.GetFiles("*.sln");
+            FileInfo[] solutions;
+            try
+            {
+                solutions = directory.GetFiles("*.sln");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error searching for solutions in {Path}", directory.FullName);
+                directory = directory.Parent;
+                continue;
+            }
 
             if (solutions.Length > 0)
             {
@@ -55,9 +65,41 @@ public class WorkspaceManager
 
         try
         {
-            var projects = Directory.GetFiles(rootPath, "*.csproj", SearchOption.AllDirectories);
-            _logger.LogDebug("Found {Count} projects in {Path}", projects.Length, rootPath);
-            return projects;
+            var projects = new List<string>();
+            var stack = new Stack<string>();
+            stack.Push(rootPath);
+
+            while (stack.Count > 0)
+            {
+                var current = stack.Pop();
+                try
+                {
+                    foreach (var file in Directory.EnumerateFiles(current, "*.csproj"))
+                    {
+                        projects.Add(file);
+                    }
+
+                    foreach (var dir in Directory.EnumerateDirectories(current))
+                    {
+                        var name = Path.GetFileName(dir);
+                        if (name.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+                            name.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
+                            name.Equals(".git", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        stack.Push(dir);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Error searching for projects in {Path}", current);
+                }
+            }
+
+            _logger.LogDebug("Found {Count} projects in {Path}", projects.Count, rootPath);
+            return projects.ToArray();
         }
         catch (Exception ex)
         {

@@ -47,6 +47,20 @@ public class InitializationOptions
     public HtmlOptions? Html { get; set; }
 
     /// <summary>
+    /// Enable fast-start mode to forward requests before Roslyn initialization completes.
+    /// This can reduce first-response latency at the cost of potential instability.
+    /// Default: true
+    /// </summary>
+    [JsonPropertyName("fastStart")]
+    public bool? FastStart { get; set; }
+
+    /// <summary>
+    /// Optional delay in milliseconds before forwarding in fast-start mode.
+    /// </summary>
+    [JsonPropertyName("fastStartDelayMs")]
+    public int? FastStartDelayMs { get; set; }
+
+    /// <summary>
     /// Server capabilities configuration.
     /// Allows enabling/disabling specific LSP features.
     /// </summary>

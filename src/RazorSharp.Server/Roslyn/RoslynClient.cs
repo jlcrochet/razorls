@@ -22,6 +22,7 @@ public class RoslynClient : IAsyncDisposable
     Task? _readTask;
     Task? _stderrTask;
     Task? _exitMonitorTask;
+    CancellationTokenSource? _processCts;
     long _nextId = 0;
     readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement?>> _pendingRequests = new();
     readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -85,6 +86,8 @@ public class RoslynClient : IAsyncDisposable
             throw new InvalidOperationException("Failed to start Roslyn process");
         }
 
+        _processCts = new CancellationTokenSource();
+
         // Capture stderr for logging (track task for cleanup)
         _stderrTask = Task.Run(async () =>
         {
@@ -92,7 +95,7 @@ public class RoslynClient : IAsyncDisposable
             {
                 while (!_process.HasExited)
                 {
-                    var line = await _process.StandardError.ReadLineAsync(cancellationToken);
+                    var line = await _process.StandardError.ReadLineAsync(_processCts.Token);
                     if (line != null)
                     {
                         _logger.LogDebug("[Roslyn stderr] {Line}", line);
@@ -101,14 +104,14 @@ public class RoslynClient : IAsyncDisposable
             }
             catch (OperationCanceledException) { }
             catch (ObjectDisposedException) { }
-        }, cancellationToken);
+        }, _processCts.Token);
 
         // Monitor process exit (track task for cleanup)
         _exitMonitorTask = Task.Run(async () =>
         {
             try
             {
-                await _process.WaitForExitAsync(cancellationToken);
+                await _process.WaitForExitAsync(_processCts.Token);
                 var exitCode = _process.ExitCode;
                 _logger.LogWarning("Roslyn process exited with code {ExitCode}", exitCode);
 
@@ -124,7 +127,7 @@ public class RoslynClient : IAsyncDisposable
             {
                 // Expected during shutdown
             }
-        }, cancellationToken);
+        }, _processCts.Token);
 
         // Start reading LSP messages from stdout
         _readCts = new CancellationTokenSource();
@@ -329,7 +332,7 @@ public class RoslynClient : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var id = Interlocked.Increment(ref _nextId);
-        var tcs = new TaskCompletionSource<JsonElement?>();
+        var tcs = new TaskCompletionSource<JsonElement?>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingRequests[id] = tcs;
 
         try
@@ -362,7 +365,7 @@ public class RoslynClient : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var id = Interlocked.Increment(ref _nextId);
-        var tcs = new TaskCompletionSource<JsonElement?>();
+        var tcs = new TaskCompletionSource<JsonElement?>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingRequests[id] = tcs;
 
         try
@@ -488,7 +491,11 @@ public class RoslynClient : IAsyncDisposable
         {
             // Serialize to pooled buffer (reset clears previous content but keeps pooled memory)
             _sendBufferWriter.Reset();
-            JsonSerializer.Serialize(new Utf8JsonWriter(_sendBufferWriter), message, SendJsonOptions);
+            using (var writer = new Utf8JsonWriter(_sendBufferWriter))
+            {
+                JsonSerializer.Serialize(writer, message, SendJsonOptions);
+                writer.Flush();
+            }
             var content = _sendBufferWriter.WrittenSpan;
 
             // Build header directly in bytes: "Content-Length: {length}\r\n\r\n"
@@ -554,6 +561,9 @@ public class RoslynClient : IAsyncDisposable
         }
 
         _readCts?.Cancel();
+        _processCts?.Cancel();
+        _processCts?.Dispose();
+        _processCts = null;
 
         // Wait briefly for background tasks to complete (use stackalloc-friendly pattern)
         try

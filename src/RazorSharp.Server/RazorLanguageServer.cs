@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Reflection;
 using System.Text.Json;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using RazorSharp.Dependencies;
 using RazorSharp.Protocol;
@@ -34,11 +35,18 @@ public class RazorLanguageServer : IAsyncDisposable
     string? _workspaceRoot;
     string _logLevel = "Information";
     bool _disposed;
-    readonly TaskCompletionSource _roslynProjectInitialized = new();
+    readonly TaskCompletionSource _roslynProjectInitialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
     DateTime _workspaceOpenedAt;
     readonly HashSet<string> _openDocuments = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, JsonElement> _pendingOpens = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, List<JsonElement>> _pendingChanges = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock _documentTrackingLock = new();
+    readonly Dictionary<string, string> _sourceGeneratedUriCache = new(StringComparer.OrdinalIgnoreCase);
+    readonly Lock _sourceGeneratedCacheLock = new();
+    readonly Channel<NotificationWorkItem> _notificationChannel;
+    readonly CancellationTokenSource _notificationCts;
+    readonly Task _notificationTask;
+    const int MaxFastStartDelayMs = 60000;
 
     static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -117,6 +125,8 @@ public class RazorLanguageServer : IAsyncDisposable
     static readonly string[] SemanticTokenFormats = ["relative"];
     static readonly string[] InlayHintResolveProperties = ["tooltip", "textEdits", "label.tooltip", "label.location", "label.command"];
 
+    readonly record struct NotificationWorkItem(string Method, JsonElement? Params);
+
     public RazorLanguageServer(ILoggerFactory loggerFactory, DependencyManager dependencyManager)
     {
         _loggerFactory = loggerFactory;
@@ -125,12 +135,32 @@ public class RazorLanguageServer : IAsyncDisposable
         _workspaceManager = new WorkspaceManager(loggerFactory.CreateLogger<WorkspaceManager>());
         _configurationLoader = new ConfigurationLoader(loggerFactory.CreateLogger<ConfigurationLoader>());
         _htmlClient = new HtmlLanguageClient(loggerFactory.CreateLogger<HtmlLanguageClient>());
+        _notificationChannel = Channel.CreateBounded<NotificationWorkItem>(new BoundedChannelOptions(1024)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropWrite
+        });
+        _notificationCts = new CancellationTokenSource();
+        _notificationTask = Task.Run(() => ProcessNotificationsAsync(_notificationCts.Token));
     }
 
     /// <summary>
     /// Gets the configuration loader for accessing omnisharp.json settings.
     /// </summary>
     public ConfigurationLoader ConfigurationLoader => _configurationLoader;
+
+    private bool FastStartEnabled => _initOptions?.FastStart != false;
+
+    private int FastStartDelayMs
+    {
+        get
+        {
+            var delay = _initOptions?.FastStartDelayMs ?? 0;
+            if (delay < 0) return 0;
+            return delay > MaxFastStartDelayMs ? MaxFastStartDelayMs : delay;
+        }
+    }
 
     /// <summary>
     /// Sets the solution/project path from CLI argument.
@@ -237,11 +267,14 @@ public class RazorLanguageServer : IAsyncDisposable
                 initOptions = JsonSerializer.Deserialize<InitializationOptions>(
                     @params.InitializationOptions.Value.GetRawText(), strictOptions);
                 _initOptions = initOptions;
-                _logger.LogDebug("Parsed initializationOptions: html.enable={HtmlEnable}, capabilities.completionProvider.triggerCharacters={TriggerChars}",
-                    initOptions?.Html?.Enable,
-                    initOptions?.Capabilities?.CompletionProvider?.TriggerCharacters != null
-                        ? string.Join(",", initOptions.Capabilities.CompletionProvider.TriggerCharacters)
-                        : "default");
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    var triggerChars = initOptions?.Capabilities?.CompletionProvider?.TriggerCharacters;
+                    var triggerText = triggerChars != null ? string.Join(",", triggerChars) : "default";
+                    _logger.LogDebug("Parsed initializationOptions: html.enable={HtmlEnable}, capabilities.completionProvider.triggerCharacters={TriggerChars}",
+                        initOptions?.Html?.Enable,
+                        triggerText);
+                }
             }
             catch (JsonException ex)
             {
@@ -253,6 +286,11 @@ public class RazorLanguageServer : IAsyncDisposable
         _roslynClient = new RoslynClient(_loggerFactory.CreateLogger<RoslynClient>());
         _roslynClient.SetConfigurationLoader(_configurationLoader);
 
+        // Wire up Roslyn events before starting to avoid missing early notifications
+        _roslynClient.NotificationReceived += OnRoslynNotification;
+        _roslynClient.RequestReceived += OnRoslynRequestAsync;
+        _roslynClient.ProcessExited += OnRoslynProcessExited;
+
         var roslynOptions = RoslynClient.CreateStartOptions(_dependencyManager,
             Path.Combine(_dependencyManager.BasePath, "logs"), _logLevel);
 
@@ -261,18 +299,13 @@ public class RazorLanguageServer : IAsyncDisposable
         // Configure HTML language server (started lazily when first Razor file is opened)
         _htmlClient.Configure(initOptions?.Html, @params?.RootUri);
 
-        // Wire up Roslyn events
-        _roslynClient.NotificationReceived += OnRoslynNotification;
-        _roslynClient.RequestReceived += OnRoslynRequestAsync;
-        _roslynClient.ProcessExited += OnRoslynProcessExited;
-
         // Forward initialize to Roslyn with cohosting enabled
         var roslynInitParams = CreateRoslynInitParams(@params);
         var roslynResult = await _roslynClient.SendRequestAsync<object, JsonElement>(
             LspMethods.Initialize, roslynInitParams, ct);
 
         _logger.LogInformation("Roslyn initialized");
-        if (roslynResult.TryGetProperty("capabilities", out var caps))
+        if (_logger.IsEnabled(LogLevel.Trace) && roslynResult.TryGetProperty("capabilities", out var caps))
         {
             _logger.LogTrace("Roslyn capabilities: {Caps}", caps.GetRawText());
         }
@@ -287,6 +320,11 @@ public class RazorLanguageServer : IAsyncDisposable
     public void HandleInitialized()
     {
         _logger.LogInformation("Client initialized");
+
+        if (_workspaceOpenedAt == default)
+        {
+            _workspaceOpenedAt = DateTime.UtcNow;
+        }
 
         // Forward to Roslyn - run in background but track completion
         _ = Task.Run(async () =>
@@ -307,7 +345,7 @@ public class RazorLanguageServer : IAsyncDisposable
                         _initParams?.WorkspaceFolders?.Length ?? 0);
                     if (_cliSolutionPath != null)
                     {
-                        await OpenWorkspaceAsync(new Uri(_cliSolutionPath).AbsoluteUri);
+                        await OpenWorkspaceAsync(_cliSolutionPath);
                     }
                     else if (_initParams?.RootUri != null)
                     {
@@ -398,51 +436,37 @@ public class RazorLanguageServer : IAsyncDisposable
         };
         var roslynParamsJson = JsonSerializer.SerializeToElement(roslynParams, JsonOptions);
 
-        // Wait briefly for Roslyn project initialization, but don't block forever
-        // If not initialized yet, forward anyway - Roslyn will queue the document
-        if (_roslynClient != null)
-        {
-            if (!_roslynProjectInitialized.Task.IsCompleted)
-            {
-                try
-                {
-                    _logger.LogDebug("Waiting for project initialization before forwarding didOpen...");
-                    await _roslynProjectInitialized.Task.WaitAsync(TimeSpan.FromSeconds(10));
-                }
-                catch (TimeoutException)
-                {
-                    _logger.LogDebug("Project not yet initialized, forwarding didOpen anyway for {Uri}", uri);
-                }
-            }
-
-            _logger.LogDebug("Forwarding didOpen to Roslyn for {Uri}", uri);
-            await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidOpen, roslynParamsJson);
-
-            // Track this document as open and retrieve any buffered changes atomically
-            // to prevent race conditions with HandleDidChangeAsync
-            List<JsonElement>? pendingChanges = null;
-            lock (_documentTrackingLock)
-            {
-                _openDocuments.Add(uri);
-                if (_pendingChanges.TryGetValue(uri, out pendingChanges))
-                {
-                    _pendingChanges.Remove(uri);
-                }
-            }
-
-            if (pendingChanges != null && pendingChanges.Count > 0)
-            {
-                _logger.LogDebug("Replaying {Count} buffered changes for {Uri}", pendingChanges.Count, uri);
-                foreach (var change in pendingChanges)
-                {
-                    await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidChange, change);
-                }
-            }
-        }
-        else
+        if (_roslynClient == null)
         {
             _logger.LogWarning("Roslyn client is null, cannot forward didOpen");
+            return;
         }
+
+        if (!_roslynClient.IsRunning)
+        {
+            _logger.LogWarning("Roslyn process is not running, cannot forward didOpen for {Uri}", uri);
+            return;
+        }
+
+        // Documents must be opened after workspace/projectInitializationComplete
+        if (!_roslynProjectInitialized.Task.IsCompleted)
+        {
+            lock (_documentTrackingLock)
+            {
+                _pendingOpens[uri] = roslynParamsJson;
+            }
+            _logger.LogDebug("Buffering didOpen for {Uri} until project initialization completes", uri);
+            return;
+        }
+
+        if (_roslynProjectInitialized.Task.IsFaulted || _roslynProjectInitialized.Task.IsCanceled)
+        {
+            _logger.LogWarning("Project initialization failed; cannot forward didOpen for {Uri}", uri);
+            return;
+        }
+
+        _logger.LogDebug("Forwarding didOpen to Roslyn for {Uri}", uri);
+        await SendDidOpenAndReplayAsync(uri, roslynParamsJson);
     }
 
     private static bool IsRazorUri(string uri)
@@ -508,6 +532,7 @@ public class RazorLanguageServer : IAsyncDisposable
         lock (_documentTrackingLock)
         {
             _openDocuments.Remove(uri);
+            _pendingOpens.Remove(uri);
             _pendingChanges.Remove(uri);
         }
 
@@ -772,9 +797,15 @@ public class RazorLanguageServer : IAsyncDisposable
     [JsonRpcMethod(LspMethods.TextDocumentFormatting, UseSingleObjectParameterDeserialization = true)]
     public async Task<JsonElement?> HandleFormattingAsync(JsonElement @params, CancellationToken ct)
     {
-        _logger.LogTrace("Formatting request params: {Params}", @params.GetRawText());
+        if (_logger.IsEnabled(LogLevel.Trace))
+        {
+            _logger.LogTrace("Formatting request params: {Params}", @params.GetRawText());
+        }
         var result = await ForwardToRoslynAsync(LspMethods.TextDocumentFormatting, @params, ct);
-        _logger.LogTrace("Formatting response: {Result}", result?.GetRawText() ?? "null");
+        if (_logger.IsEnabled(LogLevel.Trace))
+        {
+            _logger.LogTrace("Formatting response: {Result}", result?.GetRawText() ?? "null");
+        }
         return result;
     }
 
@@ -905,13 +936,16 @@ public class RazorLanguageServer : IAsyncDisposable
             // Resolve the code action to get the workspace edit
             var resolveResult = await ForwardToRoslynAsync(LspMethods.CodeActionResolve, selectedAction, ct);
 
-            if (resolveResult.HasValue && resolveResult.Value.TryGetProperty("edit", out var edit))
-            {
-                // Apply the workspace edit via the client
-                _logger.LogDebug("nestedCodeAction: Applying workspace edit");
-                await _clientRpc!.NotifyAsync(LspMethods.WorkspaceApplyEdit, new { edit });
-                return SuccessResponse;
-            }
+                if (resolveResult.HasValue && resolveResult.Value.TryGetProperty("edit", out var edit))
+                {
+                    // Apply the workspace edit via the client
+                    _logger.LogDebug("nestedCodeAction: Applying workspace edit");
+                    await _clientRpc!.InvokeWithParameterObjectAsync<JsonElement?>(
+                        LspMethods.WorkspaceApplyEdit,
+                        new { edit },
+                        ct);
+                    return SuccessResponse;
+                }
 
             _logger.LogWarning("nestedCodeAction: No edit in resolved action");
             return null;
@@ -962,7 +996,10 @@ public class RazorLanguageServer : IAsyncDisposable
                 if (resolveResult.HasValue && resolveResult.Value.TryGetProperty("edit", out var edit))
                 {
                     _logger.LogDebug("fixAllCodeAction: Applying workspace edit");
-                    await _clientRpc!.NotifyAsync(LspMethods.WorkspaceApplyEdit, new { edit });
+                    await _clientRpc!.InvokeWithParameterObjectAsync<JsonElement?>(
+                        LspMethods.WorkspaceApplyEdit,
+                        new { edit },
+                        ct);
                     return SuccessResponse;
                 }
             }
@@ -1060,33 +1097,40 @@ public class RazorLanguageServer : IAsyncDisposable
             var results = await Task.WhenAll(tasks);
             ListPool<Task<JsonElement?>>.Return(tasks);
 
-            // Merge the diagnostic items from all responses
-            var mergedItems = ListPool<JsonElement>.Rent();
+            var bufferWriter = new ArrayPoolBufferWriter();
             try
             {
+                using var writer = new Utf8JsonWriter(bufferWriter);
+                writer.WriteStartObject();
+                writer.WriteString("kind", "full");
+                writer.WriteString("resultId", $"merged:{DateTime.UtcNow.Ticks}");
+                writer.WritePropertyName("items");
+                writer.WriteStartArray();
+
+                var mergedCount = 0;
                 foreach (var result in results)
                 {
                     if (result.HasValue && result.Value.TryGetProperty("items", out var items))
                     {
                         foreach (var item in items.EnumerateArray())
                         {
-                            mergedItems.Add(item.Clone());
+                            item.WriteTo(writer);
+                            mergedCount++;
                         }
                     }
                 }
 
-                _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedItems.Count, uri);
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+                writer.Flush();
 
-                return JsonSerializer.SerializeToElement(new
-                {
-                    kind = "full",
-                    resultId = $"merged:{DateTime.UtcNow.Ticks}",
-                    items = mergedItems
-                }, JsonOptions);
+                _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedCount, uri);
+
+                return JsonDocument.Parse(bufferWriter.WrittenMemory).RootElement.Clone();
             }
             finally
             {
-                ListPool<JsonElement>.Return(mergedItems);
+                bufferWriter.Dispose();
             }
         }
 
@@ -1112,69 +1156,113 @@ public class RazorLanguageServer : IAsyncDisposable
         _logger.LogError("Roslyn process exited unexpectedly with code {ExitCode}. Language features will be unavailable.", exitCode);
         // Mark initialization as failed so new requests don't wait forever
         _roslynProjectInitialized.TrySetException(new Exception($"Roslyn process exited with code {exitCode}"));
+
+        lock (_documentTrackingLock)
+        {
+            _pendingOpens.Clear();
+            _pendingChanges.Clear();
+            _openDocuments.Clear();
+        }
+    }
+
+    private async Task ProcessNotificationsAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (await _notificationChannel.Reader.WaitToReadAsync(ct))
+            {
+                while (_notificationChannel.Reader.TryRead(out var item))
+                {
+                    await HandleRoslynNotificationAsync(item, ct);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected during shutdown
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing Roslyn notifications");
+        }
+    }
+
+    private async Task HandleRoslynNotificationAsync(NotificationWorkItem item, CancellationToken ct)
+    {
+        try
+        {
+            switch (item.Method)
+            {
+                case LspMethods.RazorLog:
+                    HandleRazorLog(item.Params);
+                    break;
+
+                case LspMethods.TextDocumentPublishDiagnostics:
+                    // Forward diagnostics to client
+                    if (item.Params.HasValue)
+                    {
+                        var uri = item.Params.Value.TryGetProperty("uri", out var uriProp) ? uriProp.GetString() : "unknown";
+                        var diagCount = item.Params.Value.TryGetProperty("diagnostics", out var diags) && diags.ValueKind == JsonValueKind.Array
+                            ? diags.GetArrayLength()
+                            : 0;
+                        _logger.LogInformation("Publishing {Count} diagnostics for {Uri}", diagCount, uri);
+                    }
+                    await ForwardNotificationToClientAsync(item.Method, item.Params);
+                    break;
+
+                case LspMethods.ProjectInitializationComplete:
+                    _logger.LogInformation("Roslyn project initialization complete - server ready");
+                    _roslynProjectInitialized.TrySetResult();
+                    await FlushPendingOpensAsync();
+                    break;
+
+                case "window/logMessage":
+                    // Log window messages for debugging
+                    if (item.Params.HasValue && item.Params.Value.TryGetProperty("message", out var msgProp))
+                    {
+                        _logger.LogDebug("[Roslyn] {Message}", msgProp.GetString());
+                    }
+                    await ForwardNotificationToClientAsync(item.Method, item.Params);
+                    break;
+
+                case "window/showMessage":
+                    // Forward window messages to client
+                    await ForwardNotificationToClientAsync(item.Method, item.Params);
+                    break;
+
+                case LspMethods.Progress:
+                    // Forward progress notifications to client for status bar spinners
+                    await ForwardNotificationToClientAsync(item.Method, item.Params);
+                    break;
+
+                default:
+                    _logger.LogDebug("Unhandled Roslyn notification: {Method}", item.Method);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error handling Roslyn notification: {Method}", item.Method);
+        }
     }
 
     private void OnRoslynNotification(object? sender, RoslynNotificationEventArgs e)
     {
         _logger.LogDebug("Received notification from Roslyn: {Method}", e.Method);
 
-        _ = Task.Run(async () =>
+        var item = new NotificationWorkItem(e.Method, e.Params);
+        if (!_notificationChannel.Writer.TryWrite(item))
         {
-            try
+            // Ensure initialization completion isn't dropped under backpressure
+            if (e.Method == LspMethods.ProjectInitializationComplete)
             {
-                switch (e.Method)
-                {
-                    case LspMethods.RazorLog:
-                        HandleRazorLog(e.Params);
-                        break;
-
-                    case LspMethods.TextDocumentPublishDiagnostics:
-                        // Forward diagnostics to client
-                        if (e.Params.HasValue)
-                        {
-                            var uri = e.Params.Value.TryGetProperty("uri", out var uriProp) ? uriProp.GetString() : "unknown";
-                            var diagCount = e.Params.Value.TryGetProperty("diagnostics", out var diags) && diags.ValueKind == JsonValueKind.Array
-                                ? diags.GetArrayLength()
-                                : 0;
-                            _logger.LogInformation("Publishing {Count} diagnostics for {Uri}", diagCount, uri);
-                        }
-                        await ForwardNotificationToClientAsync(e.Method, e.Params);
-                        break;
-
-                    case LspMethods.ProjectInitializationComplete:
-                        _logger.LogInformation("Roslyn project initialization complete - server ready");
-                        _roslynProjectInitialized.TrySetResult();
-                        break;
-
-                    case "window/logMessage":
-                        // Log window messages for debugging
-                        if (e.Params.HasValue && e.Params.Value.TryGetProperty("message", out var msgProp))
-                        {
-                            _logger.LogDebug("[Roslyn] {Message}", msgProp.GetString());
-                        }
-                        await ForwardNotificationToClientAsync(e.Method, e.Params);
-                        break;
-
-                    case "window/showMessage":
-                        // Forward window messages to client
-                        await ForwardNotificationToClientAsync(e.Method, e.Params);
-                        break;
-
-                    case LspMethods.Progress:
-                        // Forward progress notifications to client for status bar spinners
-                        await ForwardNotificationToClientAsync(e.Method, e.Params);
-                        break;
-
-                    default:
-                        _logger.LogDebug("Unhandled Roslyn notification: {Method}", e.Method);
-                        break;
-                }
+                _ = HandleRoslynNotificationAsync(item, _notificationCts.Token);
             }
-            catch (Exception ex)
+            else
             {
-                _logger.LogError(ex, "Error handling Roslyn notification: {Method}", e.Method);
+                _logger.LogDebug("Dropping Roslyn notification due to backpressure: {Method}", e.Method);
             }
-        });
+        }
     }
 
     private async Task<JsonElement?> OnRoslynRequestAsync(string method, JsonElement? @params, long requestId, CancellationToken ct)
@@ -1391,25 +1479,43 @@ public class RazorLanguageServer : IAsyncDisposable
         // If not initialized yet, either wait briefly or proceed after a grace period
         if (!_roslynProjectInitialized.Task.IsCompleted)
         {
-            // After 15 seconds from workspace open, proceed anyway even without initialization
-            // This handles cases where Roslyn never sends projectInitializationComplete
-            var timeSinceOpen = DateTime.UtcNow - _workspaceOpenedAt;
-            if (timeSinceOpen < TimeSpan.FromSeconds(15))
+            if (FastStartEnabled)
             {
-                try
+                var delayMs = FastStartDelayMs;
+                if (delayMs > 0)
                 {
-                    // Wait up to 5 seconds for initialization
-                    await _roslynProjectInitialized.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+                    var timeSinceOpen = DateTime.UtcNow - _workspaceOpenedAt;
+                    if (timeSinceOpen < TimeSpan.FromMilliseconds(delayMs))
+                    {
+                        _logger.LogDebug("Fast-start delay active, cannot forward {Method} yet", method);
+                        return null;
+                    }
                 }
-                catch (TimeoutException)
-                {
-                    _logger.LogDebug("Project not yet initialized, cannot forward {Method}", method);
-                    return null;
-                }
+
+                _logger.LogDebug("Fast-start enabled; forwarding {Method} before project initialization completes", method);
             }
             else
             {
-                _logger.LogDebug("Proceeding without initialization complete for {Method} (grace period elapsed)", method);
+                // After 15 seconds from workspace open, proceed anyway even without initialization
+                // This handles cases where Roslyn never sends projectInitializationComplete
+                var timeSinceOpen = DateTime.UtcNow - _workspaceOpenedAt;
+                if (timeSinceOpen < TimeSpan.FromSeconds(15))
+                {
+                    try
+                    {
+                        // Wait up to 5 seconds for initialization
+                        await _roslynProjectInitialized.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+                    }
+                    catch (TimeoutException)
+                    {
+                        _logger.LogDebug("Project not yet initialized, cannot forward {Method}", method);
+                        return null;
+                    }
+                }
+                else
+                {
+                    _logger.LogDebug("Proceeding without initialization complete for {Method} (grace period elapsed)", method);
+                }
             }
         }
 
@@ -1467,7 +1573,74 @@ public class RazorLanguageServer : IAsyncDisposable
         }
     }
 
-    private async Task OpenWorkspaceAsync(string rootUri)
+    private async Task SendDidOpenAndReplayAsync(string uri, JsonElement openParams)
+    {
+        if (_roslynClient == null || !_roslynClient.IsRunning)
+        {
+            return;
+        }
+
+        await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidOpen, openParams);
+
+        List<JsonElement>? pendingChanges = null;
+        lock (_documentTrackingLock)
+        {
+            _openDocuments.Add(uri);
+            _pendingOpens.Remove(uri);
+            if (_pendingChanges.TryGetValue(uri, out pendingChanges))
+            {
+                _pendingChanges.Remove(uri);
+            }
+        }
+
+        if (pendingChanges != null && pendingChanges.Count > 0)
+        {
+            _logger.LogDebug("Replaying {Count} buffered changes for {Uri}", pendingChanges.Count, uri);
+            foreach (var change in pendingChanges)
+            {
+                await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidChange, change);
+            }
+        }
+    }
+
+    private async Task FlushPendingOpensAsync()
+    {
+        if (_roslynClient == null || !_roslynClient.IsRunning)
+        {
+            return;
+        }
+
+        List<(string Uri, JsonElement OpenParams)> pending;
+        lock (_documentTrackingLock)
+        {
+            if (_pendingOpens.Count == 0)
+            {
+                return;
+            }
+
+            pending = new List<(string, JsonElement)>(_pendingOpens.Count);
+            foreach (var kvp in _pendingOpens)
+            {
+                pending.Add((kvp.Key, kvp.Value));
+            }
+            _pendingOpens.Clear();
+        }
+
+        foreach (var (uri, openParams) in pending)
+        {
+            try
+            {
+                _logger.LogDebug("Flushing pending didOpen for {Uri}", uri);
+                await SendDidOpenAndReplayAsync(uri, openParams);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to flush pending didOpen for {Uri}", uri);
+            }
+        }
+    }
+
+    private async Task OpenWorkspaceAsync(string rootUriOrPath)
     {
         if (_roslynClient == null)
         {
@@ -1475,7 +1648,45 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         _workspaceOpenedAt = DateTime.UtcNow;
-        var rootPath = new Uri(rootUri).LocalPath;
+        var rootPath = TryGetLocalPath(rootUriOrPath);
+        if (rootPath == null)
+        {
+            _logger.LogWarning("Invalid workspace root: {Root}", rootUriOrPath);
+            return;
+        }
+
+        if (File.Exists(rootPath))
+        {
+            var extension = Path.GetExtension(rootPath);
+            if (extension.Equals(".sln", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation("Opening solution: {Solution}", rootPath);
+                await _roslynClient.SendNotificationAsync(LspMethods.SolutionOpen, new SolutionOpenParams
+                {
+                    Solution = new Uri(rootPath).AbsoluteUri
+                });
+            }
+            else if (extension.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation("Opening project: {Project}", rootPath);
+                await _roslynClient.SendNotificationAsync(LspMethods.ProjectOpen, new ProjectOpenParams
+                {
+                    Projects = [new Uri(rootPath).AbsoluteUri]
+                });
+            }
+            else
+            {
+                _logger.LogWarning("Workspace path is a file but not a supported project/solution: {Path}", rootPath);
+            }
+            return;
+        }
+
+        if (!Directory.Exists(rootPath))
+        {
+            _logger.LogWarning("Workspace root does not exist: {Path}", rootPath);
+            return;
+        }
+
         var solution = _workspaceManager.FindSolution(rootPath);
 
         if (solution != null)
@@ -1499,6 +1710,61 @@ public class RazorLanguageServer : IAsyncDisposable
                 });
             }
         }
+    }
+
+    private static string? TryGetLocalPath(string uriOrPath)
+    {
+        if (string.IsNullOrWhiteSpace(uriOrPath))
+        {
+            return null;
+        }
+
+        if (IsLikelyWindowsPath(uriOrPath))
+        {
+            try
+            {
+                return Path.GetFullPath(uriOrPath);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        if (Uri.TryCreate(uriOrPath, UriKind.Absolute, out var uri))
+        {
+            if (uri.IsFile)
+            {
+                return uri.LocalPath;
+            }
+            return null;
+        }
+
+        try
+        {
+            return Path.GetFullPath(uriOrPath);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsLikelyWindowsPath(string value)
+    {
+        // Drive letter path (e.g., C:\path or C:/path)
+        if (value.Length >= 2 && char.IsLetter(value[0]) && value[1] == ':')
+        {
+            return true;
+        }
+
+        // UNC path (e.g., \\server\share)
+        if (value.StartsWith(@"\\", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private object CreateRoslynInitParams(InitializeParams? clientParams)
@@ -1705,18 +1971,8 @@ public class RazorLanguageServer : IAsyncDisposable
             {
                 Legend = new SemanticTokensLegend
                 {
-                    TokenTypes =
-                    [
-                        "namespace", "type", "class", "enum", "interface", "struct",
-                        "typeParameter", "parameter", "variable", "property", "enumMember",
-                        "event", "function", "method", "macro", "keyword", "modifier",
-                        "comment", "string", "number", "regexp", "operator", "decorator"
-                    ],
-                    TokenModifiers =
-                    [
-                        "declaration", "definition", "readonly", "static", "deprecated",
-                        "abstract", "async", "modification", "documentation", "defaultLibrary"
-                    ]
+                    TokenTypes = SemanticTokenTypes,
+                    TokenModifiers = SemanticTokenModifiers
                 },
                 Full = caps?.SemanticTokensProvider?.Full ?? true,
                 Range = caps?.SemanticTokensProvider?.Range ?? true
@@ -1824,14 +2080,14 @@ public class RazorLanguageServer : IAsyncDisposable
 
             foreach (var item in response.EnumerateArray())
             {
-                var newItem = TransformLocationElement(item);
+                var newItem = TransformLocationElement(item, out var changed);
 
                 if (transformed != null)
                 {
                     // Already started collecting, add this item
                     transformed.Add(newItem);
                 }
-                else if (item.GetRawText() != newItem.GetRawText())
+                else if (changed)
                 {
                     // First changed item - copy all previous items and this one
                     transformed = new List<JsonElement>(response.GetArrayLength());
@@ -1855,17 +2111,20 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         // Single location
-        return TransformLocationElement(response);
+        return TransformLocationElement(response, out _);
     }
 
-    private JsonElement TransformLocationElement(JsonElement element)
+    private JsonElement TransformLocationElement(JsonElement element, out bool changed)
     {
+        changed = false;
+
         // Check if this is a Location (has "uri") or LocationLink (has "targetUri")
         if (element.TryGetProperty("uri", out var uriProp))
         {
             var uri = uriProp.GetString();
             if (uri != null && TryMapSourceGeneratedUri(uri, out var filePath))
             {
+                changed = true;
                 return CloneJsonElementWithReplacedProperty(element, "uri", new Uri(filePath).AbsoluteUri);
             }
         }
@@ -1874,6 +2133,7 @@ public class RazorLanguageServer : IAsyncDisposable
             var uri = targetUriProp.GetString();
             if (uri != null && TryMapSourceGeneratedUri(uri, out var filePath))
             {
+                changed = true;
                 return CloneJsonElementWithReplacedProperty(element, "targetUri", new Uri(filePath).AbsoluteUri);
             }
         }
@@ -1929,6 +2189,19 @@ public class RazorLanguageServer : IAsyncDisposable
             return false;
         }
 
+        lock (_sourceGeneratedCacheLock)
+        {
+            if (_sourceGeneratedUriCache.TryGetValue(uri, out var cachedPath))
+            {
+                if (File.Exists(cachedPath))
+                {
+                    filePath = cachedPath;
+                    return true;
+                }
+                _sourceGeneratedUriCache.Remove(uri);
+            }
+        }
+
         try
         {
             var parsed = new Uri(uri);
@@ -1950,6 +2223,10 @@ public class RazorLanguageServer : IAsyncDisposable
             if (found != null)
             {
                 filePath = found;
+                lock (_sourceGeneratedCacheLock)
+                {
+                    _sourceGeneratedUriCache[uri] = found;
+                }
                 _logger.LogDebug("Mapped source generated URI {Uri} to {FilePath}", uri, filePath);
                 return true;
             }
@@ -2030,5 +2307,17 @@ public class RazorLanguageServer : IAsyncDisposable
         await _htmlClient.DisposeAsync();
 
         _clientRpc?.Dispose();
+
+        _notificationChannel.Writer.TryComplete();
+        _notificationCts.Cancel();
+        try
+        {
+            await _notificationTask.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        catch
+        {
+            // Ignore shutdown errors
+        }
+        _notificationCts.Dispose();
     }
 }

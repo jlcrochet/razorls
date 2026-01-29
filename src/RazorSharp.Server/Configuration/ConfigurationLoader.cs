@@ -190,8 +190,8 @@ public class ConfigurationLoader
     /// </summary>
     private static JsonNode? MergeJsonNodes(JsonNode? baseNode, JsonNode? overlay)
     {
-        if (overlay == null) return baseNode;
-        if (baseNode == null) return overlay;
+        if (overlay == null) return baseNode?.DeepClone();
+        if (baseNode == null) return overlay.DeepClone();
 
         // Only merge objects; for arrays and primitives, overlay wins
         if (baseNode is JsonObject baseObj && overlay is JsonObject overlayObj)
@@ -201,7 +201,7 @@ public class ConfigurationLoader
             // Add all properties from base
             foreach (var prop in baseObj)
             {
-                result[prop.Key] = prop.Value;
+                result[prop.Key] = prop.Value?.DeepClone();
             }
 
             // Merge/override with overlay properties
@@ -215,7 +215,7 @@ public class ConfigurationLoader
                 else
                 {
                     // Override with overlay value
-                    result[prop.Key] = prop.Value;
+                    result[prop.Key] = prop.Value?.DeepClone();
                 }
             }
 
@@ -223,6 +223,6 @@ public class ConfigurationLoader
         }
 
         // For non-objects, overlay takes precedence
-        return overlay;
+        return overlay.DeepClone();
     }
 }

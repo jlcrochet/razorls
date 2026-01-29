@@ -216,6 +216,8 @@ RazorSharp supports configuration via LSP `initializationOptions`. In Helix, thi
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `html.enable` | bool | `true` | Enable/disable HTML language server |
+| `fastStart` | bool | `true` | Forward LSP requests before Roslyn initialization completes |
+| `fastStartDelayMs` | int | `0` | Delay (ms) before forwarding requests in fast-start mode |
 | `capabilities.completionProvider.enabled` | bool | `true` | Enable/disable completion |
 | `capabilities.completionProvider.triggerCharacters` | string[] | `[".", "<", "@", "(", "=", "/"]` | Characters that trigger completion |
 | `capabilities.hoverProvider` | bool | `true` | Enable/disable hover |
@@ -246,6 +248,27 @@ RazorSharp supports configuration via LSP `initializationOptions`. In Helix, thi
 | `capabilities.diagnosticProvider.semantic` | bool | `true` | Enable compiler semantic diagnostics (type errors, etc.) |
 | `capabilities.diagnosticProvider.analyzerSyntax` | bool | `false` | Enable Roslyn analyzer syntax diagnostics |
 | `capabilities.diagnosticProvider.analyzerSemantic` | bool | `false` | Enable Roslyn analyzer semantic diagnostics |
+
+#### Example: Fast-start with a delay
+
+**Helix:**
+```toml
+[language-server.razorsharp]
+command = "dotnet"
+args = ["/path/to/razorsharp.dll"]
+config.fastStart = true
+config.fastStartDelayMs = 500
+```
+
+**Neovim:**
+```lua
+lspconfig.razorsharp.setup({
+  init_options = {
+    fastStart = true,
+    fastStartDelayMs = 500
+  }
+})
+```
 
 #### Example: Disable completion on `(`
 
