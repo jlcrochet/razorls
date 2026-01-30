@@ -182,6 +182,11 @@ public class ConfigurationLoader
             _logger.LogWarning(ex, "Failed to read omnisharp.json at {Path}", path);
             return null;
         }
+        catch (UnauthorizedAccessException ex)
+        {
+            _logger.LogWarning(ex, "Access denied reading omnisharp.json at {Path}", path);
+            return null;
+        }
     }
 
     /// <summary>

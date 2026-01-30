@@ -172,4 +172,56 @@ public class LspMessageParserTests
         }
     }
 
+    [Fact]
+    public void TryParseMessage_MalformedJson_DropsMessageAndContinues()
+    {
+        using var parser = new LspMessageParser();
+        var badMessage = """{"id":1""";
+        var goodMessage = """{"id":2}""";
+        var combined = $"Content-Length: {Encoding.UTF8.GetByteCount(badMessage)}\r\n\r\n{badMessage}" +
+                       $"Content-Length: {Encoding.UTF8.GetByteCount(goodMessage)}\r\n\r\n{goodMessage}";
+        AppendToParser(parser, combined);
+
+        var first = parser.TryParseMessage(out var pooledDoc1);
+        using (pooledDoc1)
+        {
+            Assert.False(first);
+            Assert.Null(pooledDoc1.Document);
+        }
+
+        var second = parser.TryParseMessage(out var pooledDoc2);
+        using (pooledDoc2)
+        {
+            Assert.True(second);
+            Assert.NotNull(pooledDoc2.Document);
+            Assert.Equal(2, pooledDoc2.Document!.RootElement.GetProperty("id").GetInt32());
+        }
+    }
+
+    [Fact]
+    public void TryParseMessage_OversizedHeader_IsDroppedAndNextMessageParses()
+    {
+        using var parser = new LspMessageParser();
+        AppendToParser(parser, new string('a', 33000));
+
+        var first = parser.TryParseMessage(out var pooledDoc1);
+        using (pooledDoc1)
+        {
+            Assert.False(first);
+            Assert.Null(pooledDoc1.Document);
+        }
+
+        var message = """{"id":3}""";
+        var lspMessage = $"Content-Length: {Encoding.UTF8.GetByteCount(message)}\r\n\r\n{message}";
+        AppendToParser(parser, lspMessage);
+
+        var second = parser.TryParseMessage(out var pooledDoc2);
+        using (pooledDoc2)
+        {
+            Assert.True(second);
+            Assert.NotNull(pooledDoc2.Document);
+            Assert.Equal(3, pooledDoc2.Document!.RootElement.GetProperty("id").GetInt32());
+        }
+    }
+
 }

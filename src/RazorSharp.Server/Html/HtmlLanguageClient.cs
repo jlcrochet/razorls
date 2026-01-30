@@ -27,7 +27,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     // Track HTML projections by checksum (Roslyn uses checksums to identify HTML versions)
     readonly Dictionary<string, HtmlProjection> _projections = new();
     // Secondary index for O(1) lookup by Razor URI
-    readonly Dictionary<string, string> _razorUriToChecksum = new();
+    readonly Dictionary<string, string> _razorUriToChecksum = new(UriComparer);
     // Lock for atomic updates to both projection dictionaries
     readonly Lock _projectionsLock = new();
 
@@ -36,6 +36,11 @@ public class HtmlLanguageClient : IAsyncDisposable
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true
     };
+
+    static readonly bool IsCaseInsensitiveFileSystem = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
+    static readonly StringComparer UriComparer = IsCaseInsensitiveFileSystem
+        ? StringComparer.OrdinalIgnoreCase
+        : StringComparer.Ordinal;
 
     // Cached suffix for virtual HTML URIs to avoid repeated string allocations
     const string VirtualHtmlSuffix = "__virtual.html";

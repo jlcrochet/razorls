@@ -58,6 +58,78 @@ public class WorkspaceManagerTests
     }
 
     [Fact]
+    public void FindProjects_RespectsExcludePatterns()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            var rootProject = Path.Combine(tempRoot, "Root.csproj");
+            var packagesProject = Path.Combine(tempRoot, "packages", "Lib", "Lib.csproj");
+            var nestedPackagesProject = Path.Combine(tempRoot, "src", "packages", "Inner", "Inner.csproj");
+            var appProject = Path.Combine(tempRoot, "src", "App", "App.csproj");
+
+            TouchFile(rootProject);
+            TouchFile(packagesProject);
+            TouchFile(nestedPackagesProject);
+            TouchFile(appProject);
+
+            var manager = CreateManager();
+            manager.ConfigureExcludedDirectories(null, ["**/packages/**"]);
+
+            var projects = manager.FindProjects(tempRoot)
+                .Select(Path.GetFullPath)
+                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            var expected = new[]
+            {
+                Path.GetFullPath(rootProject),
+                Path.GetFullPath(appProject)
+            }.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToArray();
+
+            Assert.Equal(expected, projects);
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
+    public void FindProjects_ExcludeOverride_ReplacesDefaults()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            var rootProject = Path.Combine(tempRoot, "Root.csproj");
+            var nodeModulesProject = Path.Combine(tempRoot, "node_modules", "Pkg", "Pkg.csproj");
+
+            TouchFile(rootProject);
+            TouchFile(nodeModulesProject);
+
+            var manager = CreateManager();
+            manager.ConfigureExcludedDirectories(Array.Empty<string>(), null);
+
+            var projects = manager.FindProjects(tempRoot)
+                .Select(Path.GetFullPath)
+                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            var expected = new[]
+            {
+                Path.GetFullPath(rootProject),
+                Path.GetFullPath(nodeModulesProject)
+            }.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToArray();
+
+            Assert.Equal(expected, projects);
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
     public void FindSolution_NoSolution_ReturnsNull()
     {
         var tempRoot = CreateTempDir();
