@@ -122,6 +122,8 @@ public class WorkDoneProgressServerTests
                 return JsonSerializer.SerializeToElement(new { kind = "full", resultId = "test", items = Array.Empty<object>() });
             });
 
+            await server.HandleRoslynNotificationForTests(LspMethods.ProjectInitializationComplete, null, CancellationToken.None);
+
             var diagnosticParams = CreateDiagnosticParams("file:///test.razor");
             await server.HandleDiagnosticAsync(diagnosticParams, CancellationToken.None);
 
@@ -143,6 +145,8 @@ public class WorkDoneProgressServerTests
                 await Task.Delay(400, ct);
                 return JsonSerializer.SerializeToElement(new { kind = "full", resultId = "test", items = Array.Empty<object>() });
             });
+
+            await server.HandleRoslynNotificationForTests(LspMethods.ProjectInitializationComplete, null, CancellationToken.None);
 
             var diagnosticParams = CreateDiagnosticParams("file:///test.razor");
             await server.HandleDiagnosticAsync(diagnosticParams, CancellationToken.None);
@@ -204,6 +208,8 @@ public class WorkDoneProgressServerTests
                     beginGate.TrySetResult(true);
                 }
             };
+
+            await server.HandleRoslynNotificationForTests(LspMethods.ProjectInitializationComplete, null, CancellationToken.None);
 
             var first = server.HandleDiagnosticAsync(CreateDiagnosticParams("file:///a.razor"), CancellationToken.None);
             var second = server.HandleDiagnosticAsync(CreateDiagnosticParams("file:///b.razor"), CancellationToken.None);
@@ -276,6 +282,8 @@ public class WorkDoneProgressServerTests
                 return JsonSerializer.SerializeToElement(new { kind = "full", resultId = "test", items = Array.Empty<object>() });
             });
 
+            await server.HandleRoslynNotificationForTests(LspMethods.ProjectInitializationComplete, null, CancellationToken.None);
+
             var fast = server.HandleDiagnosticAsync(CreateDiagnosticParams("file:///fast.razor"), CancellationToken.None);
             var slow = server.HandleDiagnosticAsync(CreateDiagnosticParams("file:///slow.razor"), CancellationToken.None);
             await Task.WhenAll(fast, slow);
@@ -306,6 +314,8 @@ public class WorkDoneProgressServerTests
                 await Task.Delay(400, ct);
                 return JsonSerializer.SerializeToElement(new { kind = "full", resultId = "test", items = Array.Empty<object>() });
             });
+
+            await server.HandleRoslynNotificationForTests(LspMethods.ProjectInitializationComplete, null, CancellationToken.None);
 
             var diagnosticParams = CreateDiagnosticParams("file:///test.razor");
             await server.HandleDiagnosticAsync(diagnosticParams, CancellationToken.None);

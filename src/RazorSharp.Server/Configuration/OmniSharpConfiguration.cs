@@ -66,6 +66,49 @@ public class InitializationOptions
     /// </summary>
     [JsonPropertyName("capabilities")]
     public CapabilitiesConfig? Capabilities { get; set; }
+
+    /// <summary>
+    /// Workspace discovery options for RazorSharp.
+    /// </summary>
+    [JsonPropertyName("workspace")]
+    public WorkspaceOptions? Workspace { get; set; }
+
+    /// <summary>
+    /// Roslyn request timeout settings for RazorSharp.
+    /// </summary>
+    [JsonPropertyName("roslyn")]
+    public RoslynOptions? Roslyn { get; set; }
+}
+
+/// <summary>
+/// Roslyn-related RazorSharp configuration.
+/// </summary>
+public class RoslynOptions
+{
+    /// <summary>
+    /// Timeout in milliseconds for Roslyn requests.
+    /// </summary>
+    [JsonPropertyName("requestTimeoutMs")]
+    public int? RequestTimeoutMs { get; set; }
+}
+
+/// <summary>
+/// Workspace discovery configuration for RazorSharp.
+/// </summary>
+public class WorkspaceOptions
+{
+    /// <summary>
+    /// Additional directory names to exclude from workspace searches.
+    /// </summary>
+    [JsonPropertyName("excludeDirectories")]
+    public string[]? ExcludeDirectories { get; set; }
+
+    /// <summary>
+    /// Override the default excluded directory list. If set (even empty),
+    /// defaults are replaced with this list.
+    /// </summary>
+    [JsonPropertyName("excludeDirectoriesOverride")]
+    public string[]? ExcludeDirectoriesOverride { get; set; }
 }
 
 /// <summary>

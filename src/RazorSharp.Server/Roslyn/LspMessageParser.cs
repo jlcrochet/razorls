@@ -13,6 +13,7 @@ public class LspMessageParser : IDisposable
 {
     static readonly ArrayPool<byte> Pool = ArrayPool<byte>.Shared;
     const int MaxContentLength = 128 * 1024 * 1024;
+    const int MaxHeaderBytes = 32 * 1024;
 
     byte[] _buffer;
     int _length;
@@ -81,7 +82,15 @@ public class LspMessageParser : IDisposable
         {
             var span = _buffer.AsSpan(0, _length);
             var headerEnd = span.IndexOf(HeaderTerminator);
-            if (headerEnd < 0) return false;
+            if (headerEnd < 0)
+            {
+                if (_length > MaxHeaderBytes)
+                {
+                    // Drop oversized/invalid headers to avoid unbounded buffer growth.
+                    _length = 0;
+                }
+                return false;
+            }
 
             // Parse headers directly from bytes (LSP headers are ASCII)
             var headers = span.Slice(0, headerEnd);
@@ -127,16 +136,49 @@ public class LspMessageParser : IDisposable
         // so we wrap it in PooledJsonDocument which returns the buffer on dispose
         var jsonBytes = Pool.Rent(_contentLength);
         Buffer.BlockCopy(_buffer, 0, jsonBytes, 0, _contentLength);
-        var doc = JsonDocument.Parse(jsonBytes.AsMemory(0, _contentLength));
-        message = new PooledJsonDocument(doc, jsonBytes);
+        try
+        {
+            var doc = JsonDocument.Parse(jsonBytes.AsMemory(0, _contentLength));
+            message = new PooledJsonDocument(doc, jsonBytes);
+        }
+        catch (JsonException)
+        {
+            Pool.Return(jsonBytes);
+
+            // Drop the invalid payload and reset state so parsing can continue
+            var restLength = _length - _contentLength;
+            if (restLength > 0)
+            {
+                Buffer.BlockCopy(_buffer, _contentLength, _buffer, 0, restLength);
+            }
+            _length = restLength;
+            _contentLength = -1;
+
+            return false;
+        }
+        catch
+        {
+            Pool.Return(jsonBytes);
+
+            // Drop the invalid payload and reset state so parsing can continue
+            var restLength = _length - _contentLength;
+            if (restLength > 0)
+            {
+                Buffer.BlockCopy(_buffer, _contentLength, _buffer, 0, restLength);
+            }
+            _length = restLength;
+            _contentLength = -1;
+
+            throw;
+        }
 
         // Remove processed content from buffer
-        var restLength = _length - _contentLength;
-        if (restLength > 0)
+        var contentRemainingLength = _length - _contentLength;
+        if (contentRemainingLength > 0)
         {
-            Buffer.BlockCopy(_buffer, _contentLength, _buffer, 0, restLength);
+            Buffer.BlockCopy(_buffer, _contentLength, _buffer, 0, contentRemainingLength);
         }
-        _length = restLength;
+        _length = contentRemainingLength;
         _contentLength = -1;
 
         return true;

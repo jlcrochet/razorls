@@ -579,6 +579,8 @@ public class RoslynClient : IAsyncDisposable
         }
 
         _readCts?.Cancel();
+        _readCts?.Dispose();
+        _readCts = null;
         _processCts?.Cancel();
         _processCts?.Dispose();
         _processCts = null;

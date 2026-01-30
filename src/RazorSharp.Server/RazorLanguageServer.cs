@@ -38,12 +38,12 @@ public class RazorLanguageServer : IAsyncDisposable
     bool _disposed;
     readonly TaskCompletionSource _roslynProjectInitialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
     DateTime _workspaceOpenedAt;
-    readonly HashSet<string> _openDocuments = new(StringComparer.OrdinalIgnoreCase);
-    readonly Dictionary<string, JsonElement> _pendingOpens = new(StringComparer.OrdinalIgnoreCase);
-    readonly Dictionary<string, List<JsonElement>> _pendingChanges = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _openDocuments = new(UriComparer);
+    readonly Dictionary<string, PendingOpenState> _pendingOpens = new(UriComparer);
+    readonly Dictionary<string, List<JsonElement>> _pendingChanges = new(UriComparer);
     readonly Lock _documentTrackingLock = new();
-    readonly Dictionary<string, string> _sourceGeneratedUriCache = new(StringComparer.OrdinalIgnoreCase);
-    readonly Dictionary<string, SourceGeneratedEntry> _sourceGeneratedIndex = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, string> _sourceGeneratedUriCache = new(UriComparer);
+    readonly Dictionary<string, List<SourceGeneratedEntry>> _sourceGeneratedIndex = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock _sourceGeneratedCacheLock = new();
     DateTime _sourceGeneratedIndexLastScan;
     bool _sourceGeneratedIndexBuilt;
@@ -51,12 +51,16 @@ public class RazorLanguageServer : IAsyncDisposable
     WorkDoneProgressScope? _workspaceInitProgress;
     long _workDoneProgressCounter;
     Func<string, JsonElement, CancellationToken, Task<JsonElement?>>? _forwardToRoslynOverride;
+    Func<string, object?, Task>? _forwardToRoslynNotificationOverride;
     readonly Channel<NotificationWorkItem> _notificationChannel;
     readonly CancellationTokenSource _notificationCts;
     readonly Task _notificationTask;
     const int DiagnosticsProgressDelayMs = 250;
     const int WorkDoneProgressCreateTimeoutMs = 2000;
     const int MaxFastStartDelayMs = 60000;
+    const int MaxPendingChangesPerDocument = 200;
+    static readonly TimeSpan DefaultRoslynRequestTimeout = TimeSpan.FromSeconds(10);
+    TimeSpan _roslynRequestTimeout = DefaultRoslynRequestTimeout;
     static readonly TimeSpan SourceGeneratedIndexRefreshInterval = TimeSpan.FromSeconds(60);
 
     static readonly JsonSerializerOptions JsonOptions = new()
@@ -64,6 +68,14 @@ public class RazorLanguageServer : IAsyncDisposable
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true
     };
+
+    static readonly bool IsCaseInsensitiveFileSystem = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
+    static readonly StringComparer UriComparer = IsCaseInsensitiveFileSystem
+        ? StringComparer.OrdinalIgnoreCase
+        : StringComparer.Ordinal;
+    static readonly StringComparison UriComparison = IsCaseInsensitiveFileSystem
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
 
     static readonly string Version = Assembly.GetExecutingAssembly()
         .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
@@ -88,12 +100,6 @@ public class RazorLanguageServer : IAsyncDisposable
     {
         kind = "full",
         resultId = "none",
-        items = Array.Empty<object>()
-    });
-    static readonly JsonElement DiagnosticResponsePending = JsonSerializer.SerializeToElement(new
-    {
-        kind = "full",
-        resultId = "pending",
         items = Array.Empty<object>()
     });
     static readonly JsonElement SuccessResponse = JsonSerializer.SerializeToElement(new { success = true });
@@ -137,6 +143,7 @@ public class RazorLanguageServer : IAsyncDisposable
     static readonly string[] InlayHintResolveProperties = ["tooltip", "textEdits", "label.tooltip", "label.location", "label.command"];
 
     readonly record struct NotificationWorkItem(string Method, JsonElement? Params);
+    readonly record struct PendingOpenState(string Uri, string LanguageId, int Version, string Text);
     readonly record struct SourceGeneratedEntry(string Path, bool IsDebug, DateTime LastWriteUtc);
 
     public RazorLanguageServer(ILoggerFactory loggerFactory, DependencyManager dependencyManager)
@@ -164,11 +171,17 @@ public class RazorLanguageServer : IAsyncDisposable
 
     private bool FastStartEnabled => _initOptions?.FastStart != false;
     private bool SupportsWorkDoneProgress => _initParams?.Capabilities?.Window?.WorkDoneProgress == true;
+    private bool CanSendRoslynNotifications =>
+        _forwardToRoslynNotificationOverride != null || _roslynClient?.IsRunning == true;
 
     internal void SetProgressRpcForTests(IProgressRpc progressRpc) => _progressRpc = progressRpc;
     internal void SetInitializeParamsForTests(InitializeParams? initParams) => _initParams = initParams;
     internal void SetForwardToRoslynOverrideForTests(Func<string, JsonElement, CancellationToken, Task<JsonElement?>>? overrideFunc)
         => _forwardToRoslynOverride = overrideFunc;
+    internal void SetForwardToRoslynNotificationOverrideForTests(Func<string, object?, Task>? overrideFunc)
+        => _forwardToRoslynNotificationOverride = overrideFunc;
+    internal void SetRoslynRequestTimeoutForTests(TimeSpan timeout)
+        => _roslynRequestTimeout = timeout;
     internal Task HandleRoslynNotificationForTests(string method, JsonElement? @params, CancellationToken ct)
         => HandleRoslynNotificationAsync(new NotificationWorkItem(method, @params), ct);
     internal void HandleRoslynProcessExitedForTests(int exitCode)
@@ -200,6 +213,28 @@ public class RazorLanguageServer : IAsyncDisposable
     public void SetLogLevel(LogLevel level)
     {
         _logLevel = level.ToString();
+    }
+
+    private void ApplyRoslynTimeout(RoslynOptions? options)
+    {
+        if (options?.RequestTimeoutMs == null)
+        {
+            return;
+        }
+
+        var timeoutMs = options.RequestTimeoutMs.Value;
+        if (timeoutMs <= 0)
+        {
+            _roslynRequestTimeout = Timeout.InfiniteTimeSpan;
+            return;
+        }
+
+        if (timeoutMs < 100)
+        {
+            timeoutMs = 100;
+        }
+
+        _roslynRequestTimeout = TimeSpan.FromMilliseconds(timeoutMs);
     }
 
     /// <summary>
@@ -292,6 +327,10 @@ public class RazorLanguageServer : IAsyncDisposable
                 initOptions = JsonSerializer.Deserialize<InitializationOptions>(
                     @params.InitializationOptions.Value.GetRawText(), strictOptions);
                 _initOptions = initOptions;
+                _workspaceManager.ConfigureExcludedDirectories(
+                    initOptions?.Workspace?.ExcludeDirectoriesOverride,
+                    initOptions?.Workspace?.ExcludeDirectories);
+                ApplyRoslynTimeout(initOptions?.Roslyn);
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
                     var triggerChars = initOptions?.Capabilities?.CompletionProvider?.TriggerCharacters;
@@ -365,7 +404,7 @@ public class RazorLanguageServer : IAsyncDisposable
             {
                 if (_roslynClient != null)
                 {
-                    await _roslynClient.SendNotificationAsync(LspMethods.Initialized, (object?)null);
+                    await SendRoslynNotificationAsync(LspMethods.Initialized, null);
                     _logger.LogDebug("Roslyn received initialized notification");
 
                     // Open solution or projects FIRST - before documents
@@ -456,28 +495,22 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             languageId = LanguageIdCSharp;
         }
+        var openState = new PendingOpenState(
+            uri,
+            languageId,
+            @params.TextDocument.Version,
+            @params.TextDocument.Text ?? string.Empty);
 
-        var roslynParams = new
+        if (!CanSendRoslynNotifications)
         {
-            textDocument = new
+            if (_roslynClient == null)
             {
-                uri,
-                languageId,
-                version = @params.TextDocument.Version,
-                text = @params.TextDocument.Text
+                _logger.LogWarning("Roslyn client is null, cannot forward didOpen");
             }
-        };
-        var roslynParamsJson = JsonSerializer.SerializeToElement(roslynParams, JsonOptions);
-
-        if (_roslynClient == null)
-        {
-            _logger.LogWarning("Roslyn client is null, cannot forward didOpen");
-            return;
-        }
-
-        if (!_roslynClient.IsRunning)
-        {
-            _logger.LogWarning("Roslyn process is not running, cannot forward didOpen for {Uri}", uri);
+            else
+            {
+                _logger.LogWarning("Roslyn process is not running, cannot forward didOpen for {Uri}", uri);
+            }
             return;
         }
 
@@ -486,7 +519,7 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             lock (_documentTrackingLock)
             {
-                _pendingOpens[uri] = roslynParamsJson;
+                _pendingOpens[uri] = openState;
             }
             _logger.LogDebug("Buffering didOpen for {Uri} until project initialization completes", uri);
             return;
@@ -499,7 +532,7 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         _logger.LogDebug("Forwarding didOpen to Roslyn for {Uri}", uri);
-        await SendDidOpenAndReplayAsync(uri, roslynParamsJson);
+        await SendDidOpenAndReplayAsync(openState);
     }
 
     private static bool IsRazorUri(string uri)
@@ -512,12 +545,149 @@ public class RazorLanguageServer : IAsyncDisposable
         return uri.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
     }
 
+    private bool TryUpdatePendingOpenText(PendingOpenState pendingOpen, JsonElement paramsJson, out PendingOpenState updated)
+    {
+        updated = pendingOpen;
+        if (!paramsJson.TryGetProperty("contentChanges", out var contentChanges) ||
+            contentChanges.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        if (!TryApplyContentChanges(pendingOpen.Text, contentChanges, out var newText))
+        {
+            return false;
+        }
+
+        var version = pendingOpen.Version;
+        if (paramsJson.TryGetProperty("textDocument", out var td) &&
+            td.TryGetProperty("version", out var v) &&
+            v.TryGetInt32(out var parsedVersion))
+        {
+            version = parsedVersion;
+        }
+
+        updated = pendingOpen with { Text = newText, Version = version };
+        return true;
+    }
+
+    private static bool TryApplyContentChanges(string originalText, JsonElement changes, out string updatedText)
+    {
+        updatedText = originalText;
+
+        foreach (var change in changes.EnumerateArray())
+        {
+            if (!change.TryGetProperty("text", out var textProp))
+            {
+                return false;
+            }
+
+            var newText = textProp.GetString() ?? string.Empty;
+
+            if (!change.TryGetProperty("range", out var rangeProp) || rangeProp.ValueKind == JsonValueKind.Null)
+            {
+                updatedText = newText;
+                continue;
+            }
+
+            if (!TryGetRange(rangeProp, out var startLine, out var startCharacter, out var endLine, out var endCharacter))
+            {
+                return false;
+            }
+
+            if (!TryGetOffset(updatedText, startLine, startCharacter, out var startOffset) ||
+                !TryGetOffset(updatedText, endLine, endCharacter, out var endOffset))
+            {
+                return false;
+            }
+
+            if (startOffset > endOffset || startOffset < 0 || endOffset > updatedText.Length)
+            {
+                return false;
+            }
+
+            updatedText = updatedText[..startOffset] + newText + updatedText[endOffset..];
+        }
+
+        return true;
+    }
+
+    private static bool TryGetRange(JsonElement range, out int startLine, out int startCharacter, out int endLine, out int endCharacter)
+    {
+        startLine = startCharacter = endLine = endCharacter = 0;
+
+        if (!range.TryGetProperty("start", out var start) ||
+            !range.TryGetProperty("end", out var end))
+        {
+            return false;
+        }
+
+        return TryGetPosition(start, out startLine, out startCharacter)
+            && TryGetPosition(end, out endLine, out endCharacter);
+    }
+
+    private static bool TryGetPosition(JsonElement position, out int line, out int character)
+    {
+        line = character = 0;
+        if (!position.TryGetProperty("line", out var lineProp) ||
+            !position.TryGetProperty("character", out var charProp))
+        {
+            return false;
+        }
+
+        return lineProp.TryGetInt32(out line) && charProp.TryGetInt32(out character);
+    }
+
+    private static bool TryGetOffset(string text, int line, int character, out int offset)
+    {
+        offset = 0;
+
+        if (line < 0 || character < 0)
+        {
+            return false;
+        }
+
+        var lineStart = 0;
+        var currentLine = 0;
+        while (currentLine < line)
+        {
+            var nextLine = text.IndexOf('\n', lineStart);
+            if (nextLine < 0)
+            {
+                return false;
+            }
+
+            lineStart = nextLine + 1;
+            currentLine++;
+        }
+
+        var lineEnd = text.IndexOf('\n', lineStart);
+        if (lineEnd < 0)
+        {
+            lineEnd = text.Length;
+        }
+
+        if (lineEnd > lineStart && text[lineEnd - 1] == '\r')
+        {
+            lineEnd--;
+        }
+
+        var lineLength = lineEnd - lineStart;
+        if (character > lineLength)
+        {
+            return false;
+        }
+
+        offset = lineStart + character;
+        return true;
+    }
+
     [JsonRpcMethod(LspMethods.TextDocumentDidChange, UseSingleObjectParameterDeserialization = true)]
     public async Task HandleDidChangeAsync(JsonElement paramsJson)
     {
         // Only forward didChange if we've already forwarded didOpen for this document
         // Roslyn crashes if it receives didChange for a document it doesn't know about
-        if (_roslynClient != null && _roslynClient.IsRunning)
+        if (CanSendRoslynNotifications)
         {
             var uri = paramsJson.TryGetProperty("textDocument", out var td) && td.TryGetProperty("uri", out var u)
                 ? u.GetString() : null;
@@ -532,20 +702,40 @@ public class RazorLanguageServer : IAsyncDisposable
                     isOpen = _openDocuments.Contains(uri);
                     if (!isOpen)
                     {
-                        // Buffer the change to replay after didOpen is forwarded
-                        _logger.LogDebug("Buffering didChange for {Uri} - document not yet open in Roslyn", uri);
-                        if (!_pendingChanges.TryGetValue(uri, out var changes))
+                        if (_pendingOpens.TryGetValue(uri, out var pendingOpen) &&
+                            TryUpdatePendingOpenText(pendingOpen, paramsJson, out var updatedOpen))
                         {
-                            changes = new List<JsonElement>();
-                            _pendingChanges[uri] = changes;
+                            _pendingOpens[uri] = updatedOpen;
+                            _pendingChanges.Remove(uri);
+                            _logger.LogDebug("Coalesced didChange into pending didOpen for {Uri}", uri);
                         }
-                        changes.Add(paramsJson.Clone());
+                        else
+                        {
+                            // Buffer the change to replay after didOpen is forwarded
+                            _logger.LogDebug("Buffering didChange for {Uri} - document not yet open in Roslyn", uri);
+                            if (!_pendingChanges.TryGetValue(uri, out var changes))
+                            {
+                                changes = new List<JsonElement>();
+                                _pendingChanges[uri] = changes;
+                            }
+                            changes.Add(paramsJson.Clone());
+
+                            if (changes.Count > MaxPendingChangesPerDocument)
+                            {
+                                _logger.LogWarning(
+                                    "Too many buffered changes for {Uri}; keeping latest change only.",
+                                    uri);
+                                var latest = changes[^1];
+                                changes.Clear();
+                                changes.Add(latest);
+                            }
+                        }
                     }
                 }
 
                 if (isOpen)
                 {
-                    await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidChange, paramsJson);
+                    await SendRoslynNotificationAsync(LspMethods.TextDocumentDidChange, paramsJson);
                 }
             }
         }
@@ -570,9 +760,9 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         // Forward to Roslyn
-        if (_roslynClient != null && _roslynClient.IsRunning)
+        if (CanSendRoslynNotifications)
         {
-            await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidClose, paramsJson);
+            await SendRoslynNotificationAsync(LspMethods.TextDocumentDidClose, paramsJson);
         }
     }
 
@@ -580,9 +770,9 @@ public class RazorLanguageServer : IAsyncDisposable
     public async Task HandleDidSaveAsync(JsonElement paramsJson)
     {
         // Forward to Roslyn
-        if (_roslynClient != null && _roslynClient.IsRunning)
+        if (CanSendRoslynNotifications)
         {
-            await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidSave, paramsJson);
+            await SendRoslynNotificationAsync(LspMethods.TextDocumentDidSave, paramsJson);
         }
     }
 
@@ -1061,6 +1251,12 @@ public class RazorLanguageServer : IAsyncDisposable
             return DiagnosticResponseDisabled;
         }
 
+        if (!_roslynProjectInitialized.Task.IsCompletedSuccessfully)
+        {
+            _logger.LogDebug("Diagnostics requested before project initialization completes; returning empty report.");
+            return DiagnosticResponseNone;
+        }
+
         WorkDoneProgressScope? progress = null;
         try
         {
@@ -1184,7 +1380,7 @@ public class RazorLanguageServer : IAsyncDisposable
             // Return empty report if forwarding failed (e.g., project not initialized)
             if (!forwardedResult.HasValue)
             {
-                return DiagnosticResponsePending;
+                return DiagnosticResponseNone;
             }
 
             return forwardedResult;
@@ -1250,6 +1446,11 @@ public class RazorLanguageServer : IAsyncDisposable
                     break;
 
                 case LspMethods.TextDocumentPublishDiagnostics:
+                    if (!_roslynProjectInitialized.Task.IsCompletedSuccessfully)
+                    {
+                        _logger.LogDebug("Skipping diagnostics publish before project initialization completes");
+                        break;
+                    }
                     // Forward diagnostics to client
                     if (item.Params.HasValue)
                     {
@@ -1612,6 +1813,26 @@ public class RazorLanguageServer : IAsyncDisposable
         }
     }
 
+    private Task SendRoslynNotificationAsync(string method, object? parameters)
+    {
+        if (_forwardToRoslynNotificationOverride != null)
+        {
+            return _forwardToRoslynNotificationOverride(method, parameters);
+        }
+
+        if (_roslynClient == null || !_roslynClient.IsRunning)
+        {
+            return Task.CompletedTask;
+        }
+
+        if (parameters is JsonElement json)
+        {
+            return _roslynClient.SendNotificationAsync(method, json);
+        }
+
+        return _roslynClient.SendNotificationAsync(method, parameters);
+    }
+
     private async Task EndWorkspaceInitializationProgressAsync()
     {
         var progress = Interlocked.Exchange(ref _workspaceInitProgress, null);
@@ -1758,9 +1979,16 @@ public class RazorLanguageServer : IAsyncDisposable
         try
         {
             _logger.LogDebug("Forwarding {Method} to Roslyn", method);
-            var result = await _roslynClient.SendRequestAsync(method, @params, ct);
+            using var timeoutCts = new CancellationTokenSource(_roslynRequestTimeout);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+            var result = await _roslynClient.SendRequestAsync(method, @params, linkedCts.Token);
             _logger.LogDebug("Received response from Roslyn for {Method}", method);
             return result;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("Roslyn request timed out or was canceled for {Method}", method);
+            return null;
         }
         catch (IOException ex)
         {
@@ -1809,44 +2037,55 @@ public class RazorLanguageServer : IAsyncDisposable
         }
     }
 
-    private async Task SendDidOpenAndReplayAsync(string uri, JsonElement openParams)
+    private async Task SendDidOpenAndReplayAsync(PendingOpenState openState)
     {
-        if (_roslynClient == null || !_roslynClient.IsRunning)
+        if (!CanSendRoslynNotifications)
         {
             return;
         }
 
-        await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidOpen, openParams);
+        var roslynParams = new
+        {
+            textDocument = new
+            {
+                uri = openState.Uri,
+                languageId = openState.LanguageId,
+                version = openState.Version,
+                text = openState.Text
+            }
+        };
+        var roslynParamsJson = JsonSerializer.SerializeToElement(roslynParams, JsonOptions);
+        await SendRoslynNotificationAsync(LspMethods.TextDocumentDidOpen, roslynParamsJson);
 
         List<JsonElement>? pendingChanges = null;
         lock (_documentTrackingLock)
         {
-            _openDocuments.Add(uri);
-            _pendingOpens.Remove(uri);
-            if (_pendingChanges.TryGetValue(uri, out pendingChanges))
+            _openDocuments.Add(openState.Uri);
+            _pendingOpens.Remove(openState.Uri);
+            if (_pendingChanges.TryGetValue(openState.Uri, out pendingChanges))
             {
-                _pendingChanges.Remove(uri);
+                _pendingChanges.Remove(openState.Uri);
             }
         }
 
         if (pendingChanges != null && pendingChanges.Count > 0)
         {
-            _logger.LogDebug("Replaying {Count} buffered changes for {Uri}", pendingChanges.Count, uri);
+            _logger.LogDebug("Replaying {Count} buffered changes for {Uri}", pendingChanges.Count, openState.Uri);
             foreach (var change in pendingChanges)
             {
-                await _roslynClient.SendNotificationAsync(LspMethods.TextDocumentDidChange, change);
+                await SendRoslynNotificationAsync(LspMethods.TextDocumentDidChange, change);
             }
         }
     }
 
     private async Task FlushPendingOpensAsync()
     {
-        if (_roslynClient == null || !_roslynClient.IsRunning)
+        if (!CanSendRoslynNotifications)
         {
             return;
         }
 
-        List<(string Uri, JsonElement OpenParams)> pending;
+        List<PendingOpenState> pending;
         lock (_documentTrackingLock)
         {
             if (_pendingOpens.Count == 0)
@@ -1854,31 +2093,31 @@ public class RazorLanguageServer : IAsyncDisposable
                 return;
             }
 
-            pending = new List<(string, JsonElement)>(_pendingOpens.Count);
+            pending = new List<PendingOpenState>(_pendingOpens.Count);
             foreach (var kvp in _pendingOpens)
             {
-                pending.Add((kvp.Key, kvp.Value));
+                pending.Add(kvp.Value);
             }
             _pendingOpens.Clear();
         }
 
-        foreach (var (uri, openParams) in pending)
+        foreach (var openState in pending)
         {
             try
             {
-                _logger.LogDebug("Flushing pending didOpen for {Uri}", uri);
-                await SendDidOpenAndReplayAsync(uri, openParams);
+                _logger.LogDebug("Flushing pending didOpen for {Uri}", openState.Uri);
+                await SendDidOpenAndReplayAsync(openState);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to flush pending didOpen for {Uri}", uri);
+                _logger.LogWarning(ex, "Failed to flush pending didOpen for {Uri}", openState.Uri);
             }
         }
     }
 
     private async Task OpenWorkspaceAsync(string rootUriOrPath)
     {
-        if (_roslynClient == null)
+        if (!CanSendRoslynNotifications)
         {
             return;
         }
@@ -1897,7 +2136,7 @@ public class RazorLanguageServer : IAsyncDisposable
             if (extension.Equals(".sln", StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogInformation("Opening solution: {Solution}", rootPath);
-                await _roslynClient.SendNotificationAsync(LspMethods.SolutionOpen, new SolutionOpenParams
+                await SendRoslynNotificationAsync(LspMethods.SolutionOpen, new SolutionOpenParams
                 {
                     Solution = new Uri(rootPath).AbsoluteUri
                 });
@@ -1905,7 +2144,7 @@ public class RazorLanguageServer : IAsyncDisposable
             else if (extension.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogInformation("Opening project: {Project}", rootPath);
-                await _roslynClient.SendNotificationAsync(LspMethods.ProjectOpen, new ProjectOpenParams
+                await SendRoslynNotificationAsync(LspMethods.ProjectOpen, new ProjectOpenParams
                 {
                     Projects = [new Uri(rootPath).AbsoluteUri]
                 });
@@ -1928,7 +2167,7 @@ public class RazorLanguageServer : IAsyncDisposable
         if (solution != null)
         {
             _logger.LogInformation("Opening solution: {Solution}", solution);
-            await _roslynClient.SendNotificationAsync(LspMethods.SolutionOpen, new SolutionOpenParams
+            await SendRoslynNotificationAsync(LspMethods.SolutionOpen, new SolutionOpenParams
             {
                 Solution = new Uri(solution).AbsoluteUri
             });
@@ -1940,7 +2179,7 @@ public class RazorLanguageServer : IAsyncDisposable
             if (projects.Length > 0)
             {
                 _logger.LogInformation("Opening {Count} projects directly", projects.Length);
-                await _roslynClient.SendNotificationAsync(LspMethods.ProjectOpen, new ProjectOpenParams
+                await SendRoslynNotificationAsync(LspMethods.ProjectOpen, new ProjectOpenParams
                 {
                     Projects = projects.Select(p => new Uri(p).AbsoluteUri).ToArray()
                 });
@@ -2453,6 +2692,7 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             var parsed = new Uri(uri);
             var query = System.Web.HttpUtility.ParseQueryString(parsed.Query);
+            var projectId = GetSourceGeneratedProjectId(parsed);
 
             var assemblyName = query["assemblyName"];
             var typeName = query["typeName"];
@@ -2465,7 +2705,7 @@ public class RazorLanguageServer : IAsyncDisposable
             }
 
             var key = MakeSourceGeneratedKey(assemblyName, typeName, hintName);
-            if (TryGetSourceGeneratedPath(key, out var found))
+            if (TryGetSourceGeneratedPath(key, projectId, out var found))
             {
                 filePath = found;
                 lock (_sourceGeneratedCacheLock)
@@ -2489,27 +2729,44 @@ public class RazorLanguageServer : IAsyncDisposable
     private static string MakeSourceGeneratedKey(string assemblyName, string typeName, string hintName)
         => string.Concat(assemblyName, "\0", typeName, "\0", hintName);
 
-    private bool TryGetSourceGeneratedPath(string key, out string filePath)
+    private static string? GetSourceGeneratedProjectId(Uri uri)
+    {
+        if (!string.IsNullOrEmpty(uri.Host))
+        {
+            return uri.Host;
+        }
+
+        var path = uri.AbsolutePath.Trim('/');
+        if (string.IsNullOrEmpty(path))
+        {
+            return null;
+        }
+
+        var slash = path.IndexOf('/');
+        return slash >= 0 ? path[..slash] : path;
+    }
+
+    private bool TryGetSourceGeneratedPath(string key, string? projectId, out string filePath)
     {
         filePath = "";
         var now = DateTime.UtcNow;
-        SourceGeneratedEntry entry;
         var shouldRefresh = false;
+        List<SourceGeneratedEntry>? entries = null;
 
         lock (_sourceGeneratedCacheLock)
         {
             shouldRefresh = !_sourceGeneratedIndexBuilt ||
                             (now - _sourceGeneratedIndexLastScan) > SourceGeneratedIndexRefreshInterval;
 
-            if (_sourceGeneratedIndex.TryGetValue(key, out entry))
+            if (_sourceGeneratedIndex.TryGetValue(key, out entries))
             {
-                if (File.Exists(entry.Path) && !shouldRefresh)
+                if (!shouldRefresh && TrySelectSourceGeneratedEntry(key, entries, projectId, out var selected))
                 {
-                    filePath = entry.Path;
+                    filePath = selected.Path;
                     return true;
                 }
 
-                if (!File.Exists(entry.Path))
+                if (!AnyEntryExists(entries))
                 {
                     _sourceGeneratedIndex.Remove(key);
                     shouldRefresh = true;
@@ -2522,11 +2779,121 @@ public class RazorLanguageServer : IAsyncDisposable
             RefreshSourceGeneratedIndex();
             lock (_sourceGeneratedCacheLock)
             {
-                if (_sourceGeneratedIndex.TryGetValue(key, out entry) && File.Exists(entry.Path))
+                if (_sourceGeneratedIndex.TryGetValue(key, out entries) &&
+                    TrySelectSourceGeneratedEntry(key, entries, projectId, out var selected))
                 {
-                    filePath = entry.Path;
+                    filePath = selected.Path;
                     return true;
                 }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TrySelectSourceGeneratedEntry(
+        string key,
+        List<SourceGeneratedEntry> entries,
+        string? projectId,
+        out SourceGeneratedEntry selected)
+    {
+        selected = default;
+
+        var hasExisting = false;
+        var existingCount = 0;
+        SourceGeneratedEntry bestAny = default;
+
+        var hasMatch = false;
+        SourceGeneratedEntry bestMatch = default;
+        var matchCount = 0;
+
+        foreach (var entry in entries)
+        {
+            if (!File.Exists(entry.Path))
+            {
+                continue;
+            }
+
+            existingCount++;
+            if (!hasExisting || IsBetterSourceGeneratedEntry(entry, bestAny))
+            {
+                bestAny = entry;
+                hasExisting = true;
+            }
+
+            if (!string.IsNullOrEmpty(projectId) && entry.Path.Contains(projectId, UriComparison))
+            {
+                matchCount++;
+                if (!hasMatch || IsBetterSourceGeneratedEntry(entry, bestMatch))
+                {
+                    bestMatch = entry;
+                    hasMatch = true;
+                }
+            }
+        }
+
+        if (!hasExisting)
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrEmpty(projectId))
+        {
+            if (hasMatch && matchCount == 1)
+            {
+                selected = bestMatch;
+                return true;
+            }
+
+            if (existingCount == 1)
+            {
+                selected = bestAny;
+                return true;
+            }
+
+            if (matchCount > 1)
+            {
+                _logger.LogDebug(
+                    "Multiple source-generated candidates found for key {Key} and projectId {ProjectId}; skipping mapping.",
+                    key,
+                    projectId);
+                return false;
+            }
+
+            if (existingCount > 1)
+            {
+                _logger.LogDebug(
+                    "No source-generated candidates matched projectId {ProjectId} for key {Key}; skipping mapping.",
+                    projectId,
+                    key);
+            }
+
+            return false;
+        }
+
+        if (existingCount == 1)
+        {
+            selected = bestAny;
+            return true;
+        }
+
+        if (existingCount > 1)
+        {
+            _logger.LogDebug(
+                "Multiple source-generated candidates found for key {Key} without project id; skipping mapping.",
+                key);
+        }
+
+        return false;
+    }
+
+    private static bool AnyEntryExists(List<SourceGeneratedEntry> entries)
+    {
+        foreach (var entry in entries)
+        {
+            if (File.Exists(entry.Path))
+            {
+                return true;
             }
         }
 
@@ -2547,7 +2914,7 @@ public class RazorLanguageServer : IAsyncDisposable
 
         try
         {
-            var newIndex = new Dictionary<string, SourceGeneratedEntry>(StringComparer.OrdinalIgnoreCase);
+            var newIndex = new Dictionary<string, List<SourceGeneratedEntry>>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var objDir in Directory.EnumerateDirectories(_workspaceRoot, "obj", SearchOption.AllDirectories))
             {
@@ -2627,7 +2994,7 @@ public class RazorLanguageServer : IAsyncDisposable
     }
 
     private static void AddOrUpdateSourceGeneratedEntry(
-        Dictionary<string, SourceGeneratedEntry> index,
+        Dictionary<string, List<SourceGeneratedEntry>> index,
         string key,
         string path,
         bool isDebug)
@@ -2643,16 +3010,25 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         var candidate = new SourceGeneratedEntry(path, isDebug, lastWriteUtc);
-        if (index.TryGetValue(key, out var existing))
+        if (index.TryGetValue(key, out var entries))
         {
-            if (IsBetterSourceGeneratedEntry(candidate, existing))
+            for (var i = 0; i < entries.Count; i++)
             {
-                index[key] = candidate;
+                if (entries[i].Path.Equals(path, UriComparison))
+                {
+                    if (IsBetterSourceGeneratedEntry(candidate, entries[i]))
+                    {
+                        entries[i] = candidate;
+                    }
+                    return;
+                }
             }
+
+            entries.Add(candidate);
             return;
         }
 
-        index[key] = candidate;
+        index[key] = new List<SourceGeneratedEntry> { candidate };
     }
 
     private static bool IsBetterSourceGeneratedEntry(SourceGeneratedEntry candidate, SourceGeneratedEntry existing)

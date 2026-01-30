@@ -2,6 +2,8 @@
 
 A standalone, IDE-agnostic Language Server Protocol (LSP) server for C# and Razor files. Provides language features like completions, hover, go-to-definition, and more for C#, Razor, and Blazor development in any LSP-compatible editor.
 
+RazorSharp is intended to be a **drop-in replacement for OmniSharp** for C# while also supporting `.razor` and `.cshtml` files. It honors OmniSharp configuration conventions for Roslyn settings and adds RazorSharp-specific configuration only where needed.
+
 I made this because I didn't want to wait for Microsoft to release an official solution and because [seblyng/roslyn.nvim](https://github.com/seblyng/roslyn.nvim) only works with Neovim. This project is heavily inspired by seblyng/roslyn.nvim.
 
 By the way, if you're looking for a Tree-sitter parser for Razor files, check out [mine](https://github.com/jlcrochet/tree-sitter-razor).
@@ -59,7 +61,7 @@ This only needs to be done once. Dependencies are cached in `~/.cache/razorsharp
 |--------|-------------|
 | `-s, --source <path>` | Solution or directory path |
 | `-l, --loglevel <level>` | Log level: Trace, Debug, Information, Warning, Error |
-| `-v, --verbose` | Set log level to Debug |
+| `-v, --verbose` | Set log level to Trace |
 | `--logFile <path>` | Write logs to file instead of stderr |
 | `-hpid, --hostPID <pid>` | Shutdown when host process exits |
 | `--download-dependencies` | Download dependencies and exit (does not start server) |
@@ -68,6 +70,14 @@ This only needs to be done once. Dependencies are cached in `~/.cache/razorsharp
 | `--version` | Show version |
 
 The server communicates via LSP over stdin/stdout.
+
+## Compatibility
+
+RazorSharp aims to be a drop-in replacement for OmniSharp for C# workflows while adding Razor support:
+
+- **Configuration:** Uses `omnisharp.json` in the same locations and precedence as OmniSharp for Roslyn settings.
+- **Behavior:** Proxies Roslyn Language Server features to provide C# language services compatible with common OmniSharp clients.
+- **Extensions:** Adds Razor/HTML support and other RazorSharp-specific behavior via LSP `initializationOptions`.
 
 ## Editor Integration
 
@@ -123,7 +133,16 @@ Configure your editor's LSP client to:
 
 ## Configuration
 
-RazorSharp reads configuration from `omnisharp.json` files, compatible with OmniSharp:
+RazorSharp uses **two configuration channels** to stay compatible with OmniSharp while exposing RazorSharp-specific options:
+
+- **`omnisharp.json` (Roslyn/OmniSharp settings only)** — forwarded to Roslyn and treated the same way OmniSharp does.
+- **LSP `initializationOptions` (RazorSharp settings)** — used only for RazorSharp-specific behavior (HTML LS, workspace discovery, capability toggles, etc.).
+
+See [Compatibility](#compatibility) for the OmniSharp-aligned behavior RazorSharp targets.
+
+### OmniSharp (Roslyn) configuration
+
+RazorSharp reads Roslyn configuration from `omnisharp.json` files, compatible with OmniSharp:
 
 **Locations (in order of precedence):**
 1. `~/.omnisharp/omnisharp.json` (global)
@@ -209,7 +228,7 @@ Disabling the HTML language server will break formatting in Razor files.
 
 ### LSP Initialization Options
 
-RazorSharp supports configuration via LSP `initializationOptions`. In Helix, this is the `config` key in `languages.toml`. These options allow you to enable/disable specific LSP capabilities and customize trigger characters.
+RazorSharp supports configuration via LSP `initializationOptions`. In Helix, this is the `config` key in `languages.toml`. These options allow you to enable/disable specific LSP capabilities and configure RazorSharp-specific behavior.
 
 #### Available Options
 
@@ -248,6 +267,9 @@ RazorSharp supports configuration via LSP `initializationOptions`. In Helix, thi
 | `capabilities.diagnosticProvider.semantic` | bool | `true` | Enable compiler semantic diagnostics (type errors, etc.) |
 | `capabilities.diagnosticProvider.analyzerSyntax` | bool | `false` | Enable Roslyn analyzer syntax diagnostics |
 | `capabilities.diagnosticProvider.analyzerSemantic` | bool | `false` | Enable Roslyn analyzer semantic diagnostics |
+| `workspace.excludeDirectories` | string[] | `[]` | Additional directory names or glob patterns to skip during workspace search (supports `*` and `**`) |
+| `workspace.excludeDirectoriesOverride` | string[] | `null` | Replace the default excluded directory list (names or glob patterns) |
+| `roslyn.requestTimeoutMs` | int | `10000` | Timeout for Roslyn requests (ms). Set `<= 0` to disable. |
 
 #### Example: Fast-start with a delay
 
@@ -346,6 +368,71 @@ lspconfig.razorsharp.setup({
 ```
 
 Note: Enabling analyzer diagnostics may impact performance on large codebases.
+
+#### Example: Customize workspace directory exclusions
+
+By default, RazorSharp skips `bin`, `obj`, `.git`, `.vs`, and `node_modules` during workspace search. You can extend or override that list (names or glob patterns):
+
+**Helix:**
+```toml
+[language-server.razorsharp]
+command = "dotnet"
+args = ["/path/to/razorsharp.dll"]
+config.workspace.excludeDirectories = ["dist", "out", "**/packages/**"]
+```
+
+**Neovim:**
+```lua
+lspconfig.razorsharp.setup({
+  init_options = {
+    workspace = {
+      excludeDirectories = { "dist", "out", "**/packages/**" }
+    }
+  }
+})
+```
+
+To override the defaults entirely:
+
+**Helix:**
+```toml
+[language-server.razorsharp]
+command = "dotnet"
+args = ["/path/to/razorsharp.dll"]
+config.workspace.excludeDirectoriesOverride = ["obj"]
+```
+
+**Neovim:**
+```lua
+lspconfig.razorsharp.setup({
+  init_options = {
+    workspace = {
+      excludeDirectoriesOverride = { "obj" }
+    }
+  }
+})
+```
+
+#### Example: Increase Roslyn request timeout
+
+**Helix:**
+```toml
+[language-server.razorsharp]
+command = "dotnet"
+args = ["/path/to/razorsharp.dll"]
+config.roslyn.requestTimeoutMs = 20000
+```
+
+**Neovim:**
+```lua
+lspconfig.razorsharp.setup({
+  init_options = {
+    roslyn = {
+      requestTimeoutMs = 20000
+    }
+  }
+})
+```
 
 ## Architecture
 
