@@ -78,6 +78,18 @@ public class InitializationOptions
     /// </summary>
     [JsonPropertyName("roslyn")]
     public RoslynOptions? Roslyn { get; set; }
+
+    /// <summary>
+    /// Logging options for RazorSharp.
+    /// </summary>
+    [JsonPropertyName("logging")]
+    public LoggingOptions? Logging { get; set; }
+
+    /// <summary>
+    /// Dependency handling options for RazorSharp.
+    /// </summary>
+    [JsonPropertyName("dependencies")]
+    public DependencyOptions? Dependencies { get; set; }
 }
 
 /// <summary>
@@ -90,6 +102,64 @@ public class RoslynOptions
     /// </summary>
     [JsonPropertyName("requestTimeoutMs")]
     public int? RequestTimeoutMs { get; set; }
+
+    /// <summary>
+    /// Enable background auto-update checks for RazorSharp dependencies.
+    /// Default: true
+    /// </summary>
+    [JsonPropertyName("autoUpdate")]
+    public bool? AutoUpdate { get; set; }
+
+    /// <summary>
+    /// Minimum hours between auto-update checks.
+    /// Default: 24
+    /// </summary>
+    [JsonPropertyName("autoUpdateIntervalHours")]
+    public int? AutoUpdateIntervalHours { get; set; }
+}
+
+/// <summary>
+/// Logging configuration for RazorSharp.
+/// </summary>
+public class LoggingOptions
+{
+    /// <summary>
+    /// Default log level (Trace, Debug, Information, Warning, Error).
+    /// CLI --loglevel overrides this value.
+    /// </summary>
+    [JsonPropertyName("level")]
+    public string? Level { get; set; }
+
+    /// <summary>
+    /// Log file path. CLI --logFile overrides this value.
+    /// </summary>
+    [JsonPropertyName("file")]
+    public string? File { get; set; }
+}
+
+/// <summary>
+/// Dependency configuration for RazorSharp.
+/// </summary>
+public class DependencyOptions
+{
+    /// <summary>
+    /// Skip dependency presence checks during initialization.
+    /// CLI --skip-dependency-check overrides this value.
+    /// </summary>
+    [JsonPropertyName("skipDependencyCheck")]
+    public bool? SkipDependencyCheck { get; set; }
+
+    /// <summary>
+    /// Optional pinned Roslyn Language Server version to use instead of latest.
+    /// </summary>
+    [JsonPropertyName("pinnedRoslynVersion")]
+    public string? PinnedRoslynVersion { get; set; }
+
+    /// <summary>
+    /// Optional pinned Razor extension version to use instead of latest.
+    /// </summary>
+    [JsonPropertyName("pinnedExtensionVersion")]
+    public string? PinnedExtensionVersion { get; set; }
 }
 
 /// <summary>

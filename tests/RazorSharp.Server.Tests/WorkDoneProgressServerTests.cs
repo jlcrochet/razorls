@@ -116,9 +116,10 @@ public class WorkDoneProgressServerTests
             var progressRpc = new FakeProgressRpc();
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.SetDiagnosticsProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, __, ct) =>
             {
-                await Task.Delay(50, ct);
+                await Task.Delay(10, ct);
                 return JsonSerializer.SerializeToElement(new { kind = "full", resultId = "test", items = Array.Empty<object>() });
             });
 
@@ -140,9 +141,10 @@ public class WorkDoneProgressServerTests
             var progressRpc = new FakeProgressRpc();
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.SetDiagnosticsProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, __, ct) =>
             {
-                await Task.Delay(400, ct);
+                await Task.Delay(120, ct);
                 return JsonSerializer.SerializeToElement(new { kind = "full", resultId = "test", items = Array.Empty<object>() });
             });
 
@@ -169,45 +171,22 @@ public class WorkDoneProgressServerTests
         await WithServer(async server =>
         {
             var progressRpc = new FakeProgressRpc();
-            var beginGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var beginTokens = new HashSet<string>();
-            var beginSeqs = new Dictionary<string, int>(StringComparer.Ordinal);
+            var startGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var started = 0;
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.SetDiagnosticsProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, __, ct) =>
             {
-                await beginGate.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
-                await Task.Delay(400, ct);
+                if (Interlocked.Increment(ref started) == 2)
+                {
+                    startGate.TrySetResult(true);
+                }
+
+                await startGate.Task.WaitAsync(TimeSpan.FromSeconds(2), ct);
+                await Task.Delay(120, ct);
                 return JsonSerializer.SerializeToElement(new { kind = "full", resultId = "test", items = Array.Empty<object>() });
             });
-            progressRpc.OnNotificationRecorded = (seq, method, @params) =>
-            {
-                if (method != LspMethods.Progress)
-                {
-                    return;
-                }
-
-                if (GetProgressKind(@params) != "begin")
-                {
-                    return;
-                }
-
-                var token = GetTokenFromParams(@params);
-                if (token == null)
-                {
-                    return;
-                }
-
-                if (beginTokens.Add(token))
-                {
-                    beginSeqs[token] = seq;
-                }
-
-                if (beginTokens.Count == 2)
-                {
-                    beginGate.TrySetResult(true);
-                }
-            };
 
             await server.HandleRoslynNotificationForTests(LspMethods.ProjectInitializationComplete, null, CancellationToken.None);
 
@@ -233,10 +212,20 @@ public class WorkDoneProgressServerTests
                 .ToArray();
             Assert.Equal(4, notifications.Length);
 
-            Assert.True(beginGate.Task.IsCompleted, "Expected both begin notifications before completion.");
+            var beginSeqs = notifications
+                .Where(notification => GetProgressKind(notification.Params) == "begin")
+                .Select(notification => notification.Seq)
+                .ToArray();
+            Assert.Equal(2, beginSeqs.Length);
 
-            var minEndSeq = int.MaxValue;
-            var maxBeginSeq = beginSeqs.Values.DefaultIfEmpty(0).Max();
+            var endSeqs = notifications
+                .Where(notification => GetProgressKind(notification.Params) == "end")
+                .Select(notification => notification.Seq)
+                .ToArray();
+            Assert.Equal(2, endSeqs.Length);
+
+            var minEndSeq = endSeqs.Min();
+            var maxBeginSeq = beginSeqs.Max();
 
             foreach (var token in tokens)
             {
@@ -268,6 +257,7 @@ public class WorkDoneProgressServerTests
             var progressRpc = new FakeProgressRpc();
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.SetDiagnosticsProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, @params, ct) =>
             {
                 var uri = @params.TryGetProperty("textDocument", out var td) && td.TryGetProperty("uri", out var u)
@@ -276,7 +266,7 @@ public class WorkDoneProgressServerTests
 
                 if (string.Equals(uri, "file:///slow.razor", StringComparison.Ordinal))
                 {
-                    await Task.Delay(400, ct);
+                    await Task.Delay(120, ct);
                 }
 
                 return JsonSerializer.SerializeToElement(new { kind = "full", resultId = "test", items = Array.Empty<object>() });
@@ -309,9 +299,10 @@ public class WorkDoneProgressServerTests
             var progressRpc = new FakeProgressRpc();
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(false));
+            server.SetDiagnosticsProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, __, ct) =>
             {
-                await Task.Delay(400, ct);
+                await Task.Delay(120, ct);
                 return JsonSerializer.SerializeToElement(new { kind = "full", resultId = "test", items = Array.Empty<object>() });
             });
 

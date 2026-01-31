@@ -11,11 +11,16 @@ static string GetVersion() =>
 
 // Parse command line arguments
 var logLevel = LogLevel.Information;
+var logLevelSpecifiedByCli = false;
 string? logFile = null;
+var logFileSpecifiedByCli = false;
 string? solutionPath = null;
 int? hostPid = null;
 bool skipDependencyCheck = false;
+var skipDependencyCheckSpecifiedByCli = false;
 bool downloadDependenciesOnly = false;
+bool autoUpdateEnabled = true;
+bool forceUpdateCheck = false;
 var warnings = new List<string>();
 
 for (int i = 0; i < args.Length; i++)
@@ -37,10 +42,12 @@ for (int i = 0; i < args.Length; i++)
             else
             {
                 logLevel = level;
+                logLevelSpecifiedByCli = true;
             }
             break;
         case "-v" or "--verbose":
             logLevel = LogLevel.Trace;
+            logLevelSpecifiedByCli = true;
             break;
         case "--logFile":
             if (nextArg == null || nextArg.StartsWith('-'))
@@ -50,6 +57,7 @@ for (int i = 0; i < args.Length; i++)
             else
             {
                 logFile = args[++i];
+                logFileSpecifiedByCli = true;
             }
             break;
         case "-s" or "--source":
@@ -78,6 +86,13 @@ for (int i = 0; i < args.Length; i++)
             break;
         case "--skip-dependency-check":
             skipDependencyCheck = true;
+            skipDependencyCheckSpecifiedByCli = true;
+            break;
+        case "--check-updates":
+            forceUpdateCheck = true;
+            break;
+        case "--no-auto-update":
+            autoUpdateEnabled = false;
             break;
         case "--download-dependencies":
             downloadDependenciesOnly = true;
@@ -109,41 +124,24 @@ if (downloadDependenciesOnly)
 }
 
 // Configure logging
+var logLevelSwitch = new LoggingLevelSwitch(logLevel);
+var logFileSwitch = new LogFileSwitch(logFile);
 using var loggerFactory = LoggerFactory.Create(builder =>
 {
-    builder.SetMinimumLevel(logLevel);
-
-    if (logFile != null)
-    {
-        // Log to file - stderr is for errors only
-        builder.AddProvider(new FileLoggerProvider(logFile));
-    }
-    else
-    {
-        // Log to stderr (stdout is for LSP communication)
-        builder.AddProvider(new StderrLoggerProvider());
-    }
+    builder.SetMinimumLevel(LogLevel.Trace);
+    builder.AddProvider(new SwitchingLoggerProvider(logLevelSwitch, logFileSwitch));
 });
 
 using var depManager = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), GetVersion());
-
-// Check if dependencies are installed (don't download during LSP startup to avoid timeouts)
-if (!skipDependencyCheck)
-{
-    if (!depManager.AreDependenciesComplete())
-    {
-        Console.Error.WriteLine("ERROR: RazorSharp dependencies are not installed.");
-        Console.Error.WriteLine();
-        Console.Error.WriteLine("Please run with --download-dependencies first to download them.");
-        Console.Error.WriteLine();
-        Console.Error.WriteLine("Or use --skip-dependency-check to skip this check (not recommended).");
-        return 1;
-    }
-}
+depManager.ApplyPendingUpdateIfAvailable();
 
 // Run the server
 var server = new RazorLanguageServer(loggerFactory, depManager);
 server.SetLogLevel(logLevel);
+server.SetLoggingOptions(logLevelSwitch, logFileSwitch, logLevelSpecifiedByCli, logFileSpecifiedByCli);
+server.SetAutoUpdateEnabledFromCli(autoUpdateEnabled);
+server.SetForceUpdateCheck(forceUpdateCheck);
+server.SetSkipDependencyCheck(skipDependencyCheck, skipDependencyCheckSpecifiedByCli);
 if (solutionPath != null)
 {
     server.SetSolutionPath(solutionPath);
@@ -208,6 +206,8 @@ static void PrintHelp()
           --logFile <path>         Write logs to file instead of stderr
           -hpid|--hostPID <pid>    Host process ID (shutdown when host exits)
           --download-dependencies  Download dependencies and exit (does not start server)
+          --check-updates          Force a background dependency update check on startup
+          --no-auto-update         Disable background dependency auto-updates
           --skip-dependency-check  Skip dependency check on startup
           -?|-h|--help             Show this help message
           --version                Show version information
@@ -363,81 +363,5 @@ internal class ProgressBar
     private static void ClearLine()
     {
         Console.Write("\r\x1b[K");
-    }
-}
-
-// Simple stderr logger provider
-internal class StderrLoggerProvider : ILoggerProvider
-{
-    public ILogger CreateLogger(string categoryName) => new StderrLogger(categoryName);
-    public void Dispose() { }
-}
-
-internal class StderrLogger : ILogger
-{
-    readonly string _category;
-    public StderrLogger(string category) => _category = category;
-    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-    public bool IsEnabled(LogLevel logLevel) => true;
-    public void Log<TState>(LogLevel logLevel, EventId _, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-    {
-        var dotIndex = _category.LastIndexOf('.');
-        var shortCategory = dotIndex != -1 ? _category.AsSpan(dotIndex + 1) : _category;
-        Console.Error.WriteLine($"[{logLevel}] {shortCategory}: {formatter(state, exception)}");
-        if (exception != null)
-        {
-            Console.Error.WriteLine(exception.ToString());
-        }
-    }
-}
-
-// Simple file logger provider
-internal class FileLoggerProvider : ILoggerProvider
-{
-    readonly StreamWriter _writer;
-    readonly Lock _lock = new();
-
-    public FileLoggerProvider(string path)
-    {
-        var dir = Path.GetDirectoryName(path);
-        if (!string.IsNullOrEmpty(dir))
-        {
-            Directory.CreateDirectory(dir);
-        }
-        _writer = new StreamWriter(path, append: true) { AutoFlush = true };
-    }
-
-    public ILogger CreateLogger(string categoryName) => new FileLogger(categoryName, _writer, _lock);
-    public void Dispose() => _writer.Dispose();
-}
-
-internal class FileLogger : ILogger
-{
-    readonly string _category;
-    readonly StreamWriter _writer;
-    readonly Lock _lock;
-
-    public FileLogger(string category, StreamWriter writer, Lock @lock)
-    {
-        _category = category;
-        _writer = writer;
-        _lock = @lock;
-    }
-
-    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-    public bool IsEnabled(LogLevel logLevel) => true;
-    public void Log<TState>(LogLevel logLevel, EventId _, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-    {
-        var dotIndex = _category.LastIndexOf('.');
-        var shortCategory = dotIndex != -1 ? _category.AsSpan(dotIndex + 1) : _category;
-        var line = $"[{DateTime.Now:HH:mm:ss.fff}] [{logLevel}] {shortCategory}: {formatter(state, exception)}";
-        lock (_lock)
-        {
-            _writer.WriteLine(line);
-            if (exception != null)
-            {
-                _writer.WriteLine(exception.ToString());
-            }
-        }
     }
 }

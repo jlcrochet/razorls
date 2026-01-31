@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
@@ -16,15 +17,17 @@ public class DependencyManager : IDisposable
     bool _disposed;
     static readonly bool IsCaseInsensitiveFileSystem = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
     static readonly TimeSpan DefaultDownloadTimeout = TimeSpan.FromMinutes(10);
+    static readonly TimeSpan VersionInfoStaleThreshold = TimeSpan.FromDays(30);
     const int MaxDownloadRetries = 3;
     long _downloadRetryCount;
 
-    // Roslyn Language Server version from Crashdummyy/roslynLanguageServer
-    // This provides platform-specific builds that actually work
-    const string RoslynVersion = "5.4.0-2.26065.8";
-
-    // VS Code C# extension version - used for Razor extension only
-    const string ExtensionVersion = "2.111.2";
+    const string UpdateRootDirectoryName = "updates";
+    internal Func<CancellationToken, Task<string?>>? GetLatestRoslynVersionOverride;
+    internal Func<CancellationToken, Task<string?>>? GetLatestExtensionVersionOverride;
+    internal Func<string, string, string, CancellationToken, Task>? DownloadUpdateOverride;
+    internal Func<CancellationToken, Action<string>?, Task<bool>>? EnsureDependenciesOverride;
+    string? _pinnedRoslynVersion;
+    string? _pinnedExtensionVersion;
 
     public DependencyManager(ILogger<DependencyManager> logger, string version, string? basePath = null)
     {
@@ -34,6 +37,16 @@ public class DependencyManager : IDisposable
         _httpClient.DefaultRequestHeaders.Add("User-Agent", $"RazorSharp/{version}");
         _httpClient.Timeout = DefaultDownloadTimeout;
     }
+
+    public void ConfigurePinnedVersions(string? roslynVersion, string? extensionVersion)
+    {
+        _pinnedRoslynVersion = string.IsNullOrWhiteSpace(roslynVersion) ? null : roslynVersion;
+        _pinnedExtensionVersion = string.IsNullOrWhiteSpace(extensionVersion) ? null : extensionVersion;
+    }
+
+    public bool HasPinnedVersions =>
+        !string.IsNullOrWhiteSpace(_pinnedRoslynVersion)
+        || !string.IsNullOrWhiteSpace(_pinnedExtensionVersion);
 
     public string BasePath => _basePath;
     public string RoslynPath => Path.Combine(_basePath, "roslyn");
@@ -73,30 +86,44 @@ public class DependencyManager : IDisposable
     {
         try
         {
+            if (EnsureDependenciesOverride != null)
+            {
+                return await EnsureDependenciesOverride(cancellationToken, onProgress);
+            }
+
             Directory.CreateDirectory(_basePath);
 
             var installedVersion = GetInstalledVersion();
-            var expectedVersion = $"{RoslynVersion}+{ExtensionVersion}";
+            var targetVersions = await ResolveTargetVersionsAsync(installedVersion, cancellationToken);
+            if (targetVersions == null)
+            {
+                _logger.LogError("Unable to resolve dependency versions. Configure pinned versions or check network access.");
+                onProgress?.Invoke("Failed to resolve dependency versions");
+                return false;
+            }
+
+            var (targetRoslynVersion, targetExtensionVersion) = targetVersions.Value;
+            var expectedVersion = BuildCombinedVersion(targetRoslynVersion, targetExtensionVersion);
 
             if (installedVersion?.Version == expectedVersion && AreDependenciesComplete())
             {
                 _logger.LogInformation("Dependencies are up to date (Roslyn {RoslynVersion}, Extension {ExtensionVersion})",
-                    RoslynVersion, ExtensionVersion);
+                    targetRoslynVersion, targetExtensionVersion);
                 onProgress?.Invoke("Dependencies are up to date");
                 return true;
             }
 
             // Download Roslyn Language Server (platform-specific)
-            _logger.LogInformation("Downloading Roslyn Language Server (version {Version})...", RoslynVersion);
-            onProgress?.Invoke($"Downloading Roslyn Language Server ({RoslynVersion})...");
-            await DownloadRoslynLanguageServerAsync(cancellationToken, onProgress);
+            _logger.LogInformation("Downloading Roslyn Language Server (version {Version})...", targetRoslynVersion);
+            onProgress?.Invoke($"Downloading Roslyn Language Server ({targetRoslynVersion})...");
+            await DownloadRoslynLanguageServerAsync(targetRoslynVersion, RoslynPath, cancellationToken, onProgress);
 
             // Download Razor extension from VS Code C# extension
-            _logger.LogInformation("Downloading Razor extension (version {Version})...", ExtensionVersion);
-            onProgress?.Invoke($"Downloading Razor extension ({ExtensionVersion})...");
-            await DownloadRazorExtensionAsync(cancellationToken, onProgress);
+            _logger.LogInformation("Downloading Razor extension (version {Version})...", targetExtensionVersion);
+            onProgress?.Invoke($"Downloading Razor extension ({targetExtensionVersion})...");
+            await DownloadRazorExtensionAsync(targetExtensionVersion, RazorExtensionPath, cancellationToken, onProgress);
 
-            SaveVersionInfo(expectedVersion);
+            SaveVersionInfo(expectedVersion, targetRoslynVersion, targetExtensionVersion);
 
             _logger.LogInformation("Dependencies downloaded successfully");
             if (_downloadRetryCount > 0)
@@ -113,28 +140,329 @@ public class DependencyManager : IDisposable
         }
     }
 
+    private async Task<(string RoslynVersion, string ExtensionVersion)?> ResolveTargetVersionsAsync(
+        DependencyVersionInfo? info,
+        CancellationToken cancellationToken)
+    {
+        string? roslynVersion = _pinnedRoslynVersion;
+        string? extensionVersion = _pinnedExtensionVersion;
+
+        if (string.IsNullOrWhiteSpace(roslynVersion))
+        {
+            try
+            {
+                var result = await GetLatestRoslynVersionAsync(null, null, cancellationToken);
+                if (result.Success && !string.IsNullOrWhiteSpace(result.Version))
+                {
+                    roslynVersion = result.Version;
+                    if (info != null)
+                    {
+                        info.LastKnownRoslynVersion = result.Version;
+                        if (!string.IsNullOrWhiteSpace(result.ETag))
+                        {
+                            info.RoslynReleasesETag = result.ETag;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to resolve latest Roslyn version");
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(roslynVersion))
+        {
+            roslynVersion = info?.LastKnownRoslynVersion;
+            if (!string.IsNullOrWhiteSpace(roslynVersion))
+            {
+                _logger.LogWarning("Using cached Roslyn version {Version} because latest resolution failed", roslynVersion);
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(extensionVersion))
+        {
+            try
+            {
+                var result = await GetLatestExtensionVersionAsync(null, null, cancellationToken);
+                if (result.Success && !string.IsNullOrWhiteSpace(result.Version))
+                {
+                    extensionVersion = result.Version;
+                    if (info != null)
+                    {
+                        info.LastKnownExtensionVersion = result.Version;
+                        if (!string.IsNullOrWhiteSpace(result.ETag))
+                        {
+                            info.ExtensionVersionsETag = result.ETag;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to resolve latest extension version");
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(extensionVersion))
+        {
+            extensionVersion = info?.LastKnownExtensionVersion;
+            if (!string.IsNullOrWhiteSpace(extensionVersion))
+            {
+                _logger.LogWarning("Using cached extension version {Version} because latest resolution failed", extensionVersion);
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(roslynVersion) || string.IsNullOrWhiteSpace(extensionVersion))
+        {
+            return null;
+        }
+
+        if (_pinnedRoslynVersion != null || _pinnedExtensionVersion != null)
+        {
+            _logger.LogInformation(
+                "Using pinned dependency versions (Roslyn {RoslynVersion}, Extension {ExtensionVersion})",
+                roslynVersion,
+                extensionVersion);
+        }
+        else
+        {
+            _logger.LogInformation("Using latest dependency versions (Roslyn {RoslynVersion}, Extension {ExtensionVersion})",
+                roslynVersion, extensionVersion);
+        }
+
+        return (roslynVersion, extensionVersion);
+    }
+
     /// <summary>
     /// Checks if all required dependency files exist.
     /// </summary>
     public bool AreDependenciesComplete()
     {
-        var complete = File.Exists(RoslynServerDllPath)
-            && File.Exists(RazorSourceGeneratorPath)
-            && File.Exists(RazorExtensionDllPath);
+        return AreDependenciesCompleteAt(RoslynPath, RazorExtensionPath, logDesignTimeMissing: true);
+    }
 
-        // Design-time targets may not exist in all versions, so just warn
-        if (complete && !File.Exists(RazorDesignTimePath))
+    public bool ApplyPendingUpdateIfAvailable()
+    {
+        var info = GetInstalledVersion();
+        if (string.IsNullOrWhiteSpace(info?.PendingVersion))
         {
-            _logger.LogWarning("Razor design-time targets not found at {Path}", RazorDesignTimePath);
+            return false;
+        }
+
+        var pendingVersion = info.PendingVersion!;
+        var updateRoot = GetUpdateRoot(pendingVersion);
+        var pendingRoslynPath = Path.Combine(updateRoot, "roslyn");
+        var pendingRazorPath = Path.Combine(updateRoot, "razorExtension");
+
+        if (!AreDependenciesCompleteAt(pendingRoslynPath, pendingRazorPath, logDesignTimeMissing: false))
+        {
+            _logger.LogWarning("Pending dependency update {Version} is incomplete; keeping existing dependencies.", pendingVersion);
+            return false;
+        }
+
+        try
+        {
+            ReplaceDirectory(pendingRoslynPath, RoslynPath);
+            ReplaceDirectory(pendingRazorPath, RazorExtensionPath);
+
+            info.Version = pendingVersion;
+            info.PendingVersion = null;
+            info.InstalledAt = DateTime.UtcNow;
+            info.Platform = RuntimeInformation.RuntimeIdentifier;
+            WriteVersionInfo(info);
+
+            TryDeleteDirectory(updateRoot);
+
+            _logger.LogInformation("Applied pending dependency update {Version}", pendingVersion);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to apply pending dependency update {Version}", pendingVersion);
+            return false;
+        }
+    }
+
+    public async Task<DependencyUpdateResult> CheckForUpdatesAsync(TimeSpan minInterval, CancellationToken cancellationToken = default)
+    {
+        if (minInterval < TimeSpan.Zero)
+        {
+            minInterval = TimeSpan.Zero;
+        }
+
+        var info = GetInstalledVersion();
+        if (HasPinnedVersions)
+        {
+            _logger.LogInformation("Skipping dependency update check because pinned versions are configured.");
+            return new DependencyUpdateResult(DependencyUpdateStatus.Skipped, info?.Version, info?.PendingVersion);
+        }
+
+        var now = DateTime.UtcNow;
+        var lastSuccess = info?.LastUpdateSuccessUtc ?? info?.LastUpdateCheckUtc;
+        if (lastSuccess != null && now - lastSuccess.Value < minInterval)
+        {
+            _logger.LogDebug("Skipping dependency update check (last success at {LastCheck})", lastSuccess);
+            return new DependencyUpdateResult(DependencyUpdateStatus.Skipped, info?.Version, info?.PendingVersion);
+        }
+
+        info ??= new DependencyVersionInfo();
+        info.LastUpdateAttemptUtc = now;
+        WriteVersionInfo(info);
+
+        string? latestRoslyn = _pinnedRoslynVersion;
+        string? latestExtension = _pinnedExtensionVersion;
+        try
+        {
+            if (latestRoslyn == null)
+            {
+                if (GetLatestRoslynVersionOverride != null)
+                {
+                    latestRoslyn = await GetLatestRoslynVersionOverride(cancellationToken);
+                }
+                else
+                {
+                    var roslynResult = await GetLatestRoslynVersionAsync(
+                        info.RoslynReleasesETag,
+                        info.LastKnownRoslynVersion,
+                        cancellationToken);
+                    if (!roslynResult.Success)
+                    {
+                        throw new InvalidOperationException("Failed to resolve latest Roslyn version.");
+                    }
+
+                    latestRoslyn = roslynResult.Version;
+                    info.RoslynReleasesETag = roslynResult.ETag ?? info.RoslynReleasesETag;
+                    info.LastKnownRoslynVersion = roslynResult.Version ?? info.LastKnownRoslynVersion;
+                }
+            }
+
+            if (latestExtension == null)
+            {
+                if (GetLatestExtensionVersionOverride != null)
+                {
+                    latestExtension = await GetLatestExtensionVersionOverride(cancellationToken);
+                }
+                else
+                {
+                    var extensionResult = await GetLatestExtensionVersionAsync(
+                        info.ExtensionVersionsETag,
+                        info.LastKnownExtensionVersion,
+                        cancellationToken);
+                    if (!extensionResult.Success)
+                    {
+                        throw new InvalidOperationException("Failed to resolve latest extension version.");
+                    }
+
+                    latestExtension = extensionResult.Version;
+                    info.ExtensionVersionsETag = extensionResult.ETag ?? info.ExtensionVersionsETag;
+                    info.LastKnownExtensionVersion = extensionResult.Version ?? info.LastKnownExtensionVersion;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to check for dependency updates");
+            return new DependencyUpdateResult(DependencyUpdateStatus.Failed, info.Version, info.PendingVersion);
+        }
+
+        if (string.IsNullOrWhiteSpace(latestRoslyn) || string.IsNullOrWhiteSpace(latestExtension))
+        {
+            _logger.LogWarning("Failed to resolve latest dependency versions");
+            return new DependencyUpdateResult(DependencyUpdateStatus.Failed, info.Version, info.PendingVersion);
+        }
+
+        if (_pinnedRoslynVersion != null)
+        {
+            info.LastKnownRoslynVersion = _pinnedRoslynVersion;
+        }
+        if (_pinnedExtensionVersion != null)
+        {
+            info.LastKnownExtensionVersion = _pinnedExtensionVersion;
+        }
+
+        var latestCombined = BuildCombinedVersion(latestRoslyn, latestExtension);
+        if (string.Equals(info.PendingVersion, latestCombined, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogInformation("Dependency update {Version} already downloaded; restart to use it.", latestCombined);
+            info.LastUpdateSuccessUtc = now;
+            WriteVersionInfo(info);
+            return new DependencyUpdateResult(DependencyUpdateStatus.UpdateAlreadyPending, info.Version, latestCombined);
+        }
+
+        var currentVersion = info.Version;
+
+        if (!string.IsNullOrWhiteSpace(currentVersion) &&
+            string.Equals(currentVersion, latestCombined, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogDebug("Dependencies already up to date ({Version})", latestCombined);
+            info.LastUpdateSuccessUtc = now;
+            WriteVersionInfo(info);
+            return new DependencyUpdateResult(DependencyUpdateStatus.NoUpdate, currentVersion, latestCombined);
+        }
+
+        try
+        {
+            if (DownloadUpdateOverride != null)
+            {
+                await DownloadUpdateOverride(latestRoslyn, latestExtension, latestCombined, cancellationToken);
+            }
+            else
+            {
+                await DownloadUpdateAsync(latestRoslyn, latestExtension, latestCombined, cancellationToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to download dependency update {Version}", latestCombined);
+            return new DependencyUpdateResult(DependencyUpdateStatus.Failed, currentVersion, latestCombined);
+        }
+
+        info.PendingVersion = latestCombined;
+        info.LastUpdateSuccessUtc = now;
+        WriteVersionInfo(info);
+
+        _logger.LogInformation("Downloaded dependency update {Version}; restart to apply.", latestCombined);
+        return new DependencyUpdateResult(DependencyUpdateStatus.UpdateDownloaded, currentVersion, latestCombined);
+    }
+
+    private bool AreDependenciesCompleteAt(string roslynPath, string razorExtensionPath, bool logDesignTimeMissing)
+    {
+        var complete = File.Exists(GetRoslynServerDllPath(roslynPath))
+            && File.Exists(GetRazorSourceGeneratorPath(razorExtensionPath))
+            && File.Exists(GetRazorExtensionDllPath(razorExtensionPath));
+
+        if (complete && logDesignTimeMissing && !File.Exists(GetRazorDesignTimePath(razorExtensionPath)))
+        {
+            _logger.LogWarning("Razor design-time targets not found at {Path}", GetRazorDesignTimePath(razorExtensionPath));
         }
 
         return complete;
     }
 
-    private async Task DownloadRoslynLanguageServerAsync(CancellationToken cancellationToken, Action<string>? onProgress = null)
+    private async Task DownloadUpdateAsync(string roslynVersion, string extensionVersion, string combinedVersion, CancellationToken cancellationToken)
+    {
+        var updateRoot = GetUpdateRoot(combinedVersion);
+        TryDeleteDirectory(updateRoot);
+        Directory.CreateDirectory(updateRoot);
+
+        var roslynTarget = Path.Combine(updateRoot, "roslyn");
+        var extensionTarget = Path.Combine(updateRoot, "razorExtension");
+
+        _logger.LogInformation("Downloading dependency update {Version}", combinedVersion);
+        await DownloadRoslynLanguageServerAsync(roslynVersion, roslynTarget, cancellationToken);
+        await DownloadRazorExtensionAsync(extensionVersion, extensionTarget, cancellationToken);
+
+        if (!AreDependenciesCompleteAt(roslynTarget, extensionTarget, logDesignTimeMissing: false))
+        {
+            throw new InvalidOperationException($"Downloaded update {combinedVersion} is incomplete.");
+        }
+    }
+
+    private async Task DownloadRoslynLanguageServerAsync(string version, string destinationPath, CancellationToken cancellationToken, Action<string>? onProgress = null)
     {
         var platform = GetRoslynPlatform();
-        var url = $"https://github.com/Crashdummyy/roslynLanguageServer/releases/download/{RoslynVersion}/microsoft.codeanalysis.languageserver.{platform}.zip";
+        var url = $"https://github.com/Crashdummyy/roslynLanguageServer/releases/download/{version}/microsoft.codeanalysis.languageserver.{platform}.zip";
 
         _logger.LogInformation("Downloading Roslyn from {Url}", url);
 
@@ -146,16 +474,16 @@ public class DependencyManager : IDisposable
 
             onProgress?.Invoke("Extracting Roslyn...");
 
-            if (Directory.Exists(RoslynPath))
+            if (Directory.Exists(destinationPath))
             {
-                Directory.Delete(RoslynPath, recursive: true);
+                Directory.Delete(destinationPath, recursive: true);
             }
-            Directory.CreateDirectory(RoslynPath);
+            Directory.CreateDirectory(destinationPath);
 
             // Extract to roslyn directory
-            await Task.Run(() => ExtractZipToDirectorySafe(tempZipPath, RoslynPath), cancellationToken);
+            await Task.Run(() => ExtractZipToDirectorySafe(tempZipPath, destinationPath), cancellationToken);
 
-            _logger.LogInformation("Extracted Roslyn language server to {Path}", RoslynPath);
+            _logger.LogInformation("Extracted Roslyn language server to {Path}", destinationPath);
         }
         finally
         {
@@ -166,9 +494,9 @@ public class DependencyManager : IDisposable
         }
     }
 
-    private async Task DownloadRazorExtensionAsync(CancellationToken cancellationToken, Action<string>? onProgress = null)
+    private async Task DownloadRazorExtensionAsync(string version, string destinationPath, CancellationToken cancellationToken, Action<string>? onProgress = null)
     {
-        var extensionUrl = GetExtensionDownloadUrl();
+        var extensionUrl = GetExtensionDownloadUrl(version);
 
         _logger.LogInformation("Downloading C# extension from {Url}", extensionUrl);
 
@@ -179,7 +507,7 @@ public class DependencyManager : IDisposable
                 percent => onProgress?.Invoke($"Downloading Razor extension... {percent}%"));
 
             onProgress?.Invoke("Extracting Razor extension...");
-            await ExtractRazorExtensionAsync(tempZipPath, cancellationToken);
+            await ExtractRazorExtensionAsync(tempZipPath, destinationPath, cancellationToken);
         }
         finally
         {
@@ -272,7 +600,7 @@ public class DependencyManager : IDisposable
     }
 
 
-    private async Task ExtractRazorExtensionAsync(string zipPath, CancellationToken cancellationToken)
+    private async Task ExtractRazorExtensionAsync(string zipPath, string destinationPath, CancellationToken cancellationToken)
     {
         var tempExtractPath = Path.Combine(Path.GetTempPath(), $"csharp-extension-extract-{Guid.NewGuid()}");
         try
@@ -286,12 +614,12 @@ public class DependencyManager : IDisposable
             var razorSource = Path.Combine(tempExtractPath, "extension", ".razorExtension");
             if (Directory.Exists(razorSource))
             {
-                if (Directory.Exists(RazorExtensionPath))
+                if (Directory.Exists(destinationPath))
                 {
-                    Directory.Delete(RazorExtensionPath, recursive: true);
+                    Directory.Delete(destinationPath, recursive: true);
                 }
-                CopyDirectory(razorSource, RazorExtensionPath);
-                _logger.LogInformation("Extracted Razor extension to {Path}", RazorExtensionPath);
+                CopyDirectory(razorSource, destinationPath);
+                _logger.LogInformation("Extracted Razor extension to {Path}", destinationPath);
             }
             else
             {
@@ -401,11 +729,11 @@ public class DependencyManager : IDisposable
         }
     }
 
-    private static string GetExtensionDownloadUrl()
+    private static string GetExtensionDownloadUrl(string version)
     {
         // Download from VS Code marketplace using the vsassets URL
         // This gets the universal (platform-neutral) package for the Razor extension
-        return $"https://ms-dotnettools.gallery.vsassets.io/_apis/public/gallery/publisher/ms-dotnettools/extension/csharp/{ExtensionVersion}/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage";
+        return $"https://ms-dotnettools.gallery.vsassets.io/_apis/public/gallery/publisher/ms-dotnettools/extension/csharp/{version}/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage";
     }
 
     private static string GetDefaultBasePath()
@@ -439,25 +767,400 @@ public class DependencyManager : IDisposable
         try
         {
             var json = File.ReadAllText(VersionFilePath);
-            return JsonSerializer.Deserialize<DependencyVersionInfo>(json);
+            var info = JsonSerializer.Deserialize<DependencyVersionInfo>(json);
+            if (info == null)
+            {
+                return null;
+            }
+
+            if (NormalizeVersionInfo(info))
+            {
+                WriteVersionInfo(info);
+            }
+
+            return info;
         }
-        catch
+        catch (JsonException ex)
         {
+            _logger.LogWarning(ex, "Failed to parse dependency version file at {Path}", VersionFilePath);
+            TryBackupCorruptVersionFile();
+            return null;
+        }
+        catch (IOException ex)
+        {
+            _logger.LogWarning(ex, "Failed to read dependency version file at {Path}", VersionFilePath);
+            return null;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            _logger.LogWarning(ex, "Access denied reading dependency version file at {Path}", VersionFilePath);
             return null;
         }
     }
 
-    private void SaveVersionInfo(string version)
+    private void SaveVersionInfo(string version, string? roslynVersion, string? extensionVersion)
     {
-        var info = new DependencyVersionInfo
+        var info = GetInstalledVersion() ?? new DependencyVersionInfo();
+        info.Version = version;
+        info.PendingVersion = null;
+        info.InstalledAt = DateTime.UtcNow;
+        info.Platform = RuntimeInformation.RuntimeIdentifier;
+        if (!string.IsNullOrWhiteSpace(roslynVersion))
         {
-            Version = version,
-            InstalledAt = DateTime.UtcNow,
-            Platform = RuntimeInformation.RuntimeIdentifier
-        };
+            info.LastKnownRoslynVersion = roslynVersion;
+        }
+        if (!string.IsNullOrWhiteSpace(extensionVersion))
+        {
+            info.LastKnownExtensionVersion = extensionVersion;
+        }
+        WriteVersionInfo(info);
+    }
 
+    private void WriteVersionInfo(DependencyVersionInfo info)
+    {
+        Directory.CreateDirectory(_basePath);
         var json = JsonSerializer.Serialize(info, new JsonSerializerOptions { WriteIndented = true });
         File.WriteAllText(VersionFilePath, json);
+    }
+
+    private string GetUpdateRoot(string version)
+    {
+        return Path.Combine(_basePath, UpdateRootDirectoryName, version);
+    }
+
+    private static string BuildCombinedVersion(string roslynVersion, string extensionVersion)
+    {
+        return $"{roslynVersion}+{extensionVersion}";
+    }
+
+    private static string GetRoslynServerDllPath(string roslynPath)
+    {
+        return Path.Combine(roslynPath, "Microsoft.CodeAnalysis.LanguageServer.dll");
+    }
+
+    private static string GetRazorSourceGeneratorPath(string razorExtensionPath)
+    {
+        return Path.Combine(razorExtensionPath, "Microsoft.CodeAnalysis.Razor.Compiler.dll");
+    }
+
+    private static string GetRazorExtensionDllPath(string razorExtensionPath)
+    {
+        return Path.Combine(razorExtensionPath, "Microsoft.VisualStudioCode.RazorExtension.dll");
+    }
+
+    private static string GetRazorDesignTimePath(string razorExtensionPath)
+    {
+        return Path.Combine(razorExtensionPath, "Targets", "Microsoft.NET.Sdk.Razor.DesignTime.targets");
+    }
+
+    private static void ReplaceDirectory(string sourceDir, string destinationDir)
+    {
+        if (!Directory.Exists(sourceDir))
+        {
+            throw new DirectoryNotFoundException($"Source directory not found: {sourceDir}");
+        }
+
+        if (Directory.Exists(destinationDir))
+        {
+            Directory.Delete(destinationDir, recursive: true);
+        }
+
+        Directory.Move(sourceDir, destinationDir);
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, recursive: true);
+            }
+        }
+        catch
+        {
+            // Ignore cleanup errors
+        }
+    }
+
+    private bool NormalizeVersionInfo(DependencyVersionInfo info)
+    {
+        var updated = false;
+        var now = DateTime.UtcNow;
+
+        if (info.InstalledAt == default || info.InstalledAt > now.AddDays(1))
+        {
+            info.InstalledAt = now;
+            updated = true;
+        }
+
+        if (info.LastUpdateAttemptUtc.HasValue && info.LastUpdateAttemptUtc.Value > now.AddDays(1))
+        {
+            info.LastUpdateAttemptUtc = null;
+            updated = true;
+        }
+
+        if (info.LastUpdateSuccessUtc.HasValue && info.LastUpdateSuccessUtc.Value > now.AddDays(1))
+        {
+            info.LastUpdateSuccessUtc = null;
+            updated = true;
+        }
+
+        if (info.LastUpdateCheckUtc.HasValue && info.LastUpdateCheckUtc.Value > now.AddDays(1))
+        {
+            info.LastUpdateCheckUtc = null;
+            updated = true;
+        }
+
+        var baseline = info.LastUpdateSuccessUtc ?? info.LastUpdateCheckUtc ?? info.InstalledAt;
+        if (baseline < now - VersionInfoStaleThreshold)
+        {
+            if (!string.IsNullOrWhiteSpace(info.RoslynReleasesETag) ||
+                !string.IsNullOrWhiteSpace(info.ExtensionVersionsETag) ||
+                !string.IsNullOrWhiteSpace(info.LastKnownRoslynVersion) ||
+                !string.IsNullOrWhiteSpace(info.LastKnownExtensionVersion))
+            {
+                info.RoslynReleasesETag = null;
+                info.ExtensionVersionsETag = null;
+                info.LastKnownRoslynVersion = null;
+                info.LastKnownExtensionVersion = null;
+                updated = true;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(info.PendingVersion))
+        {
+            var updateRoot = GetUpdateRoot(info.PendingVersion);
+            var pendingRoslynPath = Path.Combine(updateRoot, "roslyn");
+            var pendingRazorPath = Path.Combine(updateRoot, "razorExtension");
+
+            if (!AreDependenciesCompleteAt(pendingRoslynPath, pendingRazorPath, logDesignTimeMissing: false))
+            {
+                info.PendingVersion = null;
+                updated = true;
+            }
+        }
+
+        return updated;
+    }
+
+    private void TryBackupCorruptVersionFile()
+    {
+        try
+        {
+            if (!File.Exists(VersionFilePath))
+            {
+                return;
+            }
+
+            var directory = Path.GetDirectoryName(VersionFilePath);
+            if (string.IsNullOrEmpty(directory))
+            {
+                return;
+            }
+
+            var backupPath = Path.Combine(
+                directory,
+                $"version.json.corrupt-{DateTime.UtcNow:yyyyMMddHHmmss}");
+            File.Move(VersionFilePath, backupPath, overwrite: true);
+        }
+        catch
+        {
+            // Ignore cleanup errors
+        }
+    }
+
+    private async Task<VersionFetchResult> GetLatestRoslynVersionAsync(string? etag, string? cachedVersion, CancellationToken cancellationToken)
+    {
+        const string url = "https://api.github.com/repos/Crashdummyy/roslynLanguageServer/releases/latest";
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        if (!string.IsNullOrWhiteSpace(etag))
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", etag);
+        }
+
+        using var response = await _httpClient.SendAsync(request, cancellationToken);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotModified)
+        {
+            if (!string.IsNullOrWhiteSpace(cachedVersion))
+            {
+                return VersionFetchResult.CreateFromCache(cachedVersion, etag);
+            }
+        }
+
+        if (IsRateLimited(response))
+        {
+            _logger.LogWarning("GitHub API rate limit exceeded while checking Roslyn version.");
+            return VersionFetchResult.Failed;
+        }
+
+        response.EnsureSuccessStatusCode();
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+
+        if (doc.RootElement.TryGetProperty("tag_name", out var tag))
+        {
+            var value = tag.GetString();
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return VersionFetchResult.CreateSuccess(value.TrimStart('v', 'V'), GetResponseEtag(response));
+            }
+        }
+
+        return VersionFetchResult.Failed;
+    }
+
+    private async Task<VersionFetchResult> GetLatestExtensionVersionAsync(string? etag, string? cachedVersion, CancellationToken cancellationToken)
+    {
+        const string url = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=3.0-preview.1";
+        var payload = new
+        {
+            filters = new[]
+            {
+                new
+                {
+                    criteria = new[]
+                    {
+                        new { filterType = 7, value = "ms-dotnettools.csharp" }
+                    }
+                }
+            },
+            flags = 1 // IncludeVersions
+        };
+        using var request = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+        };
+        if (!string.IsNullOrWhiteSpace(etag))
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", etag);
+        }
+
+        using var response = await _httpClient.SendAsync(request, cancellationToken);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotModified)
+        {
+            if (!string.IsNullOrWhiteSpace(cachedVersion))
+            {
+                return VersionFetchResult.CreateFromCache(cachedVersion, etag);
+            }
+        }
+
+        if (IsRateLimited(response))
+        {
+            _logger.LogWarning("Marketplace API rate limit exceeded while checking extension version.");
+            return VersionFetchResult.Failed;
+        }
+
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            _logger.LogWarning("Marketplace API endpoint returned 404 while checking extension version.");
+            return VersionFetchResult.Failed;
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _logger.LogWarning("Marketplace API returned {StatusCode} while checking extension version.", response.StatusCode);
+            return VersionFetchResult.Failed;
+        }
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+
+        if (doc.RootElement.TryGetProperty("results", out var results) &&
+            results.ValueKind == JsonValueKind.Array &&
+            results.GetArrayLength() > 0 &&
+            results[0].TryGetProperty("extensions", out var extensions) &&
+            extensions.ValueKind == JsonValueKind.Array)
+        {
+            Version? best = null;
+            string? bestRaw = null;
+
+            foreach (var extension in extensions.EnumerateArray())
+            {
+                if (!extension.TryGetProperty("versions", out var versions) || versions.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                foreach (var version in versions.EnumerateArray())
+                {
+                    if (!version.TryGetProperty("version", out var versionProp))
+                    {
+                        continue;
+                    }
+
+                    var value = versionProp.GetString();
+                    if (string.IsNullOrWhiteSpace(value))
+                    {
+                        continue;
+                    }
+
+                    if (Version.TryParse(value, out var parsed))
+                    {
+                        if (best == null || parsed > best)
+                        {
+                            best = parsed;
+                            bestRaw = value;
+                        }
+                    }
+                    else if (best == null && bestRaw == null)
+                    {
+                        bestRaw = value;
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(bestRaw))
+            {
+                return VersionFetchResult.CreateSuccess(bestRaw, GetResponseEtag(response));
+            }
+        }
+
+        return VersionFetchResult.Failed;
+    }
+
+    private static bool IsRateLimited(HttpResponseMessage response)
+    {
+        if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+        {
+            return true;
+        }
+
+        if (response.StatusCode == System.Net.HttpStatusCode.Forbidden &&
+            response.Headers.TryGetValues("X-RateLimit-Remaining", out var remainingValues))
+        {
+            foreach (var value in remainingValues)
+            {
+                if (string.Equals(value, "0", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static string? GetResponseEtag(HttpResponseMessage response)
+    {
+        if (response.Headers.ETag != null)
+        {
+            return response.Headers.ETag.Tag;
+        }
+
+        if (response.Headers.TryGetValues("ETag", out var values))
+        {
+            foreach (var value in values)
+            {
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
+            }
+        }
+
+        return null;
     }
 
     public void Dispose()
@@ -475,4 +1178,33 @@ public class DependencyVersionInfo
     public string? Version { get; set; }
     public DateTime InstalledAt { get; set; }
     public string? Platform { get; set; }
+    public string? PendingVersion { get; set; }
+    public DateTime? LastUpdateCheckUtc { get; set; }
+    public DateTime? LastUpdateAttemptUtc { get; set; }
+    public DateTime? LastUpdateSuccessUtc { get; set; }
+    public string? RoslynReleasesETag { get; set; }
+    public string? ExtensionVersionsETag { get; set; }
+    public string? LastKnownRoslynVersion { get; set; }
+    public string? LastKnownExtensionVersion { get; set; }
+}
+
+public enum DependencyUpdateStatus
+{
+    Skipped,
+    NoUpdate,
+    UpdateAlreadyPending,
+    UpdateDownloaded,
+    Failed
+}
+
+public readonly record struct DependencyUpdateResult(
+    DependencyUpdateStatus Status,
+    string? CurrentVersion,
+    string? TargetVersion);
+
+readonly record struct VersionFetchResult(string? Version, string? ETag, bool Success, bool FromCache)
+{
+    public static VersionFetchResult Failed => new(null, null, Success: false, FromCache: false);
+    public static VersionFetchResult CreateSuccess(string version, string? etag) => new(version, etag, Success: true, FromCache: false);
+    public static VersionFetchResult CreateFromCache(string version, string? etag) => new(version, etag, Success: true, FromCache: true);
 }
