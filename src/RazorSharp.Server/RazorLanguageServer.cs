@@ -47,8 +47,9 @@ public class RazorLanguageServer : IAsyncDisposable
     readonly Dictionary<string, string> _sourceGeneratedUriCache = new(UriComparer);
     readonly Dictionary<string, List<SourceGeneratedEntry>> _sourceGeneratedIndex = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock _sourceGeneratedCacheLock = new();
-    DateTime _sourceGeneratedIndexLastScan;
-    bool _sourceGeneratedIndexBuilt;
+    DateTime _sourceGeneratedIndexLastFullScan;
+    bool _sourceGeneratedIndexHasFullScan;
+    bool _sourceGeneratedIndexHasIncrementalUpdates;
     int _sourceGeneratedIndexRefreshInProgress;
     readonly Lock _workspaceReloadLock = new();
     CancellationTokenSource? _workspaceReloadCts;
@@ -60,22 +61,42 @@ public class RazorLanguageServer : IAsyncDisposable
     readonly Channel<NotificationWorkItem> _notificationChannel;
     readonly CancellationTokenSource _notificationCts;
     readonly Task _notificationTask;
+    readonly CancellationTokenSource _lifetimeCts = new();
+    long _droppedRoslynNotifications;
+    long _roslynRequestTimeouts;
+    long _sourceGeneratedCacheHits;
+    long _sourceGeneratedCacheMisses;
+    long _sourceGeneratedIndexRefreshes;
+    long _sourceGeneratedIndexIncrementalUpdates;
     const int DiagnosticsProgressDelayMs = 250;
     const int WorkDoneProgressCreateTimeoutMs = 2000;
     const int MaxFastStartDelayMs = 60000;
     const int MaxPendingChangesPerDocument = 200;
+    const int MaxContentChangesToApply = 50;
     const int WorkspaceReloadDebounceMs = 1000;
     const int FileWatchKindAll = 7;
     const string FileWatchRegistrationId = "razorsharp.didChangeWatchedFiles";
     const string OmniSharpConfigFileName = "omnisharp.json";
     const string DirectoryBuildPropsFileName = "Directory.Build.props";
     const string DirectoryBuildTargetsFileName = "Directory.Build.targets";
+    const string DirectoryBuildRspFileName = "Directory.Build.rsp";
+    const string DirectoryPackagesPropsFileName = "Directory.Packages.props";
+    const string DirectoryPackagesTargetsFileName = "Directory.Packages.targets";
+    const string NuGetConfigFileName = "NuGet.Config";
+    const string NuGetConfigLowerFileName = "nuget.config";
+    const string StyleCopConfigFileName = "stylecop.json";
+    const string PackagesLockFileName = "packages.lock.json";
     const string GlobalJsonFileName = "global.json";
     const string SolutionFilterFileName = ".slnf";
     const string SolutionXmlFileName = ".slnx";
     static readonly TimeSpan DefaultRoslynRequestTimeout = TimeSpan.FromSeconds(10);
     TimeSpan _roslynRequestTimeout = DefaultRoslynRequestTimeout;
     static readonly TimeSpan SourceGeneratedIndexRefreshInterval = TimeSpan.FromSeconds(60);
+    static readonly EnumerationOptions SourceGeneratedEnumerateOptions = new()
+    {
+        IgnoreInaccessible = true,
+        AttributesToSkip = FileAttributes.ReparsePoint
+    };
 
     static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -176,6 +197,7 @@ public class RazorLanguageServer : IAsyncDisposable
         });
         _notificationCts = new CancellationTokenSource();
         _notificationTask = Task.Run(() => ProcessNotificationsAsync(_notificationCts.Token));
+        _workspaceOpenedAt = DateTime.UtcNow;
     }
 
     /// <summary>
@@ -490,6 +512,9 @@ public class RazorLanguageServer : IAsyncDisposable
         // Gracefully shut down subprocesses (they have internal timeouts before force-kill)
         try
         {
+            _notificationCts.Cancel();
+            _lifetimeCts.Cancel();
+
             // Run disposal in parallel for both clients
             Task.WhenAll(
                 _roslynClient?.DisposeAsync().AsTask() ?? Task.CompletedTask,
@@ -606,6 +631,28 @@ public class RazorLanguageServer : IAsyncDisposable
     private static bool TryApplyContentChanges(string originalText, JsonElement changes, out string updatedText)
     {
         updatedText = originalText;
+
+        if (changes.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        if (changes.GetArrayLength() > MaxContentChangesToApply)
+        {
+            var last = changes[changes.GetArrayLength() - 1];
+            if (last.TryGetProperty("range", out var lastRange) && lastRange.ValueKind != JsonValueKind.Null)
+            {
+                return false;
+            }
+
+            if (!last.TryGetProperty("text", out var lastText))
+            {
+                return false;
+            }
+
+            updatedText = lastText.GetString() ?? string.Empty;
+            return true;
+        }
 
         foreach (var change in changes.EnumerateArray())
         {
@@ -840,7 +887,8 @@ public class RazorLanguageServer : IAsyncDisposable
         var globalConfigPath = TryGetGlobalOmniSharpConfigPath();
 
         var configChanged = false;
-        var sourceGeneratedChanged = false;
+        var sourceGeneratedFullRefreshNeeded = false;
+        var sourceGeneratedIncrementalApplied = false;
         var workspaceReloadNeeded = false;
 
         foreach (var change in @params.Changes)
@@ -856,9 +904,16 @@ public class RazorLanguageServer : IAsyncDisposable
                 configChanged = true;
             }
 
-            if (!sourceGeneratedChanged && IsSourceGeneratedPath(localPath))
+            if (IsSourceGeneratedPath(localPath))
             {
-                sourceGeneratedChanged = true;
+                if (TryUpdateSourceGeneratedIndexForChange(localPath, change.Type))
+                {
+                    sourceGeneratedIncrementalApplied = true;
+                }
+                else
+                {
+                    sourceGeneratedFullRefreshNeeded = true;
+                }
             }
 
             if (!workspaceReloadNeeded && IsWorkspaceReloadTriggerPath(localPath))
@@ -877,10 +932,14 @@ public class RazorLanguageServer : IAsyncDisposable
             }
         }
 
-        if (sourceGeneratedChanged)
+        if (sourceGeneratedFullRefreshNeeded)
         {
             _logger.LogDebug("Source-generated files changed; refreshing index");
             RefreshSourceGeneratedIndex();
+        }
+        else if (sourceGeneratedIncrementalApplied)
+        {
+            _logger.LogDebug("Source-generated files changed; updated index incrementally");
         }
 
         if (workspaceReloadNeeded)
@@ -1627,6 +1686,7 @@ public class RazorLanguageServer : IAsyncDisposable
             }
             else
             {
+                Interlocked.Increment(ref _droppedRoslynNotifications);
                 _logger.LogDebug("Dropping Roslyn notification due to backpressure: {Method}", e.Method);
             }
         }
@@ -2049,6 +2109,11 @@ public class RazorLanguageServer : IAsyncDisposable
         // If not initialized yet, either wait briefly or proceed after a grace period
         if (!_roslynProjectInitialized.Task.IsCompleted)
         {
+            if (_workspaceOpenedAt == default)
+            {
+                _workspaceOpenedAt = DateTime.UtcNow;
+            }
+
             if (FastStartEnabled)
             {
                 var delayMs = FastStartDelayMs;
@@ -2100,7 +2165,15 @@ public class RazorLanguageServer : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            _logger.LogDebug("Roslyn request timed out or was canceled for {Method}", method);
+            if (!ct.IsCancellationRequested)
+            {
+                Interlocked.Increment(ref _roslynRequestTimeouts);
+                _logger.LogDebug("Roslyn request timed out for {Method}", method);
+            }
+            else
+            {
+                _logger.LogDebug("Roslyn request canceled by client for {Method}", method);
+            }
             return null;
         }
         catch (IOException ex)
@@ -2363,6 +2436,12 @@ public class RazorLanguageServer : IAsyncDisposable
             CreateWatcher("**/*.csproj", baseUri),
             CreateWatcher($"**/{DirectoryBuildPropsFileName}", baseUri),
             CreateWatcher($"**/{DirectoryBuildTargetsFileName}", baseUri),
+            CreateWatcher($"**/{DirectoryBuildRspFileName}", baseUri),
+            CreateWatcher($"**/{DirectoryPackagesPropsFileName}", baseUri),
+            CreateWatcher($"**/{DirectoryPackagesTargetsFileName}", baseUri),
+            CreateWatcher($"**/{NuGetConfigFileName}", baseUri),
+            CreateWatcher($"**/{NuGetConfigLowerFileName}", baseUri),
+            CreateWatcher($"**/{PackagesLockFileName}", baseUri),
             CreateWatcher($"**/{GlobalJsonFileName}", baseUri),
             CreateWatcher($"**/{OmniSharpConfigFileName}", baseUri),
             CreateWatcher("**/*.razor", baseUri),
@@ -2374,6 +2453,10 @@ public class RazorLanguageServer : IAsyncDisposable
             CreateWatcher("**/*.slnx", baseUri),
             CreateWatcher("**/*.props", baseUri),
             CreateWatcher("**/*.targets", baseUri),
+            CreateWatcher("**/*.globalconfig", baseUri),
+            CreateWatcher("**/*.ruleset", baseUri),
+            CreateWatcher("**/*.rsp", baseUri),
+            CreateWatcher($"**/{StyleCopConfigFileName}", baseUri),
             CreateWatcher("**/.editorconfig", baseUri),
             CreateWatcher("**/obj/**/generated/**", baseUri)
         ];
@@ -2614,7 +2697,10 @@ public class RazorLanguageServer : IAsyncDisposable
             extension.Equals(SolutionXmlFileName, StringComparison.OrdinalIgnoreCase) ||
             extension.Equals(".csproj", StringComparison.OrdinalIgnoreCase) ||
             extension.Equals(".props", StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(".targets", StringComparison.OrdinalIgnoreCase))
+            extension.Equals(".targets", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".globalconfig", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".ruleset", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".rsp", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -2622,6 +2708,13 @@ public class RazorLanguageServer : IAsyncDisposable
         var fileName = Path.GetFileName(path);
         return fileName.Equals(DirectoryBuildPropsFileName, StringComparison.OrdinalIgnoreCase) ||
                fileName.Equals(DirectoryBuildTargetsFileName, StringComparison.OrdinalIgnoreCase) ||
+               fileName.Equals(DirectoryBuildRspFileName, StringComparison.OrdinalIgnoreCase) ||
+               fileName.Equals(DirectoryPackagesPropsFileName, StringComparison.OrdinalIgnoreCase) ||
+               fileName.Equals(DirectoryPackagesTargetsFileName, StringComparison.OrdinalIgnoreCase) ||
+                fileName.Equals(NuGetConfigFileName, StringComparison.OrdinalIgnoreCase) ||
+                fileName.Equals(NuGetConfigLowerFileName, StringComparison.OrdinalIgnoreCase) ||
+                fileName.Equals(StyleCopConfigFileName, StringComparison.OrdinalIgnoreCase) ||
+               fileName.Equals(PackagesLockFileName, StringComparison.OrdinalIgnoreCase) ||
                fileName.Equals(GlobalJsonFileName, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -2639,6 +2732,94 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         return normalized.Contains("/obj/") && normalized.Contains("/generated/");
+    }
+
+    private bool TryUpdateSourceGeneratedIndexForChange(string path, FileChangeType changeType)
+    {
+        if (!TryParseSourceGeneratedPath(path, out var key, out var isDebug))
+        {
+            return false;
+        }
+
+        var fileExists = File.Exists(path);
+        lock (_sourceGeneratedCacheLock)
+        {
+            if (changeType == FileChangeType.Deleted || !fileExists)
+            {
+                if (_sourceGeneratedIndex.TryGetValue(key, out var entries))
+                {
+                    for (var i = entries.Count - 1; i >= 0; i--)
+                    {
+                        if (entries[i].Path.Equals(path, UriComparison))
+                        {
+                            entries.RemoveAt(i);
+                        }
+                    }
+
+                    if (entries.Count == 0)
+                    {
+                        _sourceGeneratedIndex.Remove(key);
+                    }
+                }
+            }
+            else
+            {
+                AddOrUpdateSourceGeneratedEntry(_sourceGeneratedIndex, key, path, isDebug);
+            }
+
+            _sourceGeneratedIndexHasIncrementalUpdates = true;
+        }
+
+        Interlocked.Increment(ref _sourceGeneratedIndexIncrementalUpdates);
+        return true;
+    }
+
+    private static bool TryParseSourceGeneratedPath(string path, out string key, out bool isDebug)
+    {
+        key = "";
+        isDebug = false;
+
+        var normalized = path.Replace('\\', '/');
+        var objIndex = normalized.IndexOf("/obj/", StringComparison.OrdinalIgnoreCase);
+        if (objIndex < 0)
+        {
+            return false;
+        }
+
+        var afterObj = normalized[(objIndex + 5)..];
+        var segments = afterObj.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        var generatedIndex = -1;
+        for (var i = 0; i < segments.Length; i++)
+        {
+            if (segments[i].Equals("generated", StringComparison.OrdinalIgnoreCase))
+            {
+                generatedIndex = i;
+                break;
+            }
+        }
+
+        if (generatedIndex < 0 || segments.Length < generatedIndex + 4)
+        {
+            return false;
+        }
+
+        var config = segments[0];
+        isDebug = config.Equals("Debug", StringComparison.OrdinalIgnoreCase);
+
+        var assemblyName = segments[generatedIndex + 1];
+        var typeName = segments[generatedIndex + 2];
+        var hintName = segments[generatedIndex + 3];
+
+        if (string.IsNullOrEmpty(assemblyName) ||
+            string.IsNullOrEmpty(typeName) ||
+            string.IsNullOrEmpty(hintName))
+        {
+            return false;
+        }
+
+        key = MakeSourceGeneratedKey(assemblyName, typeName, hintName);
+        return true;
     }
 
     private object CreateRoslynInitParams(InitializeParams? clientParams)
@@ -3080,6 +3261,7 @@ public class RazorLanguageServer : IAsyncDisposable
             {
                 if (File.Exists(cachedPath))
                 {
+                    Interlocked.Increment(ref _sourceGeneratedCacheHits);
                     filePath = cachedPath;
                     return true;
                 }
@@ -3111,10 +3293,12 @@ public class RazorLanguageServer : IAsyncDisposable
                 {
                     _sourceGeneratedUriCache[uri] = found;
                 }
+                Interlocked.Increment(ref _sourceGeneratedCacheMisses);
                 _logger.LogDebug("Mapped source generated URI {Uri} to {FilePath}", uri, filePath);
                 return true;
             }
 
+            Interlocked.Increment(ref _sourceGeneratedCacheMisses);
             _logger.LogDebug("No generated file found for URI: {Uri}", uri);
             return false;
         }
@@ -3154,8 +3338,9 @@ public class RazorLanguageServer : IAsyncDisposable
 
         lock (_sourceGeneratedCacheLock)
         {
-            shouldRefresh = !_sourceGeneratedIndexBuilt ||
-                            (now - _sourceGeneratedIndexLastScan) > SourceGeneratedIndexRefreshInterval;
+            shouldRefresh = (!_sourceGeneratedIndexHasFullScan && !_sourceGeneratedIndexHasIncrementalUpdates) ||
+                            (_sourceGeneratedIndexHasFullScan &&
+                             (now - _sourceGeneratedIndexLastFullScan) > SourceGeneratedIndexRefreshInterval);
 
             if (_sourceGeneratedIndex.TryGetValue(key, out entries))
             {
@@ -3299,6 +3484,55 @@ public class RazorLanguageServer : IAsyncDisposable
         return false;
     }
 
+    private IEnumerable<string> EnumerateObjDirectories(string rootPath)
+    {
+        var pending = new Stack<string>();
+        pending.Push(rootPath);
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            IEnumerable<string> directories;
+            try
+            {
+                directories = Directory.EnumerateDirectories(current, "*", SourceGeneratedEnumerateOptions);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Error scanning directories under {Path}", current);
+                continue;
+            }
+
+            foreach (var dir in directories)
+            {
+                var name = Path.GetFileName(dir);
+                if (string.IsNullOrEmpty(name))
+                {
+                    continue;
+                }
+
+                if (name.Equals("obj", StringComparison.OrdinalIgnoreCase))
+                {
+                    yield return dir;
+                    continue;
+                }
+
+                if (_workspaceManager.ShouldSkipDirectory(rootPath, dir, name))
+                {
+                    continue;
+                }
+
+                pending.Push(dir);
+            }
+        }
+    }
+
+    internal IEnumerable<string> EnumerateObjDirectoriesForTests(string rootPath)
+        => EnumerateObjDirectories(rootPath);
+
+    internal void ConfigureExcludedDirectoriesForTests(string[]? overrideDirectories, string[]? additionalDirectories)
+        => _workspaceManager.ConfigureExcludedDirectories(overrideDirectories, additionalDirectories);
+
     private void RefreshSourceGeneratedIndex()
     {
         if (_workspaceRoot == null)
@@ -3313,18 +3547,21 @@ public class RazorLanguageServer : IAsyncDisposable
 
         try
         {
+            Interlocked.Increment(ref _sourceGeneratedIndexRefreshes);
             var newIndex = new Dictionary<string, List<SourceGeneratedEntry>>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var objDir in Directory.EnumerateDirectories(_workspaceRoot, "obj", SearchOption.AllDirectories))
+            var ct = _lifetimeCts.Token;
+            foreach (var objDir in EnumerateObjDirectories(_workspaceRoot))
             {
+                ct.ThrowIfCancellationRequested();
                 try
                 {
-                    foreach (var configDir in Directory.EnumerateDirectories(objDir))
+                    foreach (var configDir in Directory.EnumerateDirectories(objDir, "*", SourceGeneratedEnumerateOptions))
                     {
                         var configName = Path.GetFileName(configDir);
                         var isDebug = string.Equals(configName, "Debug", StringComparison.OrdinalIgnoreCase);
 
-                        foreach (var tfmDir in Directory.EnumerateDirectories(configDir))
+                        foreach (var tfmDir in Directory.EnumerateDirectories(configDir, "*", SourceGeneratedEnumerateOptions))
                         {
                             var generatedRoot = Path.Combine(tfmDir, "generated");
                             if (!Directory.Exists(generatedRoot))
@@ -3332,7 +3569,7 @@ public class RazorLanguageServer : IAsyncDisposable
                                 continue;
                             }
 
-                            foreach (var assemblyDir in Directory.EnumerateDirectories(generatedRoot))
+                            foreach (var assemblyDir in Directory.EnumerateDirectories(generatedRoot, "*", SourceGeneratedEnumerateOptions))
                             {
                                 var assemblyName = Path.GetFileName(assemblyDir);
                                 if (string.IsNullOrEmpty(assemblyName))
@@ -3340,7 +3577,7 @@ public class RazorLanguageServer : IAsyncDisposable
                                     continue;
                                 }
 
-                                foreach (var typeDir in Directory.EnumerateDirectories(assemblyDir))
+                                foreach (var typeDir in Directory.EnumerateDirectories(assemblyDir, "*", SourceGeneratedEnumerateOptions))
                                 {
                                     var typeName = Path.GetFileName(typeDir);
                                     if (string.IsNullOrEmpty(typeName))
@@ -3348,8 +3585,9 @@ public class RazorLanguageServer : IAsyncDisposable
                                         continue;
                                     }
 
-                                    foreach (var file in Directory.EnumerateFiles(typeDir))
+                                    foreach (var file in Directory.EnumerateFiles(typeDir, "*", SourceGeneratedEnumerateOptions))
                                     {
+                                        ct.ThrowIfCancellationRequested();
                                         var hintName = Path.GetFileName(file);
                                         if (string.IsNullOrEmpty(hintName))
                                         {
@@ -3378,8 +3616,9 @@ public class RazorLanguageServer : IAsyncDisposable
                 {
                     _sourceGeneratedIndex[kvp.Key] = kvp.Value;
                 }
-                _sourceGeneratedIndexBuilt = true;
-                _sourceGeneratedIndexLastScan = scanTime;
+                _sourceGeneratedIndexHasFullScan = true;
+                _sourceGeneratedIndexLastFullScan = scanTime;
+                _sourceGeneratedIndexHasIncrementalUpdates = false;
             }
         }
         catch (Exception ex)
@@ -3456,6 +3695,9 @@ public class RazorLanguageServer : IAsyncDisposable
 
         await _htmlClient.DisposeAsync();
 
+        _lifetimeCts.Cancel();
+        _lifetimeCts.Dispose();
+
         lock (_workspaceReloadLock)
         {
             _workspaceReloadCts?.Cancel();
@@ -3488,6 +3730,27 @@ public class RazorLanguageServer : IAsyncDisposable
             // Ignore shutdown errors
         }
         _notificationCts.Dispose();
+
+        LogTelemetrySummary();
+    }
+
+    private void LogTelemetrySummary()
+    {
+        if (!_logger.IsEnabled(LogLevel.Debug))
+        {
+            return;
+        }
+
+        _logger.LogDebug(
+            "Telemetry: droppedRoslynNotifications={DroppedNotifications}, roslynRequestTimeouts={RequestTimeouts}, " +
+            "sourceGeneratedCacheHits={CacheHits}, sourceGeneratedCacheMisses={CacheMisses}, " +
+            "sourceGeneratedIndexRefreshes={IndexRefreshes}, sourceGeneratedIndexIncrementalUpdates={IncrementalUpdates}",
+            Interlocked.Read(ref _droppedRoslynNotifications),
+            Interlocked.Read(ref _roslynRequestTimeouts),
+            Interlocked.Read(ref _sourceGeneratedCacheHits),
+            Interlocked.Read(ref _sourceGeneratedCacheMisses),
+            Interlocked.Read(ref _sourceGeneratedIndexRefreshes),
+            Interlocked.Read(ref _sourceGeneratedIndexIncrementalUpdates));
     }
 }
 

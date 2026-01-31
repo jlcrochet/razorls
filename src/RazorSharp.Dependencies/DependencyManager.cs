@@ -14,6 +14,10 @@ public class DependencyManager : IDisposable
     readonly string _basePath;
     readonly HttpClient _httpClient;
     bool _disposed;
+    static readonly bool IsCaseInsensitiveFileSystem = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
+    static readonly TimeSpan DefaultDownloadTimeout = TimeSpan.FromMinutes(10);
+    const int MaxDownloadRetries = 3;
+    long _downloadRetryCount;
 
     // Roslyn Language Server version from Crashdummyy/roslynLanguageServer
     // This provides platform-specific builds that actually work
@@ -28,6 +32,7 @@ public class DependencyManager : IDisposable
         _basePath = basePath ?? GetDefaultBasePath();
         _httpClient = new HttpClient();
         _httpClient.DefaultRequestHeaders.Add("User-Agent", $"RazorSharp/{version}");
+        _httpClient.Timeout = DefaultDownloadTimeout;
     }
 
     public string BasePath => _basePath;
@@ -94,6 +99,10 @@ public class DependencyManager : IDisposable
             SaveVersionInfo(expectedVersion);
 
             _logger.LogInformation("Dependencies downloaded successfully");
+            if (_downloadRetryCount > 0)
+            {
+                _logger.LogInformation("Dependency downloads retried {RetryCount} time(s)", _downloadRetryCount);
+            }
             onProgress?.Invoke("Dependencies downloaded successfully");
             return true;
         }
@@ -144,7 +153,7 @@ public class DependencyManager : IDisposable
             Directory.CreateDirectory(RoslynPath);
 
             // Extract to roslyn directory
-            await Task.Run(() => ZipFile.ExtractToDirectory(tempZipPath, RoslynPath), cancellationToken);
+            await Task.Run(() => ExtractZipToDirectorySafe(tempZipPath, RoslynPath), cancellationToken);
 
             _logger.LogInformation("Extracted Roslyn language server to {Path}", RoslynPath);
         }
@@ -183,36 +192,85 @@ public class DependencyManager : IDisposable
 
     private async Task DownloadFileAsync(string url, string destinationPath, CancellationToken cancellationToken, Action<int>? onProgress = null)
     {
-        using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        var totalBytes = response.Content.Headers.ContentLength;
-        await using var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        await using var fileStream = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None);
-
-        var buffer = new byte[81920];
-        long totalRead = 0;
-        int bytesRead;
-        int lastLoggedPercent = -10; // Start at -10 so first 0% gets logged
-
-        while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken)) > 0)
+        var attempt = 0;
+        while (true)
         {
-            await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
-            totalRead += bytesRead;
-
-            if (totalBytes.HasValue && totalBytes.Value > 0)
+            attempt++;
+            try
             {
-                var percent = (int)(totalRead * 100 / totalBytes.Value);
-                // Only log/report every 10% to avoid spamming
-                if (percent >= lastLoggedPercent + 10)
+                using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+                response.EnsureSuccessStatusCode();
+
+                var totalBytes = response.Content.Headers.ContentLength;
+                await using var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                await using var fileStream = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None);
+
+                var buffer = new byte[81920];
+                long totalRead = 0;
+                int bytesRead;
+                int lastLoggedPercent = -10; // Start at -10 so first 0% gets logged
+
+                while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken)) > 0)
                 {
-                    _logger.LogDebug("Download progress: {Percent}%", percent);
-                    onProgress?.Invoke(percent);
-                    lastLoggedPercent = percent;
+                    await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+                    totalRead += bytesRead;
+
+                    if (totalBytes.HasValue && totalBytes.Value > 0)
+                    {
+                        var percent = (int)(totalRead * 100 / totalBytes.Value);
+                        // Only log/report every 10% to avoid spamming
+                        if (percent >= lastLoggedPercent + 10)
+                        {
+                            _logger.LogDebug("Download progress: {Percent}%", percent);
+                            onProgress?.Invoke(percent);
+                            lastLoggedPercent = percent;
+                        }
+                    }
                 }
+
+                return;
+            }
+            catch (Exception ex) when (IsTransientDownloadFailure(ex, cancellationToken) && attempt < MaxDownloadRetries)
+            {
+                Interlocked.Increment(ref _downloadRetryCount);
+                TryDeleteFile(destinationPath);
+                var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt - 1));
+                _logger.LogWarning(ex, "Download failed, retrying in {Delay} (attempt {Attempt}/{MaxAttempts})", delay, attempt, MaxDownloadRetries);
+                await Task.Delay(delay, cancellationToken);
+            }
+            catch
+            {
+                TryDeleteFile(destinationPath);
+                throw;
             }
         }
     }
+
+    private static bool IsTransientDownloadFailure(Exception ex, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+
+        return ex is HttpRequestException || ex is IOException || ex is TaskCanceledException;
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // Ignore cleanup errors
+        }
+    }
+
 
     private async Task ExtractRazorExtensionAsync(string zipPath, CancellationToken cancellationToken)
     {
@@ -222,7 +280,7 @@ public class DependencyManager : IDisposable
             _logger.LogInformation("Extracting Razor extension...");
 
             // VSIX is just a ZIP file
-            await Task.Run(() => ZipFile.ExtractToDirectory(zipPath, tempExtractPath), cancellationToken);
+            await Task.Run(() => ExtractZipToDirectorySafe(zipPath, tempExtractPath), cancellationToken);
 
             // Find and copy Razor extension
             var razorSource = Path.Combine(tempExtractPath, "extension", ".razorExtension");
@@ -263,6 +321,54 @@ public class DependencyManager : IDisposable
         {
             var destDir = Path.Combine(destinationDir, Path.GetFileName(dir));
             CopyDirectory(dir, destDir);
+        }
+    }
+
+    internal static void ExtractZipToDirectorySafe(string zipPath, string destinationPath)
+    {
+        Directory.CreateDirectory(destinationPath);
+
+        var destinationFullPath = Path.GetFullPath(destinationPath);
+        if (!destinationFullPath.EndsWith(Path.DirectorySeparatorChar))
+        {
+            destinationFullPath += Path.DirectorySeparatorChar;
+        }
+
+        var comparison = IsCaseInsensitiveFileSystem ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+        using var archive = ZipFile.OpenRead(zipPath);
+        foreach (var entry in archive.Entries)
+        {
+            if (string.IsNullOrEmpty(entry.FullName))
+            {
+                continue;
+            }
+
+            var entryPath = entry.FullName.Replace('\\', '/').TrimStart('/');
+            if (string.IsNullOrEmpty(entryPath))
+            {
+                continue;
+            }
+
+            var destinationFilePath = Path.GetFullPath(Path.Combine(destinationPath, entryPath));
+            if (!destinationFilePath.StartsWith(destinationFullPath, comparison))
+            {
+                throw new InvalidOperationException($"Zip entry is outside destination: {entry.FullName}");
+            }
+
+            if (entry.FullName.EndsWith("/", StringComparison.Ordinal) || entry.Name.Length == 0)
+            {
+                Directory.CreateDirectory(destinationFilePath);
+                continue;
+            }
+
+            var destinationDirectory = Path.GetDirectoryName(destinationFilePath);
+            if (!string.IsNullOrEmpty(destinationDirectory))
+            {
+                Directory.CreateDirectory(destinationDirectory);
+            }
+
+            entry.ExtractToFile(destinationFilePath, overwrite: true);
         }
     }
 

@@ -153,7 +153,7 @@ public class WorkspaceManager
         }
     }
 
-    bool ShouldSkipDirectory(string rootPath, string directoryPath, string? directoryName = null)
+    internal bool ShouldSkipDirectory(string rootPath, string directoryPath, string? directoryName = null)
     {
         var name = directoryName ?? Path.GetFileName(directoryPath);
         if (_excludedDirectoryNames.Contains(name))

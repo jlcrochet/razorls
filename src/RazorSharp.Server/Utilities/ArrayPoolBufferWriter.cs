@@ -10,6 +10,7 @@ namespace RazorSharp.Server.Utilities;
 public sealed class ArrayPoolBufferWriter : IBufferWriter<byte>, IDisposable
 {
     const int DefaultInitialCapacity = 256;
+    const int MaxRetainedBufferSize = 1024 * 1024;
     static readonly ArrayPool<byte> Pool = ArrayPool<byte>.Shared;
 
     byte[] _buffer;
@@ -49,6 +50,16 @@ public sealed class ArrayPoolBufferWriter : IBufferWriter<byte>, IDisposable
     /// </summary>
     public void Reset()
     {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(ArrayPoolBufferWriter));
+        }
+
+        if (_buffer.Length > MaxRetainedBufferSize)
+        {
+            Pool.Return(_buffer);
+            _buffer = Pool.Rent(DefaultInitialCapacity);
+        }
         _written = 0;
     }
 

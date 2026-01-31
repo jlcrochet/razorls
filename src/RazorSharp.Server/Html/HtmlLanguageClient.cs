@@ -22,7 +22,9 @@ public class HtmlLanguageClient : IAsyncDisposable
     bool _disposed;
     bool _enabled = true;
     bool _startAttempted;
+    bool _restartAttempted;
     string? _rootUri;
+    Func<object, Task>? _didOpenOverrideForTests;
 
     // Track HTML projections by checksum (Roslyn uses checksums to identify HTML versions)
     readonly Dictionary<string, HtmlProjection> _projections = new();
@@ -71,6 +73,22 @@ public class HtmlLanguageClient : IAsyncDisposable
     /// </summary>
     private async Task EnsureStartedAsync(CancellationToken cancellationToken)
     {
+        if (_process != null && _process.HasExited)
+        {
+            await _startLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (_process != null && _process.HasExited)
+                {
+                    HandleHtmlServerExit("process exited unexpectedly");
+                }
+            }
+            finally
+            {
+                _startLock.Release();
+            }
+        }
+
         if (!_enabled || _initialized || _startAttempted)
             return;
 
@@ -212,6 +230,18 @@ public class HtmlLanguageClient : IAsyncDisposable
 
             _initialized = true;
             _logger.LogInformation("HTML language server initialized");
+            try
+            {
+                await OpenCachedProjectionsAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to open cached HTML projections");
+            }
         }
         catch (Exception ex)
         {
@@ -237,12 +267,26 @@ public class HtmlLanguageClient : IAsyncDisposable
             return;
         }
 
+        if (_process != null && _process.HasExited)
+        {
+            HandleHtmlServerExit("process exited unexpectedly");
+            await EnsureStartedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         // Store the projection even if HTML LS failed to start
         if (_rpc == null || !_initialized)
         {
             lock (_projectionsLock)
             {
-                _projections[checksum] = new HtmlProjection(razorUri, checksum, 1);
+                if (_razorUriToChecksum.TryGetValue(razorUri, out var existingChecksum))
+                {
+                    if (!string.Equals(existingChecksum, checksum, StringComparison.Ordinal))
+                    {
+                        _projections.Remove(existingChecksum);
+                    }
+                }
+
+                _projections[checksum] = new HtmlProjection(razorUri, checksum, 1, htmlContent);
                 _razorUriToChecksum[razorUri] = checksum;
             }
             return;
@@ -267,34 +311,123 @@ public class HtmlLanguageClient : IAsyncDisposable
                 _projections.Remove(existingByUri.Checksum);
             }
 
-            _projections[checksum] = new HtmlProjection(razorUri, checksum, newVersion);
+            _projections[checksum] = new HtmlProjection(razorUri, checksum, newVersion, Content: null);
             _razorUriToChecksum[razorUri] = checksum;
         }
 
         if (existingByUri != null)
         {
-            await _rpc.NotifyWithParameterObjectAsync("textDocument/didChange", new
+            try
             {
-                textDocument = new { uri = virtualUri, version = newVersion },
-                contentChanges = new[] { new { text = htmlContent } }
-            }).ConfigureAwait(false);
+                await _rpc.NotifyWithParameterObjectAsync("textDocument/didChange", new
+                {
+                    textDocument = new { uri = virtualUri, version = newVersion },
+                    contentChanges = new[] { new { text = htmlContent } }
+                }).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                HandleHtmlServerExit("send failed", ex);
+                return;
+            }
 
             _logger.LogDebug("Updated HTML projection for {Uri} (checksum: {Checksum})", razorUri, checksum);
         }
         else
         {
-            await _rpc.NotifyWithParameterObjectAsync("textDocument/didOpen", new
+            try
+            {
+                await _rpc.NotifyWithParameterObjectAsync("textDocument/didOpen", new
+                {
+                    textDocument = new
+                    {
+                        uri = virtualUri,
+                        languageId = "html",
+                        version = 1,
+                        text = htmlContent
+                    }
+                }).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                HandleHtmlServerExit("send failed", ex);
+                return;
+            }
+
+            _logger.LogDebug("Opened HTML projection for {Uri} (checksum: {Checksum})", razorUri, checksum);
+        }
+    }
+
+    private async Task OpenCachedProjectionsAsync(CancellationToken cancellationToken)
+    {
+        if (!_initialized)
+        {
+            return;
+        }
+
+        if (_rpc == null && _didOpenOverrideForTests == null)
+        {
+            return;
+        }
+
+        List<HtmlProjection>? cached = null;
+        List<string>? keysToClear = null;
+        lock (_projectionsLock)
+        {
+            foreach (var kvp in _projections)
+            {
+                if (kvp.Value.Content == null)
+                {
+                    continue;
+                }
+
+                cached ??= new List<HtmlProjection>();
+                cached.Add(kvp.Value);
+
+                keysToClear ??= new List<string>();
+                keysToClear.Add(kvp.Key);
+            }
+
+            if (keysToClear != null)
+            {
+                foreach (var key in keysToClear)
+                {
+                    if (_projections.TryGetValue(key, out var projection))
+                    {
+                        _projections[key] = projection with { Content = null };
+                    }
+                }
+            }
+        }
+
+        if (cached == null)
+        {
+            return;
+        }
+
+        foreach (var projection in cached)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var virtualUri = GetVirtualHtmlUri(projection.RazorUri);
+            var payload = new
             {
                 textDocument = new
                 {
                     uri = virtualUri,
                     languageId = "html",
-                    version = 1,
-                    text = htmlContent
+                    version = projection.Version,
+                    text = projection.Content
                 }
-            }).ConfigureAwait(false);
+            };
 
-            _logger.LogDebug("Opened HTML projection for {Uri} (checksum: {Checksum})", razorUri, checksum);
+            if (_didOpenOverrideForTests != null)
+            {
+                await _didOpenOverrideForTests(payload).ConfigureAwait(false);
+            }
+            else
+            {
+                await _rpc!.NotifyWithParameterObjectAsync("textDocument/didOpen", payload).ConfigureAwait(false);
+            }
         }
     }
 
@@ -303,7 +436,13 @@ public class HtmlLanguageClient : IAsyncDisposable
     /// </summary>
     public async Task<JsonElement?> FormatAsync(string razorUri, string checksum, JsonElement options, CancellationToken cancellationToken)
     {
-        if (!_enabled || _rpc == null || !_initialized)
+        if (!_enabled)
+        {
+            return null;
+        }
+
+        await EnsureStartedAsync(cancellationToken).ConfigureAwait(false);
+        if (_rpc == null || !_initialized)
         {
             _logger.LogDebug("HTML LS not available for formatting");
             return null;
@@ -358,7 +497,13 @@ public class HtmlLanguageClient : IAsyncDisposable
         JsonElement options,
         CancellationToken cancellationToken)
     {
-        if (!_enabled || _rpc == null || !_initialized)
+        if (!_enabled)
+        {
+            return null;
+        }
+
+        await EnsureStartedAsync(cancellationToken).ConfigureAwait(false);
+        if (_rpc == null || !_initialized)
         {
             return null;
         }
@@ -425,6 +570,39 @@ public class HtmlLanguageClient : IAsyncDisposable
             return null;
         }
     }
+
+    internal void SetDidOpenOverrideForTests(Func<object, Task> overrideFunc)
+    {
+        _didOpenOverrideForTests = overrideFunc;
+    }
+
+    internal void SetInitializedForTests(bool initialized)
+    {
+        _initialized = initialized;
+    }
+
+    internal void SetStartAttemptedForTests(bool attempted = true)
+    {
+        _startAttempted = attempted;
+    }
+
+    internal Task FlushCachedProjectionsForTestsAsync(CancellationToken cancellationToken = default)
+    {
+        return OpenCachedProjectionsAsync(cancellationToken);
+    }
+
+    internal void TriggerHtmlServerExitForTests()
+    {
+        HandleHtmlServerExit("test");
+    }
+
+    internal bool IsRestartAttemptedForTests() => _restartAttempted;
+
+    internal bool IsEnabledForTests() => _enabled;
+
+    internal bool IsInitializedForTests() => _initialized;
+
+    internal bool IsStartAttemptedForTests() => _startAttempted;
 
     private static string GetVirtualHtmlUri(string razorUri)
     {
@@ -543,6 +721,48 @@ public class HtmlLanguageClient : IAsyncDisposable
         return null;
     }
 
+    private void HandleHtmlServerExit(string reason, Exception? ex = null)
+    {
+        _initialized = false;
+        _startAttempted = false;
+
+        _rpc?.Dispose();
+        _rpc = null;
+
+        if (_process != null)
+        {
+            try
+            {
+                if (!_process.HasExited)
+                {
+                    _process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+                // Ignore
+            }
+            _process.Dispose();
+            _process = null;
+        }
+
+        if (_restartAttempted)
+        {
+            DisableHtmlServer($"HTML language server disabled after restart attempt ({reason}).", ex);
+            return;
+        }
+
+        _restartAttempted = true;
+        if (ex != null)
+        {
+            _logger.LogWarning(ex, "HTML language server exited; attempting one restart ({Reason})", reason);
+        }
+        else
+        {
+            _logger.LogWarning("HTML language server exited; attempting one restart ({Reason})", reason);
+        }
+    }
+
     private void DisableHtmlServer(string reason, Exception? ex = null)
     {
         _enabled = false;
@@ -654,4 +874,4 @@ public class HtmlLanguageClient : IAsyncDisposable
 /// <summary>
 /// Represents an HTML projection of a Razor document.
 /// </summary>
-public record HtmlProjection(string RazorUri, string Checksum, int Version);
+public record HtmlProjection(string RazorUri, string Checksum, int Version, string? Content);

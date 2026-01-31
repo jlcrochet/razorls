@@ -55,6 +55,8 @@ dotnet /path/to/razorsharp --download-dependencies
 
 This only needs to be done once. Dependencies are cached in `~/.cache/razorsharp/` (see [Dependencies Cache](#dependencies-cache)).
 
+Downloads use a small retry/backoff for transient network failures.
+
 ### Options
 
 | Option | Description |
@@ -190,6 +192,7 @@ You can also set `OMNISHARPHOME` environment variable to specify a custom global
 | `RoslynExtensionsOptions` | Analyzers, completion, inlay hints |
 | `RoslynExtensionsOptions.inlayHintsOptions` | Parameter and type hint settings |
 | `RenameOptions` | Rename refactoring behavior |
+
 
 ### HTML Language Server
 

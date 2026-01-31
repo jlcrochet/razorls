@@ -9,6 +9,7 @@ namespace RazorSharp.Server.Utilities;
 public static class ListPool<T>
 {
     const int MaxPoolSize = 16;
+    const int MaxRetainedCapacity = 8192;
     static readonly ConcurrentBag<List<T>> Pool = new();
 
     /// <summary>
@@ -45,7 +46,7 @@ public static class ListPool<T>
     /// </summary>
     public static void Return(List<T> list)
     {
-        if (Pool.Count >= MaxPoolSize)
+        if (list.Capacity > MaxRetainedCapacity || Pool.Count >= MaxPoolSize)
         {
             // Pool is full, let GC handle this one
             list.Clear();
