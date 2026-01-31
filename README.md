@@ -8,6 +8,34 @@ I made this because I didn't want to wait for Microsoft to release an official s
 
 By the way, if you're looking for a Tree-sitter parser for Razor files, check out [mine](https://github.com/jlcrochet/tree-sitter-razor).
 
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Compatibility](#compatibility)
+- [Editor Integration](#editor-integration)
+- [Configuration](#configuration)
+- [HTML Language Server](#html-language-server)
+- [Performance Tips](#performance-tips)
+- [Troubleshooting](#troubleshooting)
+- [Versioning](#versioning)
+
+## Quick Start
+
+```bash
+# Download dependencies (one-time)
+dotnet /path/to/razorsharp --download-dependencies
+
+# Run the server
+dotnet /path/to/razorsharp
+```
+
+Then configure your editor to:
+1. Run `dotnet /path/to/razorsharp`
+2. Use `stdio` transport
+3. Associate with `.cs`, `.razor`, and `.cshtml`
+
 ## Installation
 
 ### Requirements
@@ -80,6 +108,12 @@ RazorSharp aims to be a drop-in replacement for OmniSharp for C# workflows while
 - **Configuration:** Uses `omnisharp.json` in the same locations and precedence as OmniSharp for Roslyn settings.
 - **Behavior:** Proxies Roslyn Language Server features to provide C# language services compatible with common OmniSharp clients.
 - **Extensions:** Adds Razor/HTML support and other RazorSharp-specific behavior via LSP `initializationOptions`.
+
+### Feature Routing (Summary)
+
+- **C#** features are forwarded to Roslyn.
+- **Razor** features come from Roslyn’s Razor extension.
+- **HTML formatting** uses `vscode-html-language-server` when available.
 
 ## Editor Integration
 
@@ -192,6 +226,22 @@ You can also set `OMNISHARPHOME` environment variable to specify a custom global
 | `RoslynExtensionsOptions` | Analyzers, completion, inlay hints |
 | `RoslynExtensionsOptions.inlayHintsOptions` | Parameter and type hint settings |
 | `RenameOptions` | Rename refactoring behavior |
+
+## Performance Tips
+
+- Exclude large directories via `workspace.excludeDirectories`.
+- Enable file watching in `initializationOptions.workspace`.
+- Use `--loglevel Warning` or higher for normal use.
+
+## Troubleshooting
+
+- **Dependencies missing:** run `--download-dependencies` before starting the server.
+- **HTML formatting not working:** ensure Node.js and `vscode-langservers-extracted` are installed.
+- **Slow startup:** check workspace excludes and file watcher settings.
+
+## Versioning
+
+RazorSharp pins specific Roslyn and Razor extension versions in `DependencyManager`. Update those constants when you need newer tooling, and re-download dependencies.
 
 
 ### HTML Language Server
