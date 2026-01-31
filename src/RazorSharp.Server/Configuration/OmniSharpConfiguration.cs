@@ -109,6 +109,20 @@ public class WorkspaceOptions
     /// </summary>
     [JsonPropertyName("excludeDirectoriesOverride")]
     public string[]? ExcludeDirectoriesOverride { get; set; }
+
+    /// <summary>
+    /// Enable handling workspace/didChangeWatchedFiles notifications.
+    /// Default: true
+    /// </summary>
+    [JsonPropertyName("enableFileWatching")]
+    public bool? EnableFileWatching { get; set; }
+
+    /// <summary>
+    /// Enable dynamic registration for workspace/didChangeWatchedFiles.
+    /// Default: true
+    /// </summary>
+    [JsonPropertyName("enableFileWatchingRegistration")]
+    public bool? EnableFileWatchingRegistration { get; set; }
 }
 
 /// <summary>
