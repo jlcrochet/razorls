@@ -213,6 +213,29 @@ public class RoslynClient : IAsyncDisposable
                     }
                 }
             }
+            else if (idProp.ValueKind == JsonValueKind.String &&
+                     long.TryParse(idProp.GetString(), out var stringId))
+            {
+                if (_pendingRequests.TryRemove(stringId, out var tcs))
+                {
+                    if (root.TryGetProperty("result", out var result))
+                    {
+                        tcs.TrySetResult(result.Clone());
+                    }
+                    else if (root.TryGetProperty("error", out var error))
+                    {
+                        tcs.TrySetException(new Exception($"JSON-RPC error: {error}"));
+                    }
+                    else
+                    {
+                        tcs.TrySetResult(null);
+                    }
+                }
+            }
+            else
+            {
+                _logger.LogWarning("Received response from Roslyn with unsupported id type: {Kind}", idProp.ValueKind);
+            }
             return;
         }
 
