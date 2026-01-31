@@ -33,9 +33,11 @@ public class RazorLanguageServer : IAsyncDisposable
     InitializeParams? _initParams;
     InitializationOptions? _initOptions;
     string? _cliSolutionPath;
+    string? _workspaceOpenTarget;
     string? _workspaceRoot;
     string _logLevel = "Information";
     bool _disposed;
+    bool _fileWatchersRegistered;
     readonly TaskCompletionSource _roslynProjectInitialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
     DateTime _workspaceOpenedAt;
     readonly HashSet<string> _openDocuments = new(UriComparer);
@@ -48,6 +50,9 @@ public class RazorLanguageServer : IAsyncDisposable
     DateTime _sourceGeneratedIndexLastScan;
     bool _sourceGeneratedIndexBuilt;
     int _sourceGeneratedIndexRefreshInProgress;
+    readonly Lock _workspaceReloadLock = new();
+    CancellationTokenSource? _workspaceReloadCts;
+    Task? _workspaceReloadTask;
     WorkDoneProgressScope? _workspaceInitProgress;
     long _workDoneProgressCounter;
     Func<string, JsonElement, CancellationToken, Task<JsonElement?>>? _forwardToRoslynOverride;
@@ -59,6 +64,15 @@ public class RazorLanguageServer : IAsyncDisposable
     const int WorkDoneProgressCreateTimeoutMs = 2000;
     const int MaxFastStartDelayMs = 60000;
     const int MaxPendingChangesPerDocument = 200;
+    const int WorkspaceReloadDebounceMs = 1000;
+    const int FileWatchKindAll = 7;
+    const string FileWatchRegistrationId = "razorsharp.didChangeWatchedFiles";
+    const string OmniSharpConfigFileName = "omnisharp.json";
+    const string DirectoryBuildPropsFileName = "Directory.Build.props";
+    const string DirectoryBuildTargetsFileName = "Directory.Build.targets";
+    const string GlobalJsonFileName = "global.json";
+    const string SolutionFilterFileName = ".slnf";
+    const string SolutionXmlFileName = ".slnx";
     static readonly TimeSpan DefaultRoslynRequestTimeout = TimeSpan.FromSeconds(10);
     TimeSpan _roslynRequestTimeout = DefaultRoslynRequestTimeout;
     static readonly TimeSpan SourceGeneratedIndexRefreshInterval = TimeSpan.FromSeconds(60);
@@ -170,6 +184,8 @@ public class RazorLanguageServer : IAsyncDisposable
     public ConfigurationLoader ConfigurationLoader => _configurationLoader;
 
     private bool FastStartEnabled => _initOptions?.FastStart != false;
+    private bool FileWatchingEnabled => _initOptions?.Workspace?.EnableFileWatching != false;
+    private bool FileWatchingRegistrationEnabled => _initOptions?.Workspace?.EnableFileWatchingRegistration != false;
     private bool SupportsWorkDoneProgress => _initParams?.Capabilities?.Window?.WorkDoneProgress == true;
     private bool CanSendRoslynNotifications =>
         _forwardToRoslynNotificationOverride != null || _roslynClient?.IsRunning == true;
@@ -385,6 +401,15 @@ public class RazorLanguageServer : IAsyncDisposable
     {
         _logger.LogInformation("Client initialized");
 
+        if (FileWatchingEnabled && FileWatchingRegistrationEnabled)
+        {
+            _ = TryRegisterFileWatchersAsync();
+        }
+        else if (FileWatchingEnabled && !FileWatchingRegistrationEnabled)
+        {
+            _logger.LogInformation("Dynamic file watching registration disabled by initOptions; relying on client-side watchers.");
+        }
+
         if (_workspaceOpenedAt == default)
         {
             _workspaceOpenedAt = DateTime.UtcNow;
@@ -414,17 +439,24 @@ public class RazorLanguageServer : IAsyncDisposable
                         _cliSolutionPath,
                         _initParams?.RootUri,
                         _initParams?.WorkspaceFolders?.Length ?? 0);
+                    string? openTarget = null;
                     if (_cliSolutionPath != null)
                     {
-                        await OpenWorkspaceAsync(_cliSolutionPath);
+                        openTarget = _cliSolutionPath;
                     }
                     else if (_initParams?.RootUri != null)
                     {
-                        await OpenWorkspaceAsync(_initParams.RootUri);
+                        openTarget = _initParams.RootUri;
                     }
                     else if (_initParams?.WorkspaceFolders?.Length > 0)
                     {
-                        await OpenWorkspaceAsync(_initParams.WorkspaceFolders[0].Uri);
+                        openTarget = _initParams.WorkspaceFolders[0].Uri;
+                    }
+
+                    if (openTarget != null)
+                    {
+                        _workspaceOpenTarget = openTarget;
+                        await OpenWorkspaceAsync(openTarget);
                     }
 
                     _logger.LogDebug("Workspace opened, waiting for project initialization...");
@@ -773,6 +805,87 @@ public class RazorLanguageServer : IAsyncDisposable
         if (CanSendRoslynNotifications)
         {
             await SendRoslynNotificationAsync(LspMethods.TextDocumentDidSave, paramsJson);
+        }
+    }
+
+    #endregion
+
+    #region Workspace Notifications
+
+    [JsonRpcMethod(LspMethods.WorkspaceDidChangeWatchedFiles, UseSingleObjectParameterDeserialization = true)]
+    public async Task HandleDidChangeWatchedFilesAsync(JsonElement paramsJson)
+    {
+        if (!FileWatchingEnabled)
+        {
+            _logger.LogDebug("Ignoring workspace/didChangeWatchedFiles (disabled by initOptions).");
+            return;
+        }
+
+        var @params = JsonSerializer.Deserialize<DidChangeWatchedFilesParams>(paramsJson, JsonOptions);
+        if (@params?.Changes == null || @params.Changes.Length == 0)
+        {
+            return;
+        }
+
+        // Forward to Roslyn first so it can react immediately.
+        if (CanSendRoslynNotifications)
+        {
+            await SendRoslynNotificationAsync(LspMethods.WorkspaceDidChangeWatchedFiles, paramsJson);
+        }
+
+        var workspaceRoot = _workspaceRoot;
+        var localConfigPath = workspaceRoot != null
+            ? TryGetFullPath(Path.Combine(workspaceRoot, OmniSharpConfigFileName))
+            : null;
+        var globalConfigPath = TryGetGlobalOmniSharpConfigPath();
+
+        var configChanged = false;
+        var sourceGeneratedChanged = false;
+        var workspaceReloadNeeded = false;
+
+        foreach (var change in @params.Changes)
+        {
+            var localPath = TryGetLocalPath(change.Uri);
+            if (localPath == null)
+            {
+                continue;
+            }
+
+            if (!configChanged && IsOmniSharpConfigPath(localPath, localConfigPath, globalConfigPath))
+            {
+                configChanged = true;
+            }
+
+            if (!sourceGeneratedChanged && IsSourceGeneratedPath(localPath))
+            {
+                sourceGeneratedChanged = true;
+            }
+
+            if (!workspaceReloadNeeded && IsWorkspaceReloadTriggerPath(localPath))
+            {
+                workspaceReloadNeeded = true;
+            }
+        }
+
+        if (configChanged)
+        {
+            _logger.LogInformation("omnisharp.json changed; reloading configuration");
+            _configurationLoader.Reload();
+            if (CanSendRoslynNotifications)
+            {
+                await SendRoslynNotificationAsync(LspMethods.WorkspaceDidChangeConfiguration, new { settings = new { } });
+            }
+        }
+
+        if (sourceGeneratedChanged)
+        {
+            _logger.LogDebug("Source-generated files changed; refreshing index");
+            RefreshSourceGeneratedIndex();
+        }
+
+        if (workspaceReloadNeeded)
+        {
+            ScheduleWorkspaceReload();
         }
     }
 
@@ -2133,7 +2246,9 @@ public class RazorLanguageServer : IAsyncDisposable
         if (File.Exists(rootPath))
         {
             var extension = Path.GetExtension(rootPath);
-            if (extension.Equals(".sln", StringComparison.OrdinalIgnoreCase))
+            if (extension.Equals(".sln", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(SolutionFilterFileName, StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(SolutionXmlFileName, StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogInformation("Opening solution: {Solution}", rootPath);
                 await SendRoslynNotificationAsync(LspMethods.SolutionOpen, new SolutionOpenParams
@@ -2184,6 +2299,211 @@ public class RazorLanguageServer : IAsyncDisposable
                     Projects = projects.Select(p => new Uri(p).AbsoluteUri).ToArray()
                 });
             }
+        }
+    }
+
+    private async Task TryRegisterFileWatchersAsync()
+    {
+        if (_fileWatchersRegistered)
+        {
+            return;
+        }
+
+        var didChangeWatchedFiles = _initParams?.Capabilities?.Workspace?.DidChangeWatchedFiles;
+        if (didChangeWatchedFiles?.DynamicRegistration != true)
+        {
+            _logger.LogDebug("Client does not support dynamic didChangeWatchedFiles registration; skipping registration");
+            return;
+        }
+
+        var baseUri = TryGetWorkspaceBaseUri();
+        if (baseUri == null)
+        {
+            _logger.LogInformation("Workspace baseUri not available; file watchers will not be scoped to a workspace root.");
+        }
+
+        if (_clientRpc == null)
+        {
+            return;
+        }
+
+        var registrations = new[]
+        {
+            new
+            {
+                id = FileWatchRegistrationId,
+                method = LspMethods.WorkspaceDidChangeWatchedFiles,
+                registerOptions = new
+                {
+                    watchers = CreateFileWatchers(baseUri)
+                }
+            }
+        };
+
+        try
+        {
+            await _clientRpc.InvokeWithParameterObjectAsync<JsonElement?>(
+                "client/registerCapability",
+                new { registrations },
+                CancellationToken.None);
+            _fileWatchersRegistered = true;
+            _logger.LogInformation("Registered workspace/didChangeWatchedFiles with client");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to register workspace/didChangeWatchedFiles with client");
+        }
+    }
+
+    private static object[] CreateFileWatchers(string? baseUri)
+    {
+        return
+        [
+            CreateWatcher("**/*.sln", baseUri),
+            CreateWatcher("**/*.csproj", baseUri),
+            CreateWatcher($"**/{DirectoryBuildPropsFileName}", baseUri),
+            CreateWatcher($"**/{DirectoryBuildTargetsFileName}", baseUri),
+            CreateWatcher($"**/{GlobalJsonFileName}", baseUri),
+            CreateWatcher($"**/{OmniSharpConfigFileName}", baseUri),
+            CreateWatcher("**/*.razor", baseUri),
+            CreateWatcher("**/*.cshtml", baseUri),
+            CreateWatcher("**/*.razor.cs", baseUri),
+            CreateWatcher("**/*.cs", baseUri),
+            CreateWatcher("**/*.csproj.user", baseUri),
+            CreateWatcher("**/*.slnf", baseUri),
+            CreateWatcher("**/*.slnx", baseUri),
+            CreateWatcher("**/*.props", baseUri),
+            CreateWatcher("**/*.targets", baseUri),
+            CreateWatcher("**/.editorconfig", baseUri),
+            CreateWatcher("**/obj/**/generated/**", baseUri)
+        ];
+    }
+
+    private static object CreateWatcher(string pattern, string? baseUri)
+    {
+        if (!string.IsNullOrEmpty(baseUri))
+        {
+            return new
+            {
+                globPattern = new
+                {
+                    baseUri,
+                    pattern
+                },
+                kind = FileWatchKindAll
+            };
+        }
+
+        return new
+        {
+            globPattern = pattern,
+            kind = FileWatchKindAll
+        };
+    }
+
+    private void ScheduleWorkspaceReload()
+    {
+        var target = GetWorkspaceOpenTarget();
+        if (target == null || !CanSendRoslynNotifications)
+        {
+            return;
+        }
+
+        CancellationTokenSource cts;
+        lock (_workspaceReloadLock)
+        {
+            _workspaceReloadCts?.Cancel();
+            _workspaceReloadCts?.Dispose();
+            _workspaceReloadCts = new CancellationTokenSource();
+            cts = _workspaceReloadCts;
+        }
+
+        _workspaceReloadTask = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(WorkspaceReloadDebounceMs, cts.Token);
+                if (cts.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                _logger.LogInformation("Workspace files changed; re-opening workspace");
+                await OpenWorkspaceAsync(target);
+            }
+            catch (OperationCanceledException)
+            {
+                // Debounced by a newer change
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to re-open workspace after file changes");
+            }
+        }, cts.Token);
+    }
+
+    private string? GetWorkspaceOpenTarget()
+    {
+        if (!string.IsNullOrEmpty(_workspaceOpenTarget))
+        {
+            return _workspaceOpenTarget;
+        }
+
+        if (!string.IsNullOrEmpty(_cliSolutionPath))
+        {
+            return _cliSolutionPath;
+        }
+
+        if (_initParams?.RootUri != null)
+        {
+            return _initParams.RootUri;
+        }
+
+        if (_initParams?.WorkspaceFolders?.Length > 0)
+        {
+            return _initParams.WorkspaceFolders[0].Uri;
+        }
+
+        return _workspaceRoot;
+    }
+
+    private string? TryGetWorkspaceBaseUri()
+    {
+        var rootPath = _workspaceRoot;
+        if (string.IsNullOrWhiteSpace(rootPath))
+        {
+            var target = GetWorkspaceOpenTarget();
+            rootPath = target != null ? TryGetLocalPath(target) : null;
+        }
+
+        if (string.IsNullOrWhiteSpace(rootPath))
+        {
+            return null;
+        }
+
+        if (File.Exists(rootPath))
+        {
+            rootPath = Path.GetDirectoryName(rootPath);
+        }
+
+        if (string.IsNullOrWhiteSpace(rootPath))
+        {
+            return null;
+        }
+
+        var fullPath = TryGetFullPath(rootPath);
+        if (fullPath == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return new Uri(fullPath).AbsoluteUri;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -2240,6 +2560,85 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         return false;
+    }
+
+    private static string? TryGetGlobalOmniSharpConfigPath()
+    {
+        var omniSharpHome = Environment.GetEnvironmentVariable("OMNISHARPHOME");
+        if (!string.IsNullOrEmpty(omniSharpHome))
+        {
+            return TryGetFullPath(Path.Combine(omniSharpHome, OmniSharpConfigFileName));
+        }
+
+        var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!string.IsNullOrEmpty(homeDir))
+        {
+            return TryGetFullPath(Path.Combine(homeDir, ".omnisharp", OmniSharpConfigFileName));
+        }
+
+        return null;
+    }
+
+    private static string? TryGetFullPath(string path)
+    {
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsOmniSharpConfigPath(string path, string? localPath, string? globalPath)
+    {
+        if (localPath != null && path.Equals(localPath, UriComparison))
+        {
+            return true;
+        }
+
+        if (globalPath != null && path.Equals(globalPath, UriComparison))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsWorkspaceReloadTriggerPath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        if (extension.Equals(".sln", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(SolutionFilterFileName, StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(SolutionXmlFileName, StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".csproj", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".props", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".targets", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var fileName = Path.GetFileName(path);
+        return fileName.Equals(DirectoryBuildPropsFileName, StringComparison.OrdinalIgnoreCase) ||
+               fileName.Equals(DirectoryBuildTargetsFileName, StringComparison.OrdinalIgnoreCase) ||
+               fileName.Equals(GlobalJsonFileName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSourceGeneratedPath(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+        {
+            return false;
+        }
+
+        var normalized = path.Replace('\\', '/');
+        if (IsCaseInsensitiveFileSystem)
+        {
+            normalized = normalized.ToLowerInvariant();
+        }
+
+        return normalized.Contains("/obj/") && normalized.Contains("/generated/");
     }
 
     private object CreateRoslynInitParams(InitializeParams? clientParams)
@@ -3056,6 +3455,25 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         await _htmlClient.DisposeAsync();
+
+        lock (_workspaceReloadLock)
+        {
+            _workspaceReloadCts?.Cancel();
+            _workspaceReloadCts?.Dispose();
+            _workspaceReloadCts = null;
+        }
+
+        if (_workspaceReloadTask != null)
+        {
+            try
+            {
+                await _workspaceReloadTask.WaitAsync(TimeSpan.FromSeconds(1));
+            }
+            catch
+            {
+                // Ignore shutdown errors
+            }
+        }
 
         _clientRpc?.Dispose();
 

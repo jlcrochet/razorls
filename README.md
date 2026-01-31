@@ -269,6 +269,8 @@ RazorSharp supports configuration via LSP `initializationOptions`. In Helix, thi
 | `capabilities.diagnosticProvider.analyzerSemantic` | bool | `false` | Enable Roslyn analyzer semantic diagnostics |
 | `workspace.excludeDirectories` | string[] | `[]` | Additional directory names or glob patterns to skip during workspace search (supports `*` and `**`) |
 | `workspace.excludeDirectoriesOverride` | string[] | `null` | Replace the default excluded directory list (names or glob patterns) |
+| `workspace.enableFileWatching` | bool | `true` | Enable handling `workspace/didChangeWatchedFiles` notifications |
+| `workspace.enableFileWatchingRegistration` | bool | `true` | Dynamically register file watchers with the client (when supported) |
 | `roslyn.requestTimeoutMs` | int | `10000` | Timeout for Roslyn requests (ms). Set `<= 0` to disable. |
 
 #### Example: Fast-start with a delay
@@ -433,6 +435,40 @@ lspconfig.razorsharp.setup({
   }
 })
 ```
+
+#### Example: Disable dynamic file watcher registration
+
+If your editor already configures static file watchers, you can avoid duplicate notifications:
+
+**Helix:**
+```toml
+[language-server.razorsharp]
+command = "dotnet"
+args = ["/path/to/razorsharp.dll"]
+config.workspace.enableFileWatchingRegistration = false
+```
+
+**Neovim:**
+```lua
+lspconfig.razorsharp.setup({
+  init_options = {
+    workspace = {
+      enableFileWatchingRegistration = false
+    }
+  }
+})
+```
+
+By default, RazorSharp registers watchers (scoped to the workspace root when possible) for:
+
+- `**/*.sln`, `**/*.slnf`, `**/*.slnx`
+- `**/*.csproj`, `**/*.csproj.user`
+- `**/*.props`, `**/*.targets`, `**/Directory.Build.props`, `**/Directory.Build.targets`
+- `**/*.cs`, `**/*.razor`, `**/*.razor.cs`, `**/*.cshtml`
+- `**/.editorconfig`
+- `**/global.json`
+- `**/omnisharp.json`
+- `**/obj/**/generated/**`
 
 ## Architecture
 

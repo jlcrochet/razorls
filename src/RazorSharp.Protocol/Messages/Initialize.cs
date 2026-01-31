@@ -227,7 +227,11 @@ public record GeneralClientCapabilities
 // Stub records for capabilities - implement as needed
 public record WorkspaceEditClientCapabilities;
 public record DidChangeConfigurationClientCapabilities;
-public record DidChangeWatchedFilesClientCapabilities;
+public record DidChangeWatchedFilesClientCapabilities
+{
+    [JsonPropertyName("dynamicRegistration")]
+    public bool? DynamicRegistration { get; init; }
+}
 public record WorkspaceSymbolClientCapabilities;
 public record ExecuteCommandClientCapabilities;
 public record SemanticTokensWorkspaceClientCapabilities;
