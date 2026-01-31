@@ -28,7 +28,7 @@ By the way, if you're looking for a Tree-sitter parser for Razor files, check ou
 dotnet /path/to/razorsharp --download-dependencies
 
 # Run the server
-dotnet /path/to/razorsharp
+dotnet /path/to/razorsharp.dll
 ```
 
 Then configure your editor to:
@@ -82,6 +82,8 @@ dotnet /path/to/razorsharp --download-dependencies
 ```
 
 This only needs to be done once. Dependencies are cached in `~/.cache/razorsharp/` (see [Dependencies Cache](#dependencies-cache)).
+
+If you have an apphost binary (`razorsharp`), you can run it directly instead of `dotnet`.
 
 Downloads use a small retry/backoff for transient network failures.
 
@@ -163,7 +165,7 @@ roots = ["obj", "bin", ".git", "global.json"]
 ### Other Editors
 
 Configure your editor's LSP client to:
-1. Run `dotnet /path/to/razorsharp`
+1. Run `dotnet /path/to/razorsharp.dll`
 2. Use `stdio` transport
 3. Associate with `.cs`, `.razor`, and `.cshtml` files
 
