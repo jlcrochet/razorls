@@ -36,6 +36,21 @@ public class RazorLanguageServer : IAsyncDisposable
     string? _workspaceOpenTarget;
     string? _workspaceRoot;
     string _logLevel = "Information";
+    bool _skipDependencyCheck;
+    bool _autoUpdateEnabledFromCli = true;
+    bool _autoUpdateEnabled = true;
+    TimeSpan _autoUpdateInterval = TimeSpan.FromHours(24);
+    Task? _autoUpdateTask;
+    readonly Lock _autoUpdateLock = new();
+    Task? _dependencyDownloadTask;
+    readonly Lock _dependencyDownloadLock = new();
+    bool _dependenciesMissing;
+    bool _skipDependencyCheckSetByCli;
+    bool _forceUpdateCheck;
+    LoggingLevelSwitch? _loggingLevelSwitch;
+    LogFileSwitch? _logFileSwitch;
+    bool _logLevelSetByCli;
+    bool _logFileSetByCli;
     bool _disposed;
     bool _fileWatchersRegistered;
     readonly TaskCompletionSource _roslynProjectInitialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -52,28 +67,38 @@ public class RazorLanguageServer : IAsyncDisposable
     bool _sourceGeneratedIndexHasIncrementalUpdates;
     int _sourceGeneratedIndexRefreshInProgress;
     readonly Lock _workspaceReloadLock = new();
+    readonly Lock _workspaceInitLock = new();
     CancellationTokenSource? _workspaceReloadCts;
     Task? _workspaceReloadTask;
     WorkDoneProgressScope? _workspaceInitProgress;
+    bool _workspaceInitStarted;
+    readonly Lock _roslynStartLock = new();
+    Task<bool>? _roslynStartTask;
     long _workDoneProgressCounter;
     Func<string, JsonElement, CancellationToken, Task<JsonElement?>>? _forwardToRoslynOverride;
     Func<string, object?, Task>? _forwardToRoslynNotificationOverride;
+    Func<string, object?, CancellationToken, Task<JsonElement?>>? _clientRequestOverride;
+    Func<string, object?, Task>? _clientNotificationOverride;
+    Func<CancellationToken, Task<bool>>? _startRoslynOverride;
+    bool _clientInitialized;
     readonly Channel<NotificationWorkItem> _notificationChannel;
     readonly CancellationTokenSource _notificationCts;
     readonly Task _notificationTask;
     readonly CancellationTokenSource _lifetimeCts = new();
+    static readonly TimeSpan DependencyProgressReportThrottle = TimeSpan.FromMilliseconds(250);
     long _droppedRoslynNotifications;
     long _roslynRequestTimeouts;
     long _sourceGeneratedCacheHits;
     long _sourceGeneratedCacheMisses;
     long _sourceGeneratedIndexRefreshes;
     long _sourceGeneratedIndexIncrementalUpdates;
-    const int DiagnosticsProgressDelayMs = 250;
+    const int DefaultDiagnosticsProgressDelayMs = 250;
     const int WorkDoneProgressCreateTimeoutMs = 2000;
     const int MaxFastStartDelayMs = 60000;
     const int MaxPendingChangesPerDocument = 200;
     const int MaxContentChangesToApply = 50;
     const int WorkspaceReloadDebounceMs = 1000;
+    static readonly TimeSpan AutoUpdateStartupDelay = TimeSpan.FromSeconds(5);
     const int FileWatchKindAll = 7;
     const string FileWatchRegistrationId = "razorsharp.didChangeWatchedFiles";
     const string OmniSharpConfigFileName = "omnisharp.json";
@@ -90,6 +115,7 @@ public class RazorLanguageServer : IAsyncDisposable
     const string SolutionFilterFileName = ".slnf";
     const string SolutionXmlFileName = ".slnx";
     static readonly TimeSpan DefaultRoslynRequestTimeout = TimeSpan.FromSeconds(10);
+    int _diagnosticsProgressDelayMs = DefaultDiagnosticsProgressDelayMs;
     TimeSpan _roslynRequestTimeout = DefaultRoslynRequestTimeout;
     static readonly TimeSpan SourceGeneratedIndexRefreshInterval = TimeSpan.FromSeconds(60);
     static readonly EnumerationOptions SourceGeneratedEnumerateOptions = new()
@@ -180,6 +206,13 @@ public class RazorLanguageServer : IAsyncDisposable
     readonly record struct NotificationWorkItem(string Method, JsonElement? Params);
     readonly record struct PendingOpenState(string Uri, string LanguageId, int Version, string Text);
     readonly record struct SourceGeneratedEntry(string Path, bool IsDebug, DateTime LastWriteUtc);
+    internal enum MessageType
+    {
+        Error = 1,
+        Warning = 2,
+        Info = 3,
+        Log = 4
+    }
 
     public RazorLanguageServer(ILoggerFactory loggerFactory, DependencyManager dependencyManager)
     {
@@ -209,6 +242,7 @@ public class RazorLanguageServer : IAsyncDisposable
     private bool FileWatchingEnabled => _initOptions?.Workspace?.EnableFileWatching != false;
     private bool FileWatchingRegistrationEnabled => _initOptions?.Workspace?.EnableFileWatchingRegistration != false;
     private bool SupportsWorkDoneProgress => _initParams?.Capabilities?.Window?.WorkDoneProgress == true;
+    private bool SupportsShowMessageRequest => _initParams?.Capabilities?.Window?.ShowMessage != null;
     private bool CanSendRoslynNotifications =>
         _forwardToRoslynNotificationOverride != null || _roslynClient?.IsRunning == true;
 
@@ -218,14 +252,36 @@ public class RazorLanguageServer : IAsyncDisposable
         => _forwardToRoslynOverride = overrideFunc;
     internal void SetForwardToRoslynNotificationOverrideForTests(Func<string, object?, Task>? overrideFunc)
         => _forwardToRoslynNotificationOverride = overrideFunc;
+    internal void SetClientRequestOverrideForTests(Func<string, object?, CancellationToken, Task<JsonElement?>>? overrideFunc)
+        => _clientRequestOverride = overrideFunc;
+    internal void SetClientNotificationOverrideForTests(Func<string, object?, Task>? overrideFunc)
+        => _clientNotificationOverride = overrideFunc;
     internal void SetRoslynRequestTimeoutForTests(TimeSpan timeout)
         => _roslynRequestTimeout = timeout;
+    internal void SetDiagnosticsProgressDelayForTests(int delayMs)
+        => _diagnosticsProgressDelayMs = Math.Max(0, delayMs);
+    internal void ApplyAutoUpdateSettingsForTests(RoslynOptions? options) => ApplyAutoUpdateSettings(options);
+    internal void ApplyDependencySettingsForTests(DependencyOptions? options) => ApplyDependencySettings(options);
+    internal bool AutoUpdateEnabledForTests => _autoUpdateEnabled;
+    internal bool ForceUpdateCheckForTests => _forceUpdateCheck;
+    internal Task? GetDependencyDownloadTaskForTests() => _dependencyDownloadTask;
+    internal void SetStartRoslynOverrideForTests(Func<CancellationToken, Task<bool>>? overrideFunc)
+        => _startRoslynOverride = overrideFunc;
+    internal void SetDependenciesMissingForTests(bool missing)
+        => _dependenciesMissing = missing;
     internal Task HandleRoslynNotificationForTests(string method, JsonElement? @params, CancellationToken ct)
         => HandleRoslynNotificationAsync(new NotificationWorkItem(method, @params), ct);
     internal void HandleRoslynProcessExitedForTests(int exitCode)
         => OnRoslynProcessExited(this, exitCode);
     internal Task<bool> SendWorkDoneProgressBeginForTests(string token, string title, string? message, CancellationToken ct)
         => SendWorkDoneProgressBeginAsync(token, title, message, ct);
+    internal Task NotifyRestartForTests(string message, MessageType type)
+        => NotifyRestartAsync(message, type);
+    internal Task StartBackgroundDependencyDownloadForTests()
+    {
+        StartBackgroundDependencyDownload();
+        return _dependencyDownloadTask ?? Task.CompletedTask;
+    }
 
     private int FastStartDelayMs
     {
@@ -253,6 +309,30 @@ public class RazorLanguageServer : IAsyncDisposable
         _logLevel = level.ToString();
     }
 
+    public void SetAutoUpdateEnabledFromCli(bool enabled)
+    {
+        _autoUpdateEnabledFromCli = enabled;
+    }
+
+    public void SetForceUpdateCheck(bool force)
+    {
+        _forceUpdateCheck = force;
+    }
+
+    internal void SetLoggingOptions(LoggingLevelSwitch levelSwitch, LogFileSwitch fileSwitch, bool logLevelSetByCli, bool logFileSetByCli)
+    {
+        _loggingLevelSwitch = levelSwitch;
+        _logFileSwitch = fileSwitch;
+        _logLevelSetByCli = logLevelSetByCli;
+        _logFileSetByCli = logFileSetByCli;
+    }
+
+    public void SetSkipDependencyCheck(bool skip, bool setByCli)
+    {
+        _skipDependencyCheck = skip;
+        _skipDependencyCheckSetByCli = setByCli;
+    }
+
     private void ApplyRoslynTimeout(RoslynOptions? options)
     {
         if (options?.RequestTimeoutMs == null)
@@ -275,6 +355,102 @@ public class RazorLanguageServer : IAsyncDisposable
         _roslynRequestTimeout = TimeSpan.FromMilliseconds(timeoutMs);
     }
 
+    private void ApplyLoggingSettings(LoggingOptions? options)
+    {
+        if (options == null)
+        {
+            return;
+        }
+
+        if (_loggingLevelSwitch != null && !_logLevelSetByCli && !string.IsNullOrWhiteSpace(options.Level))
+        {
+            if (Enum.TryParse<LogLevel>(options.Level, true, out var parsed))
+            {
+                _loggingLevelSwitch.MinimumLevel = parsed;
+                _logLevel = parsed.ToString();
+                _logger.LogInformation("Log level set to {Level} via initializationOptions", parsed);
+            }
+            else
+            {
+                _logger.LogWarning("Invalid log level '{Level}' in initializationOptions.logging.level", options.Level);
+            }
+        }
+
+        if (_logFileSwitch != null && !_logFileSetByCli && !string.IsNullOrWhiteSpace(options.File))
+        {
+            _logFileSwitch.SetLogFile(options.File);
+            _logger.LogInformation("Logging to file {Path} via initializationOptions", options.File);
+        }
+    }
+
+    private void ApplyDependencySettings(DependencyOptions? options)
+    {
+        if (options?.SkipDependencyCheck == null)
+        {
+            // Still apply pinned versions even if skipDependencyCheck isn't specified.
+            if (options != null)
+            {
+                ApplyPinnedDependencyVersions(options);
+            }
+            return;
+        }
+
+        if (_skipDependencyCheckSetByCli)
+        {
+            ApplyPinnedDependencyVersions(options);
+            return;
+        }
+
+        _skipDependencyCheck = options.SkipDependencyCheck.Value;
+        if (_skipDependencyCheck)
+        {
+            _logger.LogInformation("Dependency checks disabled by initializationOptions");
+        }
+
+        ApplyPinnedDependencyVersions(options);
+    }
+
+    private void ApplyPinnedDependencyVersions(DependencyOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.PinnedRoslynVersion) &&
+            string.IsNullOrWhiteSpace(options.PinnedExtensionVersion))
+        {
+            return;
+        }
+
+        _dependencyManager.ConfigurePinnedVersions(
+            options.PinnedRoslynVersion,
+            options.PinnedExtensionVersion);
+
+        _logger.LogInformation(
+            "Pinned dependency versions configured (Roslyn {RoslynVersion}, Extension {ExtensionVersion})",
+            options.PinnedRoslynVersion ?? "latest",
+            options.PinnedExtensionVersion ?? "latest");
+
+        _autoUpdateEnabled = false;
+        _forceUpdateCheck = false;
+        _logger.LogInformation("Auto-update checks disabled because pinned versions are configured.");
+    }
+
+    private void ApplyAutoUpdateSettings(RoslynOptions? options)
+    {
+        var enabled = options?.AutoUpdate ?? true;
+        _autoUpdateEnabled = _autoUpdateEnabledFromCli && enabled;
+
+        var intervalHours = options?.AutoUpdateIntervalHours ?? 24;
+        if (intervalHours < 0)
+        {
+            intervalHours = 0;
+        }
+
+        _autoUpdateInterval = TimeSpan.FromHours(intervalHours);
+
+        if (!_autoUpdateEnabled)
+        {
+            _logger.LogInformation("Dependency auto-update disabled");
+        }
+    }
+
     /// <summary>
     /// Runs the language server, listening on stdin/stdout.
     /// </summary>
@@ -282,8 +458,8 @@ public class RazorLanguageServer : IAsyncDisposable
     {
         _logger.LogInformation("Starting Razor Language Server...");
 
-        // Dependencies are now checked/downloaded at startup in Program.cs
-        // before we start listening on stdin, to avoid LSP timeout issues
+        // Dependency checks and auto-updates are handled after initialize
+        // to avoid blocking the LSP handshake.
 
         // Set up JSON-RPC over stdin/stdout
         var formatter = new SystemTextJsonFormatter
@@ -368,7 +544,10 @@ public class RazorLanguageServer : IAsyncDisposable
                 _workspaceManager.ConfigureExcludedDirectories(
                     initOptions?.Workspace?.ExcludeDirectoriesOverride,
                     initOptions?.Workspace?.ExcludeDirectories);
+                ApplyLoggingSettings(initOptions?.Logging);
+                ApplyDependencySettings(initOptions?.Dependencies);
                 ApplyRoslynTimeout(initOptions?.Roslyn);
+                ApplyAutoUpdateSettings(initOptions?.Roslyn);
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
                     var triggerChars = initOptions?.Capabilities?.CompletionProvider?.TriggerCharacters;
@@ -384,32 +563,36 @@ public class RazorLanguageServer : IAsyncDisposable
             }
         }
 
-        // Start Roslyn
-        _roslynClient = new RoslynClient(_loggerFactory.CreateLogger<RoslynClient>());
-        _roslynClient.SetConfigurationLoader(_configurationLoader);
+        _htmlClient.Configure(_initOptions?.Html, @params?.RootUri);
 
-        // Wire up Roslyn events before starting to avoid missing early notifications
-        _roslynClient.NotificationReceived += OnRoslynNotification;
-        _roslynClient.RequestReceived += OnRoslynRequestAsync;
-        _roslynClient.ProcessExited += OnRoslynProcessExited;
-
-        var roslynOptions = RoslynClient.CreateStartOptions(_dependencyManager,
-            Path.Combine(_dependencyManager.BasePath, "logs"), _logLevel);
-
-        await _roslynClient.StartAsync(roslynOptions, ct);
-
-        // Configure HTML language server (started lazily when first Razor file is opened)
-        _htmlClient.Configure(initOptions?.Html, @params?.RootUri);
-
-        // Forward initialize to Roslyn with cohosting enabled
-        var roslynInitParams = CreateRoslynInitParams(@params);
-        var roslynResult = await _roslynClient.SendRequestAsync<object, JsonElement>(
-            LspMethods.Initialize, roslynInitParams, ct);
-
-        _logger.LogInformation("Roslyn initialized");
-        if (_logger.IsEnabled(LogLevel.Trace) && roslynResult.TryGetProperty("capabilities", out var caps))
+        if (_initOptions == null)
         {
-            _logger.LogTrace("Roslyn capabilities: {Caps}", caps.GetRawText());
+            ApplyAutoUpdateSettings(null);
+        }
+
+        if (!_skipDependencyCheck && !_dependencyManager.AreDependenciesComplete())
+        {
+            if (_autoUpdateEnabled)
+            {
+                _dependenciesMissing = true;
+                _logger.LogInformation("Dependencies are missing; downloading in the background.");
+                StartBackgroundDependencyDownload();
+                _ = NotifyUserAsync("RazorSharp is downloading dependencies in the background. Language features will start automatically when ready.", MessageType.Info);
+                return CreateInitializeResult();
+            }
+
+            var message = "RazorSharp dependencies are not installed. Run with --download-dependencies first.";
+            _logger.LogError(message);
+            _ = NotifyUserAsync(message, MessageType.Error);
+            throw new InvalidOperationException(message);
+        }
+
+        if (!await EnsureRoslynStartedAsync(ct))
+        {
+            var message = "Failed to start Roslyn after downloading dependencies. Restart your editor.";
+            _logger.LogError(message);
+            _ = NotifyUserAsync(message, MessageType.Error);
+            throw new InvalidOperationException(message);
         }
 
         var result = CreateInitializeResult();
@@ -422,6 +605,7 @@ public class RazorLanguageServer : IAsyncDisposable
     public void HandleInitialized()
     {
         _logger.LogInformation("Client initialized");
+        _clientInitialized = true;
 
         if (FileWatchingEnabled && FileWatchingRegistrationEnabled)
         {
@@ -437,6 +621,257 @@ public class RazorLanguageServer : IAsyncDisposable
             _workspaceOpenedAt = DateTime.UtcNow;
         }
 
+        if (_dependenciesMissing)
+        {
+            StartAutoUpdateCheck();
+            return;
+        }
+
+        StartWorkspaceInitialization();
+
+        StartAutoUpdateCheck();
+    }
+
+    private void StartBackgroundDependencyDownload()
+    {
+        lock (_dependencyDownloadLock)
+        {
+            if (_dependencyDownloadTask != null)
+            {
+                return;
+            }
+
+            _dependencyDownloadTask = Task.Run(async () =>
+            {
+                WorkDoneProgressScope? progress = null;
+                try
+                {
+                    progress = BeginWorkDoneProgress(
+                        "razorsharp.dependencies",
+                        "RazorSharp",
+                        "Downloading dependencies",
+                        delayMs: 0,
+                        _lifetimeCts.Token);
+
+                    var lastReport = DateTime.MinValue;
+                    var reportLock = new Lock();
+                    void Report(string message)
+                    {
+                        if (progress == null)
+                        {
+                            return;
+                        }
+
+                        var now = DateTime.UtcNow;
+                        lock (reportLock)
+                        {
+                            if (now - lastReport < DependencyProgressReportThrottle)
+                            {
+                                return;
+                            }
+                            lastReport = now;
+                        }
+
+                        _ = progress.ReportAsync(message);
+                    }
+
+                    var success = await _dependencyManager.EnsureDependenciesAsync(_lifetimeCts.Token, Report);
+                    if (success)
+                    {
+                        _dependenciesMissing = false;
+                        _logger.LogInformation("Dependencies downloaded. Starting language services.");
+
+                        var started = await StartRoslynAfterDownloadAsync();
+                        if (started)
+                        {
+                            _logger.LogInformation("Roslyn started after dependency download.");
+                            await NotifyUserAsync(
+                                "RazorSharp finished downloading dependencies. Starting language services.",
+                                MessageType.Info);
+                        }
+                        else
+                        {
+                            await NotifyRestartAsync(
+                                "RazorSharp downloaded dependencies but couldn't start language services. Restart your editor.",
+                                MessageType.Warning);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Failed to download dependencies.");
+                        await NotifyUserAsync(
+                            "RazorSharp failed to download dependencies. Check logs for details.",
+                            MessageType.Error);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Shutdown requested.
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Background dependency download failed");
+                    await NotifyUserAsync(
+                        "RazorSharp failed to download dependencies. Check logs for details.",
+                        MessageType.Error);
+                }
+                finally
+                {
+                    if (progress != null)
+                    {
+                        await progress.DisposeAsync();
+                    }
+                }
+            });
+        }
+    }
+
+    private async Task<bool> StartRoslynAfterDownloadAsync()
+    {
+        if (_initParams == null)
+        {
+            _logger.LogWarning("Cannot start Roslyn after download: initialize parameters are missing.");
+            return false;
+        }
+
+        var started = await EnsureRoslynStartedAsync(_lifetimeCts.Token);
+        if (!started)
+        {
+            return false;
+        }
+
+        if (_clientInitialized)
+        {
+            StartWorkspaceInitialization();
+        }
+
+        return true;
+    }
+
+    private async Task<bool> EnsureRoslynStartedAsync(CancellationToken ct)
+    {
+        Task<bool> startTask;
+        lock (_roslynStartLock)
+        {
+            if (_roslynStartTask != null)
+            {
+                startTask = _roslynStartTask;
+            }
+            else
+            {
+                startTask = StartRoslynAsync(ct);
+                _roslynStartTask = startTask;
+            }
+        }
+
+        bool result;
+        try
+        {
+            result = await startTask;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Roslyn start failed");
+            result = false;
+        }
+
+        if (!result)
+        {
+            lock (_roslynStartLock)
+            {
+                if (_roslynStartTask == startTask)
+                {
+                    _roslynStartTask = null;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private async Task<bool> StartRoslynAsync(CancellationToken ct)
+    {
+        if (_startRoslynOverride != null)
+        {
+            return await _startRoslynOverride(ct);
+        }
+
+        if (_roslynClient != null && _roslynClient.IsRunning)
+        {
+            return true;
+        }
+
+        if (_initParams == null)
+        {
+            _logger.LogWarning("Cannot start Roslyn: initialize parameters are missing.");
+            return false;
+        }
+
+        try
+        {
+            // Start Roslyn
+            _roslynClient = new RoslynClient(_loggerFactory.CreateLogger<RoslynClient>());
+            _roslynClient.SetConfigurationLoader(_configurationLoader);
+
+            // Wire up Roslyn events before starting to avoid missing early notifications
+            _roslynClient.NotificationReceived += OnRoslynNotification;
+            _roslynClient.RequestReceived += OnRoslynRequestAsync;
+            _roslynClient.ProcessExited += OnRoslynProcessExited;
+
+            var roslynOptions = RoslynClient.CreateStartOptions(_dependencyManager,
+                Path.Combine(_dependencyManager.BasePath, "logs"), _logLevel);
+
+            await _roslynClient.StartAsync(roslynOptions, ct);
+
+            // Forward initialize to Roslyn with cohosting enabled
+            var roslynInitParams = CreateRoslynInitParams(_initParams);
+            var roslynResult = await _roslynClient.SendRequestAsync<object, JsonElement>(
+                LspMethods.Initialize, roslynInitParams, ct);
+
+            _logger.LogInformation("Roslyn initialized");
+            if (_logger.IsEnabled(LogLevel.Trace) && roslynResult.TryGetProperty("capabilities", out var caps))
+            {
+                _logger.LogTrace("Roslyn capabilities: {Caps}", caps.GetRawText());
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to start Roslyn");
+            if (_roslynClient != null)
+            {
+                try
+                {
+                    await _roslynClient.DisposeAsync();
+                }
+                catch
+                {
+                    // Ignore cleanup failures
+                }
+                _roslynClient = null;
+            }
+            return false;
+        }
+    }
+
+    private void StartWorkspaceInitialization()
+    {
+        if (_dependenciesMissing)
+        {
+            return;
+        }
+
+        lock (_workspaceInitLock)
+        {
+            if (_workspaceInitStarted)
+            {
+                return;
+            }
+
+            _workspaceInitStarted = true;
+        }
+
         _workspaceInitProgress ??= BeginWorkDoneProgress(
             "razorsharp.init",
             "RazorSharp",
@@ -449,6 +884,17 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             try
             {
+                if (!await EnsureRoslynStartedAsync(_lifetimeCts.Token))
+                {
+                    _logger.LogWarning("Roslyn failed to start; workspace initialization skipped.");
+                    lock (_workspaceInitLock)
+                    {
+                        _workspaceInitStarted = false;
+                    }
+                    await EndWorkspaceInitializationProgressAsync();
+                    return;
+                }
+
                 if (_roslynClient != null)
                 {
                     await SendRoslynNotificationAsync(LspMethods.Initialized, null);
@@ -490,9 +936,161 @@ public class RazorLanguageServer : IAsyncDisposable
             {
                 _logger.LogError(ex, "Error during Roslyn initialization");
                 _roslynProjectInitialized.TrySetException(ex);
+                lock (_workspaceInitLock)
+                {
+                    _workspaceInitStarted = false;
+                }
                 await EndWorkspaceInitializationProgressAsync();
             }
         });
+    }
+
+    private void StartAutoUpdateCheck()
+    {
+        if (_dependencyManager.HasPinnedVersions)
+        {
+            return;
+        }
+
+        if (!_autoUpdateEnabled && !_forceUpdateCheck)
+        {
+            return;
+        }
+
+        if (!_dependencyManager.AreDependenciesComplete())
+        {
+            return;
+        }
+
+        lock (_autoUpdateLock)
+        {
+            if (_autoUpdateTask != null)
+            {
+                return;
+            }
+
+            var delay = _forceUpdateCheck ? TimeSpan.Zero : AutoUpdateStartupDelay;
+            _autoUpdateTask = Task.Run(() => RunAutoUpdateCheckAsync(delay, _forceUpdateCheck, _lifetimeCts.Token));
+        }
+    }
+
+    private async Task RunAutoUpdateCheckAsync(TimeSpan delay, bool force, CancellationToken ct)
+    {
+        try
+        {
+            if (delay > TimeSpan.Zero)
+            {
+                await Task.Delay(delay, ct);
+            }
+
+            var interval = force ? TimeSpan.Zero : _autoUpdateInterval;
+            var result = await _dependencyManager.CheckForUpdatesAsync(interval, ct);
+            if (result.Status is DependencyUpdateStatus.UpdateDownloaded or DependencyUpdateStatus.UpdateAlreadyPending)
+            {
+                var versionLabel = result.TargetVersion ?? "a newer version";
+                _logger.LogInformation("Dependency update {Version} is ready; restart to use it.", versionLabel);
+                await NotifyRestartAsync(
+                    $"RazorSharp downloaded dependency update {versionLabel}. Restart your editor to use it.",
+                    MessageType.Info);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutdown requested.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Auto-update check failed");
+        }
+    }
+
+    private async Task NotifyUserAsync(string message, MessageType type)
+    {
+        if (_clientNotificationOverride != null)
+        {
+            await _clientNotificationOverride(LspMethods.WindowShowMessage, new
+            {
+                type = (int)type,
+                message
+            });
+            return;
+        }
+
+        if (_clientRpc == null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _clientRpc.NotifyWithParameterObjectAsync(LspMethods.WindowShowMessage, new
+            {
+                type = (int)type,
+                message
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to send window/showMessage");
+        }
+    }
+
+    private async Task NotifyRestartAsync(string message, MessageType type)
+    {
+        if (!SupportsShowMessageRequest || (_clientRpc == null && _clientRequestOverride == null))
+        {
+            await NotifyUserAsync(message, type);
+            return;
+        }
+
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            var payload = new
+            {
+                type = (int)type,
+                message,
+                actions = new[]
+                {
+                    new { title = "Restart" },
+                    new { title = "Dismiss" }
+                }
+            };
+
+            JsonElement? response;
+            if (_clientRequestOverride != null)
+            {
+                response = await _clientRequestOverride(LspMethods.WindowShowMessageRequest, payload, cts.Token);
+            }
+            else if (_clientRpc != null)
+            {
+                response = await _clientRpc.InvokeWithParameterObjectAsync<JsonElement?>(
+                    LspMethods.WindowShowMessageRequest,
+                    payload,
+                    cts.Token);
+            }
+            else
+            {
+                await NotifyUserAsync(message, type);
+                return;
+            }
+
+            if (response.HasValue &&
+                response.Value.ValueKind == JsonValueKind.Object &&
+                response.Value.TryGetProperty("title", out var title) &&
+                string.Equals(title.GetString(), "Restart", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation("User requested restart; please restart the editor to apply updates.");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("ShowMessageRequest timed out");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to send window/showMessageRequest");
+        }
     }
 
     [JsonRpcMethod(LspMethods.Shutdown, UseSingleObjectParameterDeserialization = true)]
@@ -551,27 +1149,14 @@ public class RazorLanguageServer : IAsyncDisposable
             @params.TextDocument.Version,
             @params.TextDocument.Text ?? string.Empty);
 
-        if (!CanSendRoslynNotifications)
-        {
-            if (_roslynClient == null)
-            {
-                _logger.LogWarning("Roslyn client is null, cannot forward didOpen");
-            }
-            else
-            {
-                _logger.LogWarning("Roslyn process is not running, cannot forward didOpen for {Uri}", uri);
-            }
-            return;
-        }
-
-        // Documents must be opened after workspace/projectInitializationComplete
-        if (!_roslynProjectInitialized.Task.IsCompleted)
+        // If Roslyn isn't available yet, queue opens for replay later.
+        if (!CanSendRoslynNotifications || !_roslynProjectInitialized.Task.IsCompleted)
         {
             lock (_documentTrackingLock)
             {
                 _pendingOpens[uri] = openState;
             }
-            _logger.LogDebug("Buffering didOpen for {Uri} until project initialization completes", uri);
+            _logger.LogDebug("Buffering didOpen for {Uri} until Roslyn is ready", uri);
             return;
         }
 
@@ -757,59 +1342,61 @@ public class RazorLanguageServer : IAsyncDisposable
     [JsonRpcMethod(LspMethods.TextDocumentDidChange, UseSingleObjectParameterDeserialization = true)]
     public async Task HandleDidChangeAsync(JsonElement paramsJson)
     {
-        // Only forward didChange if we've already forwarded didOpen for this document
-        // Roslyn crashes if it receives didChange for a document it doesn't know about
-        if (CanSendRoslynNotifications)
+        var uri = paramsJson.TryGetProperty("textDocument", out var td) && td.TryGetProperty("uri", out var u)
+            ? u.GetString() : null;
+
+        if (uri == null)
         {
-            var uri = paramsJson.TryGetProperty("textDocument", out var td) && td.TryGetProperty("uri", out var u)
-                ? u.GetString() : null;
+            return;
+        }
 
-            if (uri != null)
+        // Check document state and buffer if needed atomically
+        // to prevent race conditions with HandleDidOpenAsync
+        bool isOpen;
+        lock (_documentTrackingLock)
+        {
+            isOpen = _openDocuments.Contains(uri);
+            if (!isOpen)
             {
-                // Check document state and buffer if needed atomically
-                // to prevent race conditions with HandleDidOpenAsync
-                bool isOpen;
-                lock (_documentTrackingLock)
+                if (_pendingOpens.TryGetValue(uri, out var pendingOpen) &&
+                    TryUpdatePendingOpenText(pendingOpen, paramsJson, out var updatedOpen))
                 {
-                    isOpen = _openDocuments.Contains(uri);
-                    if (!isOpen)
+                    _pendingOpens[uri] = updatedOpen;
+                    _pendingChanges.Remove(uri);
+                    _logger.LogDebug("Coalesced didChange into pending didOpen for {Uri}", uri);
+                }
+                else
+                {
+                    // Buffer the change to replay after didOpen is forwarded
+                    _logger.LogDebug("Buffering didChange for {Uri} - document not yet open in Roslyn", uri);
+                    if (!_pendingChanges.TryGetValue(uri, out var changes))
                     {
-                        if (_pendingOpens.TryGetValue(uri, out var pendingOpen) &&
-                            TryUpdatePendingOpenText(pendingOpen, paramsJson, out var updatedOpen))
-                        {
-                            _pendingOpens[uri] = updatedOpen;
-                            _pendingChanges.Remove(uri);
-                            _logger.LogDebug("Coalesced didChange into pending didOpen for {Uri}", uri);
-                        }
-                        else
-                        {
-                            // Buffer the change to replay after didOpen is forwarded
-                            _logger.LogDebug("Buffering didChange for {Uri} - document not yet open in Roslyn", uri);
-                            if (!_pendingChanges.TryGetValue(uri, out var changes))
-                            {
-                                changes = new List<JsonElement>();
-                                _pendingChanges[uri] = changes;
-                            }
-                            changes.Add(paramsJson.Clone());
+                        changes = new List<JsonElement>();
+                        _pendingChanges[uri] = changes;
+                    }
+                    changes.Add(paramsJson.Clone());
 
-                            if (changes.Count > MaxPendingChangesPerDocument)
-                            {
-                                _logger.LogWarning(
-                                    "Too many buffered changes for {Uri}; keeping latest change only.",
-                                    uri);
-                                var latest = changes[^1];
-                                changes.Clear();
-                                changes.Add(latest);
-                            }
-                        }
+                    if (changes.Count > MaxPendingChangesPerDocument)
+                    {
+                        _logger.LogWarning(
+                            "Too many buffered changes for {Uri}; keeping latest change only.",
+                            uri);
+                        var latest = changes[^1];
+                        changes.Clear();
+                        changes.Add(latest);
                     }
                 }
-
-                if (isOpen)
-                {
-                    await SendRoslynNotificationAsync(LspMethods.TextDocumentDidChange, paramsJson);
-                }
             }
+        }
+
+        if (!CanSendRoslynNotifications)
+        {
+            return;
+        }
+
+        if (isOpen)
+        {
+            await SendRoslynNotificationAsync(LspMethods.TextDocumentDidChange, paramsJson);
         }
     }
 
@@ -831,7 +1418,6 @@ public class RazorLanguageServer : IAsyncDisposable
             _pendingChanges.Remove(uri);
         }
 
-        // Forward to Roslyn
         if (CanSendRoslynNotifications)
         {
             await SendRoslynNotificationAsync(LspMethods.TextDocumentDidClose, paramsJson);
@@ -1429,7 +2015,7 @@ public class RazorLanguageServer : IAsyncDisposable
                 "razorsharp.diagnostics",
                 "RazorSharp",
                 "Diagnostics",
-                DiagnosticsProgressDelayMs,
+                _diagnosticsProgressDelayMs,
                 ct);
 
             // For C# files, request configured diagnostic categories from Roslyn
@@ -1979,6 +2565,31 @@ public class RazorLanguageServer : IAsyncDisposable
         }
     }
 
+    private async Task SendWorkDoneProgressReportAsync(string token, string? message)
+    {
+        if (_progressRpc == null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _progressRpc.NotifyWithParameterObjectAsync(LspMethods.Progress, new
+            {
+                token,
+                value = new
+                {
+                    kind = "report",
+                    message
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to report work done progress {Token}", token);
+        }
+    }
+
     private Task SendRoslynNotificationAsync(string method, object? parameters)
     {
         if (_forwardToRoslynNotificationOverride != null)
@@ -2016,6 +2627,7 @@ public class RazorLanguageServer : IAsyncDisposable
         readonly string? _message;
         readonly CancellationTokenSource _delayCts;
         readonly Task<bool> _startTask;
+        bool _disposed;
 
         public WorkDoneProgressScope(
             RazorLanguageServer server,
@@ -2054,8 +2666,34 @@ public class RazorLanguageServer : IAsyncDisposable
                 CancellationToken.None);
         }
 
+        public async Task ReportAsync(string? message)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            bool started;
+            try
+            {
+                started = await _startTask;
+            }
+            catch
+            {
+                return;
+            }
+
+            if (!started || _disposed)
+            {
+                return;
+            }
+
+            await _server.SendWorkDoneProgressReportAsync(_token, message);
+        }
+
         public async ValueTask DisposeAsync()
         {
+            _disposed = true;
             _delayCts.Cancel();
             bool started = false;
             try
@@ -2080,6 +2718,11 @@ public class RazorLanguageServer : IAsyncDisposable
 
     private async Task<JsonElement?> ForwardToRoslynAsync(string method, JsonElement @params, CancellationToken ct)
     {
+        if (_dependenciesMissing)
+        {
+            return null;
+        }
+
         if (_forwardToRoslynOverride != null)
         {
             return await _forwardToRoslynOverride(method, @params, ct);

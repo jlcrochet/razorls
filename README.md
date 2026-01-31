@@ -87,6 +87,8 @@ If you have an apphost binary (`razorsharp`), you can run it directly instead of
 
 Downloads use a small retry/backoff for transient network failures.
 
+If auto-updates are enabled (default), RazorSharp will download missing dependencies in the background and start language services automatically. Restart is only required when updating existing dependencies.
+
 ### Options
 
 | Option | Description |
@@ -97,6 +99,8 @@ Downloads use a small retry/backoff for transient network failures.
 | `--logFile <path>` | Write logs to file instead of stderr |
 | `-hpid, --hostPID <pid>` | Shutdown when host process exits |
 | `--download-dependencies` | Download dependencies and exit (does not start server) |
+| `--check-updates` | Force a background dependency update check on startup |
+| `--no-auto-update` | Disable background dependency auto-updates |
 | `--skip-dependency-check` | Skip dependency check on startup |
 | `-h, --help` | Show help |
 | `--version` | Show version |
@@ -237,13 +241,13 @@ You can also set `OMNISHARPHOME` environment variable to specify a custom global
 
 ## Troubleshooting
 
-- **Dependencies missing:** run `--download-dependencies` before starting the server.
+- **Dependencies missing:** run `--download-dependencies` (or allow the background auto-download; language services start automatically once downloads finish).
 - **HTML formatting not working:** ensure Node.js and `vscode-langservers-extracted` are installed.
 - **Slow startup:** check workspace excludes and file watcher settings.
 
 ## Versioning
 
-RazorSharp pins specific Roslyn and Razor extension versions in `DependencyManager`. Update those constants when you need newer tooling, and re-download dependencies.
+RazorSharp uses the latest available Roslyn Language Server and Razor extension versions by default. You can pin versions via `initializationOptions.dependencies.pinnedRoslynVersion` and `initializationOptions.dependencies.pinnedExtensionVersion` when you need deterministic tooling; pinning disables auto-update checks (including `--check-updates`). If RazorSharp cannot reach the version feeds, it falls back to the last known versions in `version.json`; if nothing is cached, you'll need to pin versions or restore connectivity. With auto-update enabled, RazorSharp downloads missing dependencies in the background and starts language services automatically. When updating existing dependencies, a restart is required to switch to the new version. Use `--check-updates` to force a background update check even within the interval.
 
 
 ### HTML Language Server
@@ -283,7 +287,7 @@ Disabling the HTML language server will break formatting in Razor files.
 
 ### LSP Initialization Options
 
-RazorSharp supports configuration via LSP `initializationOptions`. In Helix, this is the `config` key in `languages.toml`. These options allow you to enable/disable specific LSP capabilities and configure RazorSharp-specific behavior.
+RazorSharp supports configuration via LSP `initializationOptions`. In Helix, this is the `config` key in `languages.toml`. These options allow you to enable/disable specific LSP capabilities, configure RazorSharp-specific behavior, and set logging/dependency defaults.
 
 #### Available Options
 
@@ -327,6 +331,42 @@ RazorSharp supports configuration via LSP `initializationOptions`. In Helix, thi
 | `workspace.enableFileWatching` | bool | `true` | Enable handling `workspace/didChangeWatchedFiles` notifications |
 | `workspace.enableFileWatchingRegistration` | bool | `true` | Dynamically register file watchers with the client (when supported) |
 | `roslyn.requestTimeoutMs` | int | `10000` | Timeout for Roslyn requests (ms). Set `<= 0` to disable. |
+| `roslyn.autoUpdate` | bool | `true` | Enable background dependency auto-updates |
+| `roslyn.autoUpdateIntervalHours` | int | `24` | Minimum hours between auto-update checks |
+| `logging.level` | string | `Information` | Default log level (CLI `--loglevel` overrides) |
+| `logging.file` | string | `null` | Log file path (CLI `--logFile` overrides) |
+| `dependencies.skipDependencyCheck` | bool | `false` | Skip dependency presence checks (CLI `--skip-dependency-check` overrides) |
+| `dependencies.pinnedRoslynVersion` | string | `null` | Pin Roslyn Language Server version (disables auto-update checks when set) |
+| `dependencies.pinnedExtensionVersion` | string | `null` | Pin Razor extension version (disables auto-update checks when set) |
+
+#### Example: Pin versions and set logging defaults
+
+**Helix:**
+```toml
+[language-server.razorsharp]
+command = "dotnet"
+args = ["/path/to/razorsharp.dll"]
+config.dependencies.pinnedRoslynVersion = "4.10.0"
+config.dependencies.pinnedExtensionVersion = "2.3.4"
+config.logging.level = "Warning"
+config.logging.file = "/tmp/razorsharp.log"
+```
+
+**Neovim:**
+```lua
+lspconfig.razorsharp.setup({
+  init_options = {
+    dependencies = {
+      pinnedRoslynVersion = "4.10.0",
+      pinnedExtensionVersion = "2.3.4"
+    },
+    logging = {
+      level = "Warning",
+      file = "/tmp/razorsharp.log"
+    }
+  }
+})
+```
 
 #### Example: Fast-start with a delay
 
