@@ -509,24 +509,17 @@ public class RazorLanguageServer : IAsyncDisposable
     {
         _logger.LogDebug("Exit requested");
 
-        // Gracefully shut down subprocesses (they have internal timeouts before force-kill)
+        LogTelemetrySummary();
+
+        // Dispose the JSON-RPC handler so RunAsync completes and Program can run DisposeAsync.
         try
         {
-            _notificationCts.Cancel();
-            _lifetimeCts.Cancel();
-
-            // Run disposal in parallel for both clients
-            Task.WhenAll(
-                _roslynClient?.DisposeAsync().AsTask() ?? Task.CompletedTask,
-                _htmlClient.DisposeAsync().AsTask()
-            ).Wait(TimeSpan.FromSeconds(5));
+            _clientRpc?.Dispose();
         }
         catch
         {
-            // Ignore disposal errors during exit
+            // Ignore shutdown errors during exit
         }
-
-        Environment.Exit(0);
     }
 
     #endregion
