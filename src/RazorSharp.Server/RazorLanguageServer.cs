@@ -98,7 +98,7 @@ public class RazorLanguageServer : IAsyncDisposable
     const int MaxPendingChangesPerDocument = 200;
     const int MaxContentChangesToApply = 50;
     const int WorkspaceReloadDebounceMs = 1000;
-    const int DefaultUserRequestProgressDelayMs = 500;
+    const int DefaultUserRequestProgressDelayMs = 1000;
     static readonly TimeSpan AutoUpdateStartupDelay = TimeSpan.FromSeconds(5);
     const int FileWatchKindAll = 7;
     const string FileWatchRegistrationId = "razorsharp.didChangeWatchedFiles";

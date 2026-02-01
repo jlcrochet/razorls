@@ -338,7 +338,7 @@ RazorSharp supports configuration via LSP `initializationOptions`. In Helix, thi
 | `logging.level` | string | `Information` | Default log level (CLI `--loglevel` overrides) |
 | `logging.file` | string | `null` | Log file path (CLI `--logFile` overrides) |
 | `dependencies.skipDependencyCheck` | bool | `false` | Skip dependency presence checks (CLI `--skip-dependency-check` overrides) |
-| `requestProgressDelayMs` | int | `500` | Delay (ms) before showing workDoneProgress for user requests; set `< 0` to disable |
+| `requestProgressDelayMs` | int | `1000` | Delay (ms) before showing workDoneProgress for user requests; set `< 0` to disable |
 | `dependencies.pinnedRoslynVersion` | string | `null` | Pin Roslyn Language Server version (disables auto-update checks when set) |
 | `dependencies.pinnedExtensionVersion` | string | `null` | Pin Razor extension version (disables auto-update checks when set) |
 
@@ -379,7 +379,7 @@ lspconfig.razorsharp.setup({
 command = "dotnet"
 args = ["/path/to/razorsharp.dll"]
 config.fastStart = true
-config.fastStartDelayMs = 500
+config.fastStartDelayMs = 1000
 ```
 
 **Neovim:**
@@ -387,7 +387,7 @@ config.fastStartDelayMs = 500
 lspconfig.razorsharp.setup({
   init_options = {
     fastStart = true,
-    fastStartDelayMs = 500
+    fastStartDelayMs = 1000
   }
 })
 ```
