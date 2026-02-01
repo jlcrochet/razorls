@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Reflection;
 using System.Text.Json;
 using System.Threading;
 using Microsoft.Extensions.Logging;
@@ -149,6 +150,44 @@ public class RazorLanguageServerDependencyTests
         }
     }
 
+    [Fact]
+    public async Task InitializeAsync_AllowsNonFileRootUri()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var loggerFactory = LoggerFactory.Create(builder => { });
+            using var deps = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), "test", tempRoot);
+
+            Directory.CreateDirectory(deps.RoslynPath);
+            Directory.CreateDirectory(deps.RazorExtensionPath);
+            File.WriteAllText(Path.Combine(deps.RoslynPath, "Microsoft.CodeAnalysis.LanguageServer.dll"), "ok");
+            File.WriteAllText(Path.Combine(deps.RazorExtensionPath, "Microsoft.CodeAnalysis.Razor.Compiler.dll"), "ok");
+            File.WriteAllText(Path.Combine(deps.RazorExtensionPath, "Microsoft.VisualStudioCode.RazorExtension.dll"), "ok");
+
+            var server = new RazorLanguageServer(loggerFactory, deps);
+            try
+            {
+                server.SetStartRoslynOverrideForTests(_ => Task.FromResult(true));
+                var initParams = new InitializeParams { RootUri = "untitled:workspace" };
+                var initJson = JsonSerializer.SerializeToElement(initParams);
+
+                await server.HandleInitializeAsync(initJson, CancellationToken.None);
+
+                var workspaceRoot = (string?)GetPrivateField(server, "_workspaceRoot");
+                Assert.Null(workspaceRoot);
+            }
+            finally
+            {
+                await server.DisposeAsync();
+            }
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
     static async Task AwaitOrTimeout(Task task, int timeoutMs, string message)
     {
         var completed = await Task.WhenAny(task, Task.Delay(timeoutMs)) == task;
@@ -168,5 +207,12 @@ public class RazorLanguageServerDependencyTests
         {
             Directory.Delete(path, recursive: true);
         }
+    }
+
+    static object? GetPrivateField(object target, string fieldName)
+    {
+        var field = target.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        return field!.GetValue(target);
     }
 }

@@ -202,6 +202,31 @@ public class RazorLanguageServer : IAsyncDisposable
     ];
     static readonly string[] SemanticTokenFormats = ["relative"];
     static readonly string[] InlayHintResolveProperties = ["tooltip", "textEdits", "label.tooltip", "label.location", "label.command"];
+    static readonly string[] WorkspaceReloadExtensions =
+    [
+        ".sln",
+        SolutionFilterFileName,
+        SolutionXmlFileName,
+        ".csproj",
+        ".props",
+        ".targets",
+        ".globalconfig",
+        ".ruleset",
+        ".rsp"
+    ];
+    static readonly string[] WorkspaceReloadFileNames =
+    [
+        DirectoryBuildPropsFileName,
+        DirectoryBuildTargetsFileName,
+        DirectoryBuildRspFileName,
+        DirectoryPackagesPropsFileName,
+        DirectoryPackagesTargetsFileName,
+        NuGetConfigFileName,
+        NuGetConfigLowerFileName,
+        StyleCopConfigFileName,
+        PackagesLockFileName,
+        GlobalJsonFileName
+    ];
 
     readonly record struct NotificationWorkItem(string Method, JsonElement? Params);
     readonly record struct PendingOpenState(string Uri, string LanguageId, int Version, string Text);
@@ -517,11 +542,11 @@ public class RazorLanguageServer : IAsyncDisposable
         }
         else if (@params?.RootUri != null)
         {
-            workspaceRoot = new Uri(@params.RootUri).LocalPath;
+            workspaceRoot = TryGetLocalPath(@params.RootUri);
         }
         else if (@params?.WorkspaceFolders?.Length > 0)
         {
-            workspaceRoot = new Uri(@params.WorkspaceFolders[0].Uri).LocalPath;
+            workspaceRoot = TryGetLocalPath(@params.WorkspaceFolders[0].Uri);
         }
 
         _workspaceRoot = workspaceRoot;
@@ -1232,6 +1257,7 @@ public class RazorLanguageServer : IAsyncDisposable
             return true;
         }
 
+        List<int>? lineIndex = null;
         foreach (var change in changes.EnumerateArray())
         {
             if (!change.TryGetProperty("text", out var textProp))
@@ -1252,8 +1278,9 @@ public class RazorLanguageServer : IAsyncDisposable
                 return false;
             }
 
-            if (!TryGetOffset(updatedText, startLine, startCharacter, out var startOffset) ||
-                !TryGetOffset(updatedText, endLine, endCharacter, out var endOffset))
+            lineIndex ??= BuildLineStartIndex(updatedText);
+            if (!TryGetOffset(updatedText, lineIndex, startLine, startCharacter, out var startOffset) ||
+                !TryGetOffset(updatedText, lineIndex, endLine, endCharacter, out var endOffset))
             {
                 return false;
             }
@@ -1263,10 +1290,30 @@ public class RazorLanguageServer : IAsyncDisposable
                 return false;
             }
 
-            updatedText = updatedText[..startOffset] + newText + updatedText[endOffset..];
+            updatedText = ApplyTextChange(updatedText, startOffset, endOffset, newText);
+            lineIndex = null;
         }
 
         return true;
+    }
+
+    private static string ApplyTextChange(string text, int startOffset, int endOffset, string newText)
+    {
+        var newLength = text.Length - (endOffset - startOffset) + newText.Length;
+        return string.Create(newLength, (text, startOffset, endOffset, newText),
+            static (span, state) =>
+            {
+                var dest = span;
+                var prefix = state.text.AsSpan(0, state.startOffset);
+                prefix.CopyTo(dest);
+                dest = dest[prefix.Length..];
+
+                var insert = state.newText.AsSpan();
+                insert.CopyTo(dest);
+                dest = dest[insert.Length..];
+
+                state.text.AsSpan(state.endOffset).CopyTo(dest);
+            });
     }
 
     private static bool TryGetRange(JsonElement range, out int startLine, out int startCharacter, out int endLine, out int endCharacter)
@@ -1325,6 +1372,61 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         if (lineEnd > lineStart && text[lineEnd - 1] == '\r')
+        {
+            lineEnd--;
+        }
+
+        var lineLength = lineEnd - lineStart;
+        if (character > lineLength)
+        {
+            return false;
+        }
+
+        offset = lineStart + character;
+        return true;
+    }
+
+    private static List<int> BuildLineStartIndex(string text)
+    {
+        var lineStarts = new List<int> { 0 };
+        var index = 0;
+        while (index < text.Length)
+        {
+            var newline = text.IndexOf('\n', index);
+            if (newline < 0)
+            {
+                break;
+            }
+
+            var nextStart = newline + 1;
+            if (nextStart < text.Length)
+            {
+                lineStarts.Add(nextStart);
+            }
+
+            index = nextStart;
+        }
+
+        return lineStarts;
+    }
+
+    private static bool TryGetOffset(string text, List<int> lineStarts, int line, int character, out int offset)
+    {
+        offset = 0;
+
+        if (line < 0 || character < 0)
+        {
+            return false;
+        }
+
+        if (line >= lineStarts.Count)
+        {
+            return false;
+        }
+
+        var lineStart = lineStarts[line];
+        var lineEnd = line + 1 < lineStarts.Count ? lineStarts[line + 1] - 1 : text.Length;
+        if (lineEnd > lineStart && lineEnd <= text.Length && text[lineEnd - 1] == '\r')
         {
             lineEnd--;
         }
@@ -1912,9 +2014,15 @@ public class RazorLanguageServer : IAsyncDisposable
 
                 if (resolveResult.HasValue && resolveResult.Value.TryGetProperty("edit", out var edit))
                 {
+                    if (_clientRpc == null)
+                    {
+                        _logger.LogWarning("nestedCodeAction: Client RPC not available to apply edit");
+                        return null;
+                    }
+
                     // Apply the workspace edit via the client
                     _logger.LogDebug("nestedCodeAction: Applying workspace edit");
-                    await _clientRpc!.InvokeWithParameterObjectAsync<JsonElement?>(
+                    await _clientRpc.InvokeWithParameterObjectAsync<JsonElement?>(
                         LspMethods.WorkspaceApplyEdit,
                         new { edit },
                         ct);
@@ -1969,8 +2077,14 @@ public class RazorLanguageServer : IAsyncDisposable
 
                 if (resolveResult.HasValue && resolveResult.Value.TryGetProperty("edit", out var edit))
                 {
+                    if (_clientRpc == null)
+                    {
+                        _logger.LogWarning("fixAllCodeAction: Client RPC not available to apply edit");
+                        return null;
+                    }
+
                     _logger.LogDebug("fixAllCodeAction: Applying workspace edit");
-                    await _clientRpc!.InvokeWithParameterObjectAsync<JsonElement?>(
+                    await _clientRpc.InvokeWithParameterObjectAsync<JsonElement?>(
                         LspMethods.WorkspaceApplyEdit,
                         new { edit },
                         ct);
@@ -2087,6 +2201,21 @@ public class RazorLanguageServer : IAsyncDisposable
                 var results = await Task.WhenAll(tasks);
                 ListPool<Task<JsonElement?>>.Return(tasks);
 
+                Dictionary<string, JsonElement>? relatedDocuments = null;
+                foreach (var result in results)
+                {
+                    if (result.HasValue &&
+                        result.Value.TryGetProperty("relatedDocuments", out var related) &&
+                        related.ValueKind == JsonValueKind.Object)
+                    {
+                        relatedDocuments ??= new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var property in related.EnumerateObject())
+                        {
+                            relatedDocuments[property.Name] = property.Value.Clone();
+                        }
+                    }
+                }
+
                 var bufferWriter = new ArrayPoolBufferWriter();
                 try
                 {
@@ -2111,12 +2240,25 @@ public class RazorLanguageServer : IAsyncDisposable
                     }
 
                     writer.WriteEndArray();
+
+                    if (relatedDocuments != null && relatedDocuments.Count > 0)
+                    {
+                        writer.WritePropertyName("relatedDocuments");
+                        writer.WriteStartObject();
+                        foreach (var kvp in relatedDocuments)
+                        {
+                            writer.WritePropertyName(kvp.Key);
+                            kvp.Value.WriteTo(writer);
+                        }
+                        writer.WriteEndObject();
+                    }
                     writer.WriteEndObject();
                     writer.Flush();
 
                     _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedCount, uri);
 
-                    return JsonDocument.Parse(bufferWriter.WrittenMemory).RootElement.Clone();
+                    using var doc = JsonDocument.Parse(bufferWriter.WrittenMemory);
+                    return doc.RootElement.Clone();
                 }
                 finally
                 {
@@ -3066,36 +3208,25 @@ public class RazorLanguageServer : IAsyncDisposable
 
     private static object[] CreateFileWatchers(string? baseUri)
     {
-        return
-        [
-            CreateWatcher("**/*.sln", baseUri),
-            CreateWatcher("**/*.csproj", baseUri),
-            CreateWatcher($"**/{DirectoryBuildPropsFileName}", baseUri),
-            CreateWatcher($"**/{DirectoryBuildTargetsFileName}", baseUri),
-            CreateWatcher($"**/{DirectoryBuildRspFileName}", baseUri),
-            CreateWatcher($"**/{DirectoryPackagesPropsFileName}", baseUri),
-            CreateWatcher($"**/{DirectoryPackagesTargetsFileName}", baseUri),
-            CreateWatcher($"**/{NuGetConfigFileName}", baseUri),
-            CreateWatcher($"**/{NuGetConfigLowerFileName}", baseUri),
-            CreateWatcher($"**/{PackagesLockFileName}", baseUri),
-            CreateWatcher($"**/{GlobalJsonFileName}", baseUri),
-            CreateWatcher($"**/{OmniSharpConfigFileName}", baseUri),
-            CreateWatcher("**/*.razor", baseUri),
-            CreateWatcher("**/*.cshtml", baseUri),
-            CreateWatcher("**/*.razor.cs", baseUri),
-            CreateWatcher("**/*.cs", baseUri),
-            CreateWatcher("**/*.csproj.user", baseUri),
-            CreateWatcher("**/*.slnf", baseUri),
-            CreateWatcher("**/*.slnx", baseUri),
-            CreateWatcher("**/*.props", baseUri),
-            CreateWatcher("**/*.targets", baseUri),
-            CreateWatcher("**/*.globalconfig", baseUri),
-            CreateWatcher("**/*.ruleset", baseUri),
-            CreateWatcher("**/*.rsp", baseUri),
-            CreateWatcher($"**/{StyleCopConfigFileName}", baseUri),
-            CreateWatcher("**/.editorconfig", baseUri),
-            CreateWatcher("**/obj/**/generated/**", baseUri)
-        ];
+        var watchers = new List<object>();
+        foreach (var extension in WorkspaceReloadExtensions)
+        {
+            watchers.Add(CreateWatcher($"**/*{extension}", baseUri));
+        }
+        foreach (var fileName in WorkspaceReloadFileNames)
+        {
+            watchers.Add(CreateWatcher($"**/{fileName}", baseUri));
+        }
+
+        watchers.Add(CreateWatcher($"**/{OmniSharpConfigFileName}", baseUri));
+        watchers.Add(CreateWatcher("**/*.razor", baseUri));
+        watchers.Add(CreateWatcher("**/*.cshtml", baseUri));
+        watchers.Add(CreateWatcher("**/*.razor.cs", baseUri));
+        watchers.Add(CreateWatcher("**/*.cs", baseUri));
+        watchers.Add(CreateWatcher("**/*.csproj.user", baseUri));
+        watchers.Add(CreateWatcher("**/.editorconfig", baseUri));
+        watchers.Add(CreateWatcher("**/obj/**/generated/**", baseUri));
+        return watchers.ToArray();
     }
 
     private static object CreateWatcher(string pattern, string? baseUri)
@@ -3328,30 +3459,24 @@ public class RazorLanguageServer : IAsyncDisposable
     private static bool IsWorkspaceReloadTriggerPath(string path)
     {
         var extension = Path.GetExtension(path);
-        if (extension.Equals(".sln", StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(SolutionFilterFileName, StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(SolutionXmlFileName, StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(".csproj", StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(".props", StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(".targets", StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(".globalconfig", StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(".ruleset", StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(".rsp", StringComparison.OrdinalIgnoreCase))
+        foreach (var reloadExtension in WorkspaceReloadExtensions)
         {
-            return true;
+            if (extension.Equals(reloadExtension, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
         }
 
         var fileName = Path.GetFileName(path);
-        return fileName.Equals(DirectoryBuildPropsFileName, StringComparison.OrdinalIgnoreCase) ||
-               fileName.Equals(DirectoryBuildTargetsFileName, StringComparison.OrdinalIgnoreCase) ||
-               fileName.Equals(DirectoryBuildRspFileName, StringComparison.OrdinalIgnoreCase) ||
-               fileName.Equals(DirectoryPackagesPropsFileName, StringComparison.OrdinalIgnoreCase) ||
-               fileName.Equals(DirectoryPackagesTargetsFileName, StringComparison.OrdinalIgnoreCase) ||
-                fileName.Equals(NuGetConfigFileName, StringComparison.OrdinalIgnoreCase) ||
-                fileName.Equals(NuGetConfigLowerFileName, StringComparison.OrdinalIgnoreCase) ||
-                fileName.Equals(StyleCopConfigFileName, StringComparison.OrdinalIgnoreCase) ||
-               fileName.Equals(PackagesLockFileName, StringComparison.OrdinalIgnoreCase) ||
-               fileName.Equals(GlobalJsonFileName, StringComparison.OrdinalIgnoreCase);
+        foreach (var reloadFileName in WorkspaceReloadFileNames)
+        {
+            if (fileName.Equals(reloadFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsSourceGeneratedPath(string path)
@@ -3362,12 +3487,8 @@ public class RazorLanguageServer : IAsyncDisposable
         }
 
         var normalized = path.Replace('\\', '/');
-        if (IsCaseInsensitiveFileSystem)
-        {
-            normalized = normalized.ToLowerInvariant();
-        }
-
-        return normalized.Contains("/obj/") && normalized.Contains("/generated/");
+        return normalized.IndexOf("/obj/", StringComparison.OrdinalIgnoreCase) >= 0 &&
+               normalized.IndexOf("/generated/", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private bool TryUpdateSourceGeneratedIndexForChange(string path, FileChangeType changeType)
@@ -3869,7 +3990,8 @@ public class RazorLanguageServer : IAsyncDisposable
                 writer.WriteEndObject();
             }
 
-            return JsonDocument.Parse(bufferWriter.WrittenMemory).RootElement.Clone();
+            using var doc = JsonDocument.Parse(bufferWriter.WrittenMemory);
+            return doc.RootElement.Clone();
         }
         finally
         {

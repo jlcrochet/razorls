@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net.Http;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RazorSharp.Dependencies;
@@ -158,6 +159,39 @@ public class DependencyManagerUpdateTests
     }
 
     [Fact]
+    public async Task CheckForUpdatesAsync_ThrottlesFailedChecks_AndRetriesOnce()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var manager = new DependencyManager(CreateLogger(), "1.0.0-test", tempRoot);
+            var attempts = 0;
+            manager.GetLatestRoslynVersionOverride = _ =>
+            {
+                attempts++;
+                throw new HttpRequestException("fail");
+            };
+
+            var before = DateTime.UtcNow;
+            var result = await manager.CheckForUpdatesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            Assert.Equal(DependencyUpdateStatus.Failed, result.Status);
+            Assert.Equal(2, attempts);
+
+            var info = ReadVersionInfo(manager.VersionFilePath);
+            Assert.NotNull(info.LastUpdateCheckUtc);
+            Assert.True(info.LastUpdateCheckUtc >= before);
+
+            var skipped = await manager.CheckForUpdatesAsync(TimeSpan.FromHours(1), CancellationToken.None);
+            Assert.Equal(DependencyUpdateStatus.Skipped, skipped.Status);
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
     public async Task CheckForUpdatesAsync_Skips_WhenPinnedVersionsConfigured()
     {
         var tempRoot = CreateTempDir();
@@ -211,6 +245,90 @@ public class DependencyManagerUpdateTests
             var result = await manager.EnsureDependenciesAsync(CancellationToken.None);
 
             Assert.True(result);
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
+    public async Task EnsureDependenciesAsync_Succeeds_WhenVersionMissingButDependenciesComplete()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var manager = new DependencyManager(CreateLogger(), "1.0.0-test", tempRoot);
+
+            Directory.CreateDirectory(manager.RoslynPath);
+            Directory.CreateDirectory(manager.RazorExtensionPath);
+            File.WriteAllText(Path.Combine(manager.RoslynPath, "Microsoft.CodeAnalysis.LanguageServer.dll"), "ok");
+            File.WriteAllText(Path.Combine(manager.RazorExtensionPath, "Microsoft.CodeAnalysis.Razor.Compiler.dll"), "ok");
+            File.WriteAllText(Path.Combine(manager.RazorExtensionPath, "Microsoft.VisualStudioCode.RazorExtension.dll"), "ok");
+
+            var result = await manager.EnsureDependenciesAsync(CancellationToken.None);
+
+            Assert.True(result);
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
+    public async Task EnsureDependenciesAsync_Fails_WhenIncompleteAndVersionsCannotBeResolved()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var manager = new DependencyManager(CreateLogger(), "1.0.0-test", tempRoot);
+            manager.GetLatestRoslynVersionOverride = _ => Task.FromResult<string?>(null);
+            manager.GetLatestExtensionVersionOverride = _ => Task.FromResult<string?>(null);
+
+            var result = await manager.EnsureDependenciesAsync(CancellationToken.None);
+
+            Assert.False(result);
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
+    public async Task CheckForUpdatesAsync_RetriesAndSucceeds_WhenTransientFailureOccurs()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var manager = new DependencyManager(CreateLogger(), "1.0.0-test", tempRoot);
+            WriteVersionInfo(manager.VersionFilePath, pendingVersion: null, version: "0.0.1+0.0.1");
+
+            var attempts = 0;
+            manager.GetLatestRoslynVersionOverride = _ =>
+            {
+                attempts++;
+                if (attempts == 1)
+                {
+                    throw new HttpRequestException("transient");
+                }
+                return Task.FromResult<string?>("9.9.9");
+            };
+            manager.GetLatestExtensionVersionOverride = _ => Task.FromResult<string?>("8.8.8");
+
+            var downloadCalled = false;
+            manager.DownloadUpdateOverride = (_, __, ___, ____) =>
+            {
+                downloadCalled = true;
+                return Task.CompletedTask;
+            };
+
+            var result = await manager.CheckForUpdatesAsync(TimeSpan.Zero, CancellationToken.None);
+
+            Assert.Equal(DependencyUpdateStatus.UpdateDownloaded, result.Status);
+            Assert.Equal(2, attempts);
+            Assert.True(downloadCalled);
         }
         finally
         {

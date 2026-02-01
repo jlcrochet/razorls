@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -246,6 +247,59 @@ public class WorkDoneProgressServerTests
             }
 
             Assert.True(minEndSeq > maxBeginSeq, "Expected all begins before any end.");
+        });
+    }
+
+    [Fact]
+    public async Task DiagnosticsMerge_PreservesRelatedDocuments()
+    {
+        await WithServer(async server =>
+        {
+            var callCount = 0;
+            server.SetForwardToRoslynOverrideForTests((_, @params, _) =>
+            {
+                callCount++;
+                var identifier = @params.TryGetProperty("identifier", out var idProp) ? idProp.GetString() : null;
+                if (identifier == "syntax")
+                {
+                    return Task.FromResult<JsonElement?>(JsonSerializer.SerializeToElement(new
+                    {
+                        kind = "full",
+                        resultId = "syntax",
+                        items = new[] { new { message = "a" } },
+                        relatedDocuments = new Dictionary<string, object>
+                        {
+                            ["file:///a.cs"] = new { kind = "full", items = Array.Empty<object>() }
+                        }
+                    }));
+                }
+
+                return Task.FromResult<JsonElement?>(JsonSerializer.SerializeToElement(new
+                {
+                    kind = "full",
+                    resultId = "semantic",
+                    items = new[] { new { message = "b" } },
+                    relatedDocuments = new Dictionary<string, object>
+                    {
+                        ["file:///b.cs"] = new { kind = "full", items = Array.Empty<object>() }
+                    }
+                }));
+            });
+
+            await server.HandleRoslynNotificationForTests(LspMethods.ProjectInitializationComplete, null, CancellationToken.None);
+
+            var diagnosticParams = CreateDiagnosticParams("file:///test.cs");
+            var result = await server.HandleDiagnosticAsync(diagnosticParams, CancellationToken.None);
+
+            Assert.True(result.HasValue);
+            var items = result.Value.GetProperty("items");
+            Assert.Equal(2, items.GetArrayLength());
+
+            var related = result.Value.GetProperty("relatedDocuments");
+            Assert.Equal(JsonValueKind.Object, related.ValueKind);
+            Assert.True(related.TryGetProperty("file:///a.cs", out _));
+            Assert.True(related.TryGetProperty("file:///b.cs", out _));
+            Assert.True(callCount >= 2);
         });
     }
 

@@ -41,6 +41,7 @@ Then configure your editor to:
 ### Requirements
 
 - **.NET 10+** - Required for both RazorSharp and the Roslyn Language Server dependencies it downloads
+- **64-bit runtime (x64 or arm64)** - 32-bit runtimes are not supported
 - **Node.js** - Optional, for HTML language server support (see [HTML Language Server](#html-language-server))
 
 ### Pre-built binaries
