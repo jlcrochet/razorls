@@ -311,6 +311,7 @@ public class WorkDoneProgressServerTests
             var progressRpc = new FakeProgressRpc();
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.SetUserRequestProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, __, ct) =>
             {
                 await Task.Delay(700, ct);

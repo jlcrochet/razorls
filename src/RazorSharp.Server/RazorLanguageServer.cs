@@ -287,6 +287,8 @@ public class RazorLanguageServer : IAsyncDisposable
         => _roslynRequestTimeout = timeout;
     internal void SetDiagnosticsProgressDelayForTests(int delayMs)
         => _diagnosticsProgressDelayMs = Math.Max(0, delayMs);
+    internal void SetUserRequestProgressDelayForTests(int delayMs)
+        => _userRequestProgressDelayMs = Math.Max(0, delayMs);
     internal void ApplyAutoUpdateSettingsForTests(RoslynOptions? options) => ApplyAutoUpdateSettings(options);
     internal void ApplyDependencySettingsForTests(DependencyOptions? options) => ApplyDependencySettings(options);
     internal bool AutoUpdateEnabledForTests => _autoUpdateEnabled;
