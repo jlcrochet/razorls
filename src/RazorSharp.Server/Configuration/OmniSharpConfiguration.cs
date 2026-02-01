@@ -90,6 +90,14 @@ public class InitializationOptions
     /// </summary>
     [JsonPropertyName("dependencies")]
     public DependencyOptions? Dependencies { get; set; }
+
+    /// <summary>
+    /// Delay in milliseconds before showing workDoneProgress for user requests (hover, code actions, etc.).
+    /// Set to a negative value to disable request progress indicators.
+    /// Default: 500
+    /// </summary>
+    [JsonPropertyName("requestProgressDelayMs")]
+    public int? RequestProgressDelayMs { get; set; }
 }
 
 /// <summary>
