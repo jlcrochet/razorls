@@ -46,7 +46,7 @@ Then configure your editor to:
 
 ### Pre-built binaries
 
-Download `razorsharp.zip` from the [Releases](https://github.com/jlcrochet/razorsharp/releases) page. The build is platform-agnostic and works on any OS with .NET installed.
+Download `razorsharp.zip` from the [Releases](https://github.com/jlcrochet/razorsharp/releases) page. The build is platform-agnostic and works on any OS with 64-bit .NET installed.
 
 ```bash
 # Extract and install
