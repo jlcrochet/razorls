@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -18,10 +19,15 @@ public class DependencyManager : IDisposable
     static readonly bool IsCaseInsensitiveFileSystem = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
     static readonly TimeSpan DefaultDownloadTimeout = TimeSpan.FromMinutes(10);
     static readonly TimeSpan VersionInfoStaleThreshold = TimeSpan.FromDays(30);
+    static readonly TimeSpan DependencyLockTimeout = TimeSpan.FromSeconds(30);
+    static readonly TimeSpan DependencyLockRetryDelay = TimeSpan.FromMilliseconds(200);
     const int MaxDownloadRetries = 3;
+    const int MaxUpdateCheckRetries = 2;
+    const int UpdateRetryBaseDelayMs = 250;
     long _downloadRetryCount;
 
     const string UpdateRootDirectoryName = "updates";
+    const string DependencyLockFileName = ".dependency.lock";
     internal Func<CancellationToken, Task<string?>>? GetLatestRoslynVersionOverride;
     internal Func<CancellationToken, Task<string?>>? GetLatestExtensionVersionOverride;
     internal Func<string, string, string, CancellationToken, Task>? DownloadUpdateOverride;
@@ -36,6 +42,14 @@ public class DependencyManager : IDisposable
         _httpClient = new HttpClient();
         _httpClient.DefaultRequestHeaders.Add("User-Agent", $"RazorSharp/{version}");
         _httpClient.Timeout = DefaultDownloadTimeout;
+
+        var architecture = RuntimeInformation.ProcessArchitecture;
+        if (architecture is Architecture.X86 or Architecture.Arm)
+        {
+            _logger.LogError(
+                "RazorSharp does not support 32-bit runtimes (arch: {Architecture}). Use x64 or arm64.",
+                architecture);
+        }
     }
 
     public void ConfigurePinnedVersions(string? roslynVersion, string? extensionVersion)
@@ -91,12 +105,36 @@ public class DependencyManager : IDisposable
                 return await EnsureDependenciesOverride(cancellationToken, onProgress);
             }
 
+            await using var dependencyLock = await TryAcquireDependencyLockAsync(DependencyLockTimeout, cancellationToken);
+            if (dependencyLock == null)
+            {
+                _logger.LogWarning("Timed out waiting for dependency lock; skipping dependency ensure.");
+                onProgress?.Invoke("Timed out waiting for dependency lock");
+                return false;
+            }
+
             Directory.CreateDirectory(_basePath);
 
             var installedVersion = GetInstalledVersion();
+            if (!HasPinnedVersions &&
+                AreDependenciesComplete() &&
+                string.IsNullOrWhiteSpace(installedVersion?.Version))
+            {
+                _logger.LogWarning("Dependencies appear complete but version info is missing; skipping version resolution.");
+                onProgress?.Invoke("Dependencies present; version info missing");
+                return true;
+            }
+
             var targetVersions = await ResolveTargetVersionsAsync(installedVersion, cancellationToken);
             if (targetVersions == null)
             {
+                if (!HasPinnedVersions && AreDependenciesComplete())
+                {
+                    _logger.LogWarning("Dependencies appear complete but versions could not be resolved; skipping download.");
+                    onProgress?.Invoke("Dependencies present; skipping download");
+                    return true;
+                }
+
                 _logger.LogError("Unable to resolve dependency versions. Configure pinned versions or check network access.");
                 onProgress?.Invoke("Failed to resolve dependency versions");
                 return false;
@@ -151,16 +189,27 @@ public class DependencyManager : IDisposable
         {
             try
             {
-                var result = await GetLatestRoslynVersionAsync(null, null, cancellationToken);
-                if (result.Success && !string.IsNullOrWhiteSpace(result.Version))
+                if (GetLatestRoslynVersionOverride != null)
                 {
-                    roslynVersion = result.Version;
-                    if (info != null)
+                    roslynVersion = await GetLatestRoslynVersionOverride(cancellationToken);
+                    if (info != null && !string.IsNullOrWhiteSpace(roslynVersion))
                     {
-                        info.LastKnownRoslynVersion = result.Version;
-                        if (!string.IsNullOrWhiteSpace(result.ETag))
+                        info.LastKnownRoslynVersion = roslynVersion;
+                    }
+                }
+                else
+                {
+                    var result = await GetLatestRoslynVersionAsync(null, null, cancellationToken);
+                    if (result.Success && !string.IsNullOrWhiteSpace(result.Version))
+                    {
+                        roslynVersion = result.Version;
+                        if (info != null)
                         {
-                            info.RoslynReleasesETag = result.ETag;
+                            info.LastKnownRoslynVersion = result.Version;
+                            if (!string.IsNullOrWhiteSpace(result.ETag))
+                            {
+                                info.RoslynReleasesETag = result.ETag;
+                            }
                         }
                     }
                 }
@@ -184,16 +233,27 @@ public class DependencyManager : IDisposable
         {
             try
             {
-                var result = await GetLatestExtensionVersionAsync(null, null, cancellationToken);
-                if (result.Success && !string.IsNullOrWhiteSpace(result.Version))
+                if (GetLatestExtensionVersionOverride != null)
                 {
-                    extensionVersion = result.Version;
-                    if (info != null)
+                    extensionVersion = await GetLatestExtensionVersionOverride(cancellationToken);
+                    if (info != null && !string.IsNullOrWhiteSpace(extensionVersion))
                     {
-                        info.LastKnownExtensionVersion = result.Version;
-                        if (!string.IsNullOrWhiteSpace(result.ETag))
+                        info.LastKnownExtensionVersion = extensionVersion;
+                    }
+                }
+                else
+                {
+                    var result = await GetLatestExtensionVersionAsync(null, null, cancellationToken);
+                    if (result.Success && !string.IsNullOrWhiteSpace(result.Version))
+                    {
+                        extensionVersion = result.Version;
+                        if (info != null)
                         {
-                            info.ExtensionVersionsETag = result.ETag;
+                            info.LastKnownExtensionVersion = result.Version;
+                            if (!string.IsNullOrWhiteSpace(result.ETag))
+                            {
+                                info.ExtensionVersionsETag = result.ETag;
+                            }
                         }
                     }
                 }
@@ -244,6 +304,13 @@ public class DependencyManager : IDisposable
 
     public bool ApplyPendingUpdateIfAvailable()
     {
+        using var dependencyLock = TryAcquireDependencyLock(DependencyLockTimeout);
+        if (dependencyLock == null)
+        {
+            _logger.LogWarning("Timed out waiting for dependency lock; skipping pending update apply.");
+            return false;
+        }
+
         var info = GetInstalledVersion();
         if (string.IsNullOrWhiteSpace(info?.PendingVersion))
         {
@@ -291,12 +358,22 @@ public class DependencyManager : IDisposable
             minInterval = TimeSpan.Zero;
         }
 
-        var info = GetInstalledVersion();
         if (HasPinnedVersions)
         {
             _logger.LogInformation("Skipping dependency update check because pinned versions are configured.");
-            return new DependencyUpdateResult(DependencyUpdateStatus.Skipped, info?.Version, info?.PendingVersion);
+            var pinnedInfo = GetInstalledVersion();
+            return new DependencyUpdateResult(DependencyUpdateStatus.Skipped, pinnedInfo?.Version, pinnedInfo?.PendingVersion);
         }
+
+        await using var dependencyLock = await TryAcquireDependencyLockAsync(DependencyLockTimeout, cancellationToken);
+        if (dependencyLock == null)
+        {
+            _logger.LogWarning("Timed out waiting for dependency lock; skipping update check.");
+            var lockedInfo = GetInstalledVersion();
+            return new DependencyUpdateResult(DependencyUpdateStatus.Skipped, lockedInfo?.Version, lockedInfo?.PendingVersion);
+        }
+
+        var info = GetInstalledVersion();
 
         var now = DateTime.UtcNow;
         var lastSuccess = info?.LastUpdateSuccessUtc ?? info?.LastUpdateCheckUtc;
@@ -308,62 +385,81 @@ public class DependencyManager : IDisposable
 
         info ??= new DependencyVersionInfo();
         info.LastUpdateAttemptUtc = now;
+        info.LastUpdateCheckUtc = now;
         WriteVersionInfo(info);
 
         string? latestRoslyn = _pinnedRoslynVersion;
         string? latestExtension = _pinnedExtensionVersion;
-        try
+        var attempt = 0;
+        while (true)
         {
-            if (latestRoslyn == null)
+            attempt++;
+            try
             {
-                if (GetLatestRoslynVersionOverride != null)
+                if (latestRoslyn == null)
                 {
-                    latestRoslyn = await GetLatestRoslynVersionOverride(cancellationToken);
-                }
-                else
-                {
-                    var roslynResult = await GetLatestRoslynVersionAsync(
-                        info.RoslynReleasesETag,
-                        info.LastKnownRoslynVersion,
-                        cancellationToken);
-                    if (!roslynResult.Success)
+                    if (GetLatestRoslynVersionOverride != null)
                     {
-                        throw new InvalidOperationException("Failed to resolve latest Roslyn version.");
+                        latestRoslyn = await GetLatestRoslynVersionOverride(cancellationToken);
                     }
+                    else
+                    {
+                        var roslynResult = await GetLatestRoslynVersionAsync(
+                            info.RoslynReleasesETag,
+                            info.LastKnownRoslynVersion,
+                            cancellationToken);
+                        if (!roslynResult.Success)
+                        {
+                            throw new InvalidOperationException("Failed to resolve latest Roslyn version.");
+                        }
 
-                    latestRoslyn = roslynResult.Version;
-                    info.RoslynReleasesETag = roslynResult.ETag ?? info.RoslynReleasesETag;
-                    info.LastKnownRoslynVersion = roslynResult.Version ?? info.LastKnownRoslynVersion;
+                        latestRoslyn = roslynResult.Version;
+                        info.RoslynReleasesETag = roslynResult.ETag ?? info.RoslynReleasesETag;
+                        info.LastKnownRoslynVersion = roslynResult.Version ?? info.LastKnownRoslynVersion;
+                    }
                 }
-            }
 
-            if (latestExtension == null)
+                if (latestExtension == null)
+                {
+                    if (GetLatestExtensionVersionOverride != null)
+                    {
+                        latestExtension = await GetLatestExtensionVersionOverride(cancellationToken);
+                    }
+                    else
+                    {
+                        var extensionResult = await GetLatestExtensionVersionAsync(
+                            info.ExtensionVersionsETag,
+                            info.LastKnownExtensionVersion,
+                            cancellationToken);
+                        if (!extensionResult.Success)
+                        {
+                            throw new InvalidOperationException("Failed to resolve latest extension version.");
+                        }
+
+                        latestExtension = extensionResult.Version;
+                        info.ExtensionVersionsETag = extensionResult.ETag ?? info.ExtensionVersionsETag;
+                        info.LastKnownExtensionVersion = extensionResult.Version ?? info.LastKnownExtensionVersion;
+                    }
+                }
+
+                break;
+            }
+            catch (Exception ex) when (IsTransientUpdateFailure(ex, cancellationToken) && attempt < MaxUpdateCheckRetries)
             {
-                if (GetLatestExtensionVersionOverride != null)
-                {
-                    latestExtension = await GetLatestExtensionVersionOverride(cancellationToken);
-                }
-                else
-                {
-                    var extensionResult = await GetLatestExtensionVersionAsync(
-                        info.ExtensionVersionsETag,
-                        info.LastKnownExtensionVersion,
-                        cancellationToken);
-                    if (!extensionResult.Success)
-                    {
-                        throw new InvalidOperationException("Failed to resolve latest extension version.");
-                    }
-
-                    latestExtension = extensionResult.Version;
-                    info.ExtensionVersionsETag = extensionResult.ETag ?? info.ExtensionVersionsETag;
-                    info.LastKnownExtensionVersion = extensionResult.Version ?? info.LastKnownExtensionVersion;
-                }
+                latestRoslyn = _pinnedRoslynVersion;
+                latestExtension = _pinnedExtensionVersion;
+                var delay = TimeSpan.FromMilliseconds(UpdateRetryBaseDelayMs * attempt);
+                _logger.LogWarning(ex, "Failed to check for dependency updates, retrying in {Delay} (attempt {Attempt}/{MaxAttempts})",
+                    delay,
+                    attempt,
+                    MaxUpdateCheckRetries);
+                await Task.Delay(delay, cancellationToken);
             }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to check for dependency updates");
-            return new DependencyUpdateResult(DependencyUpdateStatus.Failed, info.Version, info.PendingVersion);
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to check for dependency updates");
+                return new DependencyUpdateResult(DependencyUpdateStatus.Failed, info.Version, info.PendingVersion);
+            }
         }
 
         if (string.IsNullOrWhiteSpace(latestRoslyn) || string.IsNullOrWhiteSpace(latestExtension))
@@ -461,7 +557,16 @@ public class DependencyManager : IDisposable
 
     private async Task DownloadRoslynLanguageServerAsync(string version, string destinationPath, CancellationToken cancellationToken, Action<string>? onProgress = null)
     {
-        var platform = GetRoslynPlatform();
+        var architecture = RuntimeInformation.ProcessArchitecture;
+        if (architecture is Architecture.X86 or Architecture.Arm)
+        {
+            _logger.LogError(
+                "Roslyn language server dependencies do not support 32-bit runtimes (arch: {Architecture}). Use x64 or arm64.",
+                architecture);
+            throw new NotSupportedException("32-bit runtimes are not supported for Roslyn language server dependencies.");
+        }
+
+        var platform = GetRoslynPlatform(architecture);
         var url = $"https://github.com/Crashdummyy/roslynLanguageServer/releases/download/{version}/microsoft.codeanalysis.languageserver.{platform}.zip";
 
         _logger.LogInformation("Downloading Roslyn from {Url}", url);
@@ -584,6 +689,9 @@ public class DependencyManager : IDisposable
         return ex is HttpRequestException || ex is IOException || ex is TaskCanceledException;
     }
 
+    private static bool IsTransientUpdateFailure(Exception ex, CancellationToken cancellationToken)
+        => IsTransientDownloadFailure(ex, cancellationToken);
+
     private static void TryDeleteFile(string path)
     {
         try
@@ -700,12 +808,12 @@ public class DependencyManager : IDisposable
         }
     }
 
-    private static string GetRoslynPlatform()
+    private static string GetRoslynPlatform(Architecture architecture)
     {
         // Determine platform for Roslyn Language Server download
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return RuntimeInformation.ProcessArchitecture switch
+            return architecture switch
             {
                 Architecture.Arm64 => "win-arm64",
                 _ => "win-x64"
@@ -713,7 +821,7 @@ public class DependencyManager : IDisposable
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
-            return RuntimeInformation.ProcessArchitecture switch
+            return architecture switch
             {
                 Architecture.Arm64 => "osx-arm64",
                 _ => "osx-x64"
@@ -721,7 +829,7 @@ public class DependencyManager : IDisposable
         }
         else // Linux
         {
-            return RuntimeInformation.ProcessArchitecture switch
+            return architecture switch
             {
                 Architecture.Arm64 => "linux-arm64",
                 _ => "linux-x64"
@@ -818,9 +926,47 @@ public class DependencyManager : IDisposable
 
     private void WriteVersionInfo(DependencyVersionInfo info)
     {
-        Directory.CreateDirectory(_basePath);
-        var json = JsonSerializer.Serialize(info, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(VersionFilePath, json);
+        try
+        {
+            Directory.CreateDirectory(_basePath);
+            var json = JsonSerializer.Serialize(info, new JsonSerializerOptions { WriteIndented = true });
+            var directory = Path.GetDirectoryName(VersionFilePath);
+            if (string.IsNullOrEmpty(directory))
+            {
+                return;
+            }
+
+            var tempPath = Path.Combine(directory, $"version.json.tmp-{Guid.NewGuid():N}");
+            File.WriteAllText(tempPath, json);
+
+            if (File.Exists(VersionFilePath))
+            {
+                File.Replace(tempPath, VersionFilePath, null, ignoreMetadataErrors: true);
+            }
+            else
+            {
+                File.Move(tempPath, VersionFilePath);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to write dependency version file at {Path}", VersionFilePath);
+            try
+            {
+                var directory = Path.GetDirectoryName(VersionFilePath);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    foreach (var tempFile in Directory.EnumerateFiles(directory, "version.json.tmp-*"))
+                    {
+                        TryDeleteFile(tempFile);
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore cleanup failures
+            }
+        }
     }
 
     private string GetUpdateRoot(string version)
@@ -860,12 +1006,35 @@ public class DependencyManager : IDisposable
             throw new DirectoryNotFoundException($"Source directory not found: {sourceDir}");
         }
 
-        if (Directory.Exists(destinationDir))
+        var backupDir = destinationDir + ".bak-" + Guid.NewGuid().ToString("N");
+        try
         {
-            Directory.Delete(destinationDir, recursive: true);
-        }
+            if (Directory.Exists(destinationDir))
+            {
+                Directory.Move(destinationDir, backupDir);
+            }
 
-        Directory.Move(sourceDir, destinationDir);
+            Directory.Move(sourceDir, destinationDir);
+        }
+        catch
+        {
+            if (Directory.Exists(backupDir) && !Directory.Exists(destinationDir))
+            {
+                try
+                {
+                    Directory.Move(backupDir, destinationDir);
+                }
+                catch
+                {
+                    // Ignore rollback failures
+                }
+            }
+            throw;
+        }
+        finally
+        {
+            TryDeleteDirectory(backupDir);
+        }
     }
 
     private static void TryDeleteDirectory(string path)
@@ -967,6 +1136,73 @@ public class DependencyManager : IDisposable
         catch
         {
             // Ignore cleanup errors
+        }
+    }
+
+    private DependencyLock? TryAcquireDependencyLock(TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            try
+            {
+                Directory.CreateDirectory(_basePath);
+                var lockPath = Path.Combine(_basePath, DependencyLockFileName);
+                var stream = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                return new DependencyLock(stream);
+            }
+            catch (IOException)
+            {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    return null;
+                }
+
+                Thread.Sleep(DependencyLockRetryDelay);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    return null;
+                }
+
+                Thread.Sleep(DependencyLockRetryDelay);
+            }
+        }
+    }
+
+    private async Task<DependencyLock?> TryAcquireDependencyLockAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                Directory.CreateDirectory(_basePath);
+                var lockPath = Path.Combine(_basePath, DependencyLockFileName);
+                var stream = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                return new DependencyLock(stream);
+            }
+            catch (IOException)
+            {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    return null;
+                }
+
+                await Task.Delay(DependencyLockRetryDelay, cancellationToken);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    return null;
+                }
+
+                await Task.Delay(DependencyLockRetryDelay, cancellationToken);
+            }
         }
     }
 
@@ -1207,4 +1443,25 @@ readonly record struct VersionFetchResult(string? Version, string? ETag, bool Su
     public static VersionFetchResult Failed => new(null, null, Success: false, FromCache: false);
     public static VersionFetchResult CreateSuccess(string version, string? etag) => new(version, etag, Success: true, FromCache: false);
     public static VersionFetchResult CreateFromCache(string version, string? etag) => new(version, etag, Success: true, FromCache: true);
+}
+
+sealed class DependencyLock : IDisposable, IAsyncDisposable
+{
+    readonly FileStream _stream;
+
+    public DependencyLock(FileStream stream)
+    {
+        _stream = stream;
+    }
+
+    public void Dispose()
+    {
+        _stream.Dispose();
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _stream.Dispose();
+        return ValueTask.CompletedTask;
+    }
 }

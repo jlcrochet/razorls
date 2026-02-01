@@ -462,10 +462,18 @@ public class FileWatchingTests
     {
         readonly List<LogEntry> _entries = new();
 
-        public IReadOnlyList<LogEntry> Entries => _entries;
+        public IReadOnlyList<LogEntry> Entries => GetEntriesSnapshot();
 
         public ILogger CreateLogger(string categoryName)
             => new TestLogger(categoryName, _entries);
+
+        public IReadOnlyList<LogEntry> GetEntriesSnapshot()
+        {
+            lock (_entries)
+            {
+                return _entries.ToArray();
+            }
+        }
 
         public void Dispose()
         {

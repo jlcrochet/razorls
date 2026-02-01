@@ -45,6 +45,23 @@ public class LoggingSwitchTests
         }
     }
 
+    [Fact]
+    public void LogFileSwitch_DisablesFile_WhenPathInvalid()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var logFileSwitch = new LogFileSwitch(tempRoot, TextWriter.Null);
+
+            Assert.False(logFileSwitch.IsFileEnabled);
+            logFileSwitch.WriteLine("hello");
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
     static string CreateTempDir()
     {
         var path = Path.Combine(Path.GetTempPath(), "razorsharp-tests", Guid.NewGuid().ToString("N"));

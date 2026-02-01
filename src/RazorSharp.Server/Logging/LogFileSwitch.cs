@@ -5,11 +5,13 @@ namespace RazorSharp.Server;
 internal sealed class LogFileSwitch : IDisposable
 {
     readonly Lock _lock = new();
+    readonly TextWriter _errorWriter;
     StreamWriter? _writer;
     string? _currentPath;
 
-    public LogFileSwitch(string? initialPath = null)
+    public LogFileSwitch(string? initialPath = null, TextWriter? errorWriter = null)
     {
+        _errorWriter = errorWriter ?? Console.Error;
         if (!string.IsNullOrWhiteSpace(initialPath))
         {
             SetLogFile(initialPath);
@@ -31,28 +33,38 @@ internal sealed class LogFileSwitch : IDisposable
     {
         lock (_lock)
         {
-            if (string.IsNullOrWhiteSpace(path))
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    _writer?.Dispose();
+                    _writer = null;
+                    _currentPath = null;
+                    return;
+                }
+
+                if (string.Equals(_currentPath, path, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+
+                _writer?.Dispose();
+                _writer = new StreamWriter(path, append: true) { AutoFlush = true };
+                _currentPath = path;
+            }
+            catch (Exception ex)
             {
                 _writer?.Dispose();
                 _writer = null;
                 _currentPath = null;
-                return;
+                _errorWriter.WriteLine($"Failed to open log file '{path}': {ex.Message}");
             }
-
-            if (string.Equals(_currentPath, path, StringComparison.Ordinal))
-            {
-                return;
-            }
-
-            var dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir))
-            {
-                Directory.CreateDirectory(dir);
-            }
-
-            _writer?.Dispose();
-            _writer = new StreamWriter(path, append: true) { AutoFlush = true };
-            _currentPath = path;
         }
     }
 
@@ -62,12 +74,22 @@ internal sealed class LogFileSwitch : IDisposable
         {
             if (_writer != null)
             {
-                _writer.WriteLine(line);
-                return;
+                try
+                {
+                    _writer.WriteLine(line);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _writer.Dispose();
+                    _writer = null;
+                    _currentPath = null;
+                    _errorWriter.WriteLine($"Failed to write to log file: {ex.Message}");
+                }
             }
         }
 
-        Console.Error.WriteLine(line);
+        _errorWriter.WriteLine(line);
     }
 
     public void Dispose()
