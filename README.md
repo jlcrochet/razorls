@@ -107,6 +107,7 @@ If auto-updates are enabled (default), RazorSharp will download missing dependen
 | `--version` | Show version |
 
 The server communicates via LSP over stdin/stdout.
+Long-running requests (e.g., hover, code actions) emit workDoneProgress notifications when the client advertises support. The delay is configurable via `initializationOptions.requestProgressDelayMs`.
 
 ## Compatibility
 
@@ -337,6 +338,7 @@ RazorSharp supports configuration via LSP `initializationOptions`. In Helix, thi
 | `logging.level` | string | `Information` | Default log level (CLI `--loglevel` overrides) |
 | `logging.file` | string | `null` | Log file path (CLI `--logFile` overrides) |
 | `dependencies.skipDependencyCheck` | bool | `false` | Skip dependency presence checks (CLI `--skip-dependency-check` overrides) |
+| `requestProgressDelayMs` | int | `500` | Delay (ms) before showing workDoneProgress for user requests; set `< 0` to disable |
 | `dependencies.pinnedRoslynVersion` | string | `null` | Pin Roslyn Language Server version (disables auto-update checks when set) |
 | `dependencies.pinnedExtensionVersion` | string | `null` | Pin Razor extension version (disables auto-update checks when set) |
 

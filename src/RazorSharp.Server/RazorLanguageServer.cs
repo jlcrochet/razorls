@@ -98,6 +98,7 @@ public class RazorLanguageServer : IAsyncDisposable
     const int MaxPendingChangesPerDocument = 200;
     const int MaxContentChangesToApply = 50;
     const int WorkspaceReloadDebounceMs = 1000;
+    const int DefaultUserRequestProgressDelayMs = 500;
     static readonly TimeSpan AutoUpdateStartupDelay = TimeSpan.FromSeconds(5);
     const int FileWatchKindAll = 7;
     const string FileWatchRegistrationId = "razorsharp.didChangeWatchedFiles";
@@ -117,6 +118,7 @@ public class RazorLanguageServer : IAsyncDisposable
     static readonly TimeSpan DefaultRoslynRequestTimeout = TimeSpan.FromSeconds(10);
     int _diagnosticsProgressDelayMs = DefaultDiagnosticsProgressDelayMs;
     TimeSpan _roslynRequestTimeout = DefaultRoslynRequestTimeout;
+    int _userRequestProgressDelayMs = DefaultUserRequestProgressDelayMs;
     static readonly TimeSpan SourceGeneratedIndexRefreshInterval = TimeSpan.FromSeconds(60);
     static readonly EnumerationOptions SourceGeneratedEnumerateOptions = new()
     {
@@ -476,6 +478,30 @@ public class RazorLanguageServer : IAsyncDisposable
         }
     }
 
+    private void ApplyRequestProgressSettings(InitializationOptions? options)
+    {
+        if (options?.RequestProgressDelayMs == null)
+        {
+            return;
+        }
+
+        var delayMs = options.RequestProgressDelayMs.Value;
+        if (delayMs < 0)
+        {
+            _userRequestProgressDelayMs = -1;
+            _logger.LogInformation("Request progress indicators disabled by initializationOptions");
+            return;
+        }
+
+        if (delayMs > MaxFastStartDelayMs)
+        {
+            delayMs = MaxFastStartDelayMs;
+        }
+
+        _userRequestProgressDelayMs = delayMs;
+        _logger.LogInformation("Request progress delay set to {DelayMs}ms via initializationOptions", delayMs);
+    }
+
     /// <summary>
     /// Runs the language server, listening on stdin/stdout.
     /// </summary>
@@ -573,6 +599,7 @@ public class RazorLanguageServer : IAsyncDisposable
                 ApplyDependencySettings(initOptions?.Dependencies);
                 ApplyRoslynTimeout(initOptions?.Roslyn);
                 ApplyAutoUpdateSettings(initOptions?.Roslyn);
+                ApplyRequestProgressSettings(initOptions);
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
                     var triggerChars = initOptions?.Capabilities?.CompletionProvider?.TriggerCharacters;
@@ -1637,51 +1664,51 @@ public class RazorLanguageServer : IAsyncDisposable
     public async Task<JsonElement?> HandleCompletionAsync(JsonElement @params, CancellationToken ct)
     {
         _logger.LogDebug("Completion request received");
-        return await ForwardToRoslynAsync(LspMethods.TextDocumentCompletion, @params, ct);
+        return await ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentCompletion, @params, "Completion", ct);
     }
 
     [JsonRpcMethod(LspMethods.CompletionItemResolve, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleCompletionResolveAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.CompletionItemResolve, @params, ct);
+        => ForwardToRoslynWithProgressAsync(LspMethods.CompletionItemResolve, @params, "Completion resolve", ct);
 
     [JsonRpcMethod(LspMethods.TextDocumentHover, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleHoverAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentHover, @params, ct);
+        => ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentHover, @params, "Hover", ct);
 
     [JsonRpcMethod(LspMethods.TextDocumentDefinition, UseSingleObjectParameterDeserialization = true)]
     public async Task<JsonElement?> HandleDefinitionAsync(JsonElement @params, CancellationToken ct)
     {
-        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentDefinition, @params, ct);
+        var result = await ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentDefinition, @params, "Definition", ct);
         return result.HasValue ? TransformSourceGeneratedUris(result.Value) : result;
     }
 
     [JsonRpcMethod(LspMethods.TextDocumentReferences, UseSingleObjectParameterDeserialization = true)]
     public async Task<JsonElement?> HandleReferencesAsync(JsonElement @params, CancellationToken ct)
     {
-        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentReferences, @params, ct);
+        var result = await ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentReferences, @params, "References", ct);
         return result.HasValue ? TransformSourceGeneratedUris(result.Value) : result;
     }
 
     [JsonRpcMethod(LspMethods.TextDocumentImplementation, UseSingleObjectParameterDeserialization = true)]
     public async Task<JsonElement?> HandleImplementationAsync(JsonElement @params, CancellationToken ct)
     {
-        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentImplementation, @params, ct);
+        var result = await ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentImplementation, @params, "Implementation", ct);
         return result.HasValue ? TransformSourceGeneratedUris(result.Value) : result;
     }
 
     [JsonRpcMethod(LspMethods.TextDocumentDocumentHighlight, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleDocumentHighlightAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentDocumentHighlight, @params, ct);
+        => ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentDocumentHighlight, @params, "Document highlights", ct);
 
     [JsonRpcMethod(LspMethods.TextDocumentDocumentSymbol, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleDocumentSymbolAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentDocumentSymbol, @params, ct);
+        => ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentDocumentSymbol, @params, "Document symbols", ct);
 
     [JsonRpcMethod(LspMethods.TextDocumentCodeAction, UseSingleObjectParameterDeserialization = true)]
     public async Task<JsonElement?> HandleCodeActionAsync(JsonElement @params, CancellationToken ct)
     {
         _logger.LogDebug("Forwarding textDocument/codeAction to Roslyn");
-        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentCodeAction, @params, ct);
+        var result = await ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentCodeAction, @params, "Code actions", ct);
 
         // Transform code actions to expand nested actions for editors that don't support them
         // Also pre-resolve actions that need resolution (have data but no edit)
@@ -1853,7 +1880,7 @@ public class RazorLanguageServer : IAsyncDisposable
         var title = @params.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : "(no title)";
         _logger.LogDebug("Resolving code action: {Title}", title);
 
-        var result = await ForwardToRoslynAsync(LspMethods.CodeActionResolve, @params, ct);
+        var result = await ForwardToRoslynWithProgressAsync(LspMethods.CodeActionResolve, @params, "Resolve code action", ct);
 
         if (result.HasValue)
         {
@@ -1877,7 +1904,7 @@ public class RazorLanguageServer : IAsyncDisposable
         {
             _logger.LogTrace("Formatting request params: {Params}", @params.GetRawText());
         }
-        var result = await ForwardToRoslynAsync(LspMethods.TextDocumentFormatting, @params, ct);
+        var result = await ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentFormatting, @params, "Formatting", ct);
         if (_logger.IsEnabled(LogLevel.Trace))
         {
             _logger.LogTrace("Formatting response: {Result}", result?.GetRawText() ?? "null");
@@ -1887,7 +1914,7 @@ public class RazorLanguageServer : IAsyncDisposable
 
     [JsonRpcMethod(LspMethods.TextDocumentRangeFormatting, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleRangeFormattingAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentRangeFormatting, @params, ct);
+        => ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentRangeFormatting, @params, "Range formatting", ct);
 
     [JsonRpcMethod(LspMethods.TextDocumentOnTypeFormatting, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleOnTypeFormattingAsync(JsonElement @params, CancellationToken ct)
@@ -1895,15 +1922,15 @@ public class RazorLanguageServer : IAsyncDisposable
 
     [JsonRpcMethod(LspMethods.TextDocumentRename, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleRenameAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentRename, @params, ct);
+        => ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentRename, @params, "Rename", ct);
 
     [JsonRpcMethod(LspMethods.TextDocumentPrepareRename, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandlePrepareRenameAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentPrepareRename, @params, ct);
+        => ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentPrepareRename, @params, "Prepare rename", ct);
 
     [JsonRpcMethod(LspMethods.TextDocumentSignatureHelp, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleSignatureHelpAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.TextDocumentSignatureHelp, @params, ct);
+        => ForwardToRoslynWithProgressAsync(LspMethods.TextDocumentSignatureHelp, @params, "Signature help", ct);
 
     [JsonRpcMethod(LspMethods.TextDocumentFoldingRange, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleFoldingRangeAsync(JsonElement @params, CancellationToken ct)
@@ -1927,7 +1954,7 @@ public class RazorLanguageServer : IAsyncDisposable
 
     [JsonRpcMethod(LspMethods.WorkspaceSymbol, UseSingleObjectParameterDeserialization = true)]
     public Task<JsonElement?> HandleWorkspaceSymbolAsync(JsonElement @params, CancellationToken ct)
-        => ForwardToRoslynAsync(LspMethods.WorkspaceSymbol, @params, ct);
+        => ForwardToRoslynWithProgressAsync(LspMethods.WorkspaceSymbol, @params, "Workspace symbols", ct);
 
     [JsonRpcMethod(LspMethods.WorkspaceExecuteCommand, UseSingleObjectParameterDeserialization = true)]
     public async Task<JsonElement?> HandleExecuteCommandAsync(JsonElement @params, CancellationToken ct)
@@ -2629,6 +2656,44 @@ public class RazorLanguageServer : IAsyncDisposable
 
         var token = CreateWorkDoneProgressToken(tokenPrefix);
         return new WorkDoneProgressScope(this, token, title, message, delayMs, ct);
+    }
+
+    private async Task<JsonElement?> ForwardToRoslynWithProgressAsync(
+        string method,
+        JsonElement @params,
+        string message,
+        CancellationToken ct)
+    {
+        return await WithUserRequestProgressAsync(message, ct, () => ForwardToRoslynAsync(method, @params, ct));
+    }
+
+    private async Task<JsonElement?> WithUserRequestProgressAsync(
+        string message,
+        CancellationToken ct,
+        Func<Task<JsonElement?>> action)
+    {
+        if (_userRequestProgressDelayMs < 0)
+        {
+            return await action();
+        }
+
+        var progress = BeginWorkDoneProgress(
+            "razorsharp.request",
+            "RazorSharp",
+            message,
+            _userRequestProgressDelayMs,
+            ct);
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            if (progress != null)
+            {
+                await progress.DisposeAsync();
+            }
+        }
     }
 
     private string CreateWorkDoneProgressToken(string prefix)

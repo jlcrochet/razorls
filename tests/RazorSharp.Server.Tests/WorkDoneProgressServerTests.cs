@@ -304,6 +304,38 @@ public class WorkDoneProgressServerTests
     }
 
     [Fact]
+    public async Task Hover_ShowsProgress_WhenSlow()
+    {
+        await WithServer(async server =>
+        {
+            var progressRpc = new FakeProgressRpc();
+            server.SetProgressRpcForTests(progressRpc);
+            server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.SetForwardToRoslynOverrideForTests(async (_, __, ct) =>
+            {
+                await Task.Delay(700, ct);
+                return JsonSerializer.SerializeToElement(new { contents = "ok" });
+            });
+
+            var hoverParams = JsonSerializer.SerializeToElement(new
+            {
+                textDocument = new { uri = "file:///test.cs" },
+                position = new { line = 0, character = 0 }
+            });
+
+            await server.HandleHoverAsync(hoverParams, CancellationToken.None);
+
+            Assert.Single(progressRpc.Requests);
+            Assert.Equal(LspMethods.WindowWorkDoneProgressCreate, progressRpc.Requests[0].Method);
+            var kinds = progressRpc.Notifications
+                .Where(notification => notification.Method == LspMethods.Progress)
+                .Select(notification => GetProgressKind(notification.Params))
+                .ToArray();
+            Assert.Equal(new[] { "begin", "end" }, kinds);
+        });
+    }
+
+    [Fact]
     public async Task DiagnosticsProgress_MixedSpeed_OnlySlowEmitsProgress()
     {
         await WithServer(async server =>
