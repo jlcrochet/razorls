@@ -71,7 +71,9 @@ public class RazorLanguageServer : IAsyncDisposable
     CancellationTokenSource? _workspaceReloadCts;
     Task? _workspaceReloadTask;
     WorkDoneProgressScope? _workspaceInitProgress;
+    Task? _workspaceInitTimeoutTask;
     bool _workspaceInitStarted;
+    int _workspaceInitProgressTimeoutMs = DefaultWorkspaceInitProgressTimeoutMs;
     readonly Lock _roslynStartLock = new();
     Task<bool>? _roslynStartTask;
     long _workDoneProgressCounter;
@@ -99,6 +101,7 @@ public class RazorLanguageServer : IAsyncDisposable
     const int MaxContentChangesToApply = 50;
     const int WorkspaceReloadDebounceMs = 1000;
     const int DefaultUserRequestProgressDelayMs = 1000;
+    const int DefaultWorkspaceInitProgressTimeoutMs = 60000;
     static readonly TimeSpan AutoUpdateStartupDelay = TimeSpan.FromSeconds(5);
     const int FileWatchKindAll = 7;
     const string FileWatchRegistrationId = "razorsharp.didChangeWatchedFiles";
@@ -289,6 +292,8 @@ public class RazorLanguageServer : IAsyncDisposable
         => _diagnosticsProgressDelayMs = Math.Max(0, delayMs);
     internal void SetUserRequestProgressDelayForTests(int delayMs)
         => _userRequestProgressDelayMs = Math.Max(0, delayMs);
+    internal void SetWorkspaceInitProgressTimeoutForTests(int timeoutMs)
+        => _workspaceInitProgressTimeoutMs = Math.Max(0, timeoutMs);
     internal void ApplyAutoUpdateSettingsForTests(RoslynOptions? options) => ApplyAutoUpdateSettings(options);
     internal void ApplyDependencySettingsForTests(DependencyOptions? options) => ApplyDependencySettings(options);
     internal bool AutoUpdateEnabledForTests => _autoUpdateEnabled;
@@ -298,6 +303,10 @@ public class RazorLanguageServer : IAsyncDisposable
         => _startRoslynOverride = overrideFunc;
     internal void SetDependenciesMissingForTests(bool missing)
         => _dependenciesMissing = missing;
+    internal void MarkClientInitializedForTests()
+    {
+        _clientInitialized = true;
+    }
     internal Task HandleRoslynNotificationForTests(string method, JsonElement? @params, CancellationToken ct)
         => HandleRoslynNotificationAsync(new NotificationWorkItem(method, @params), ct);
     internal void HandleRoslynProcessExitedForTests(int exitCode)
@@ -631,22 +640,26 @@ public class RazorLanguageServer : IAsyncDisposable
                 _dependenciesMissing = true;
                 _logger.LogInformation("Dependencies are missing; downloading in the background.");
                 StartBackgroundDependencyDownload();
-                _ = NotifyUserAsync("RazorSharp is downloading dependencies in the background. Language features will start automatically when ready.", MessageType.Info);
-                return CreateInitializeResult();
+                _ = NotifyUserAsync("RazorSharp is downloading dependencies. Language features will start when ready.", MessageType.Info);
             }
-
-            var message = "RazorSharp dependencies are not installed. Run with --download-dependencies first.";
-            _logger.LogError(message);
-            _ = NotifyUserAsync(message, MessageType.Error);
-            throw new InvalidOperationException(message);
+            else
+            {
+                var message = "RazorSharp dependencies are not installed. Run with --download-dependencies first.";
+                _logger.LogError(message);
+                _ = NotifyUserAsync(message, MessageType.Error);
+                throw new InvalidOperationException(message);
+            }
         }
 
-        if (!await EnsureRoslynStartedAsync(ct))
+        if (!_dependenciesMissing)
         {
-            var message = "Failed to start Roslyn after downloading dependencies. Restart your editor.";
-            _logger.LogError(message);
-            _ = NotifyUserAsync(message, MessageType.Error);
-            throw new InvalidOperationException(message);
+            if (!await EnsureRoslynStartedAsync(ct))
+            {
+                var message = "Failed to start Roslyn. Check logs for details.";
+                _logger.LogError(message);
+                _ = NotifyUserAsync(message, MessageType.Error);
+                throw new InvalidOperationException(message);
+            }
         }
 
         var result = CreateInitializeResult();
@@ -698,6 +711,7 @@ public class RazorLanguageServer : IAsyncDisposable
             _dependencyDownloadTask = Task.Run(async () =>
             {
                 WorkDoneProgressScope? progress = null;
+                Task reportChain = Task.CompletedTask;
                 try
                 {
                     progress = BeginWorkDoneProgress(
@@ -724,9 +738,14 @@ public class RazorLanguageServer : IAsyncDisposable
                                 return;
                             }
                             lastReport = now;
-                        }
 
-                        _ = progress.ReportAsync(message);
+                            // Keep reports ordered/observable so fast downloads don't drop the last update.
+                            reportChain = reportChain.ContinueWith(
+                                _ => progress.ReportAsync(message),
+                                CancellationToken.None,
+                                TaskContinuationOptions.ExecuteSynchronously,
+                                TaskScheduler.Default).Unwrap();
+                        }
                     }
 
                     var success = await _dependencyManager.EnsureDependenciesAsync(_lifetimeCts.Token, Report);
@@ -773,6 +792,15 @@ public class RazorLanguageServer : IAsyncDisposable
                 {
                     if (progress != null)
                     {
+                        try
+                        {
+                            await reportChain;
+                        }
+                        catch
+                        {
+                            // Ignore progress reporting failures.
+                        }
+
                         await progress.DisposeAsync();
                     }
                 }
@@ -933,6 +961,8 @@ public class RazorLanguageServer : IAsyncDisposable
             delayMs: 0,
             CancellationToken.None);
 
+        StartWorkspaceInitializationTimeout();
+
         // Forward to Roslyn - run in background but track completion
         _ = Task.Run(async () =>
         {
@@ -997,6 +1027,52 @@ public class RazorLanguageServer : IAsyncDisposable
                 await EndWorkspaceInitializationProgressAsync();
             }
         });
+    }
+
+    private void StartWorkspaceInitializationTimeout()
+    {
+        if (_workspaceInitProgress == null)
+        {
+            return;
+        }
+
+        lock (_workspaceInitLock)
+        {
+            if (_workspaceInitTimeoutTask != null)
+            {
+                return;
+            }
+
+            var timeout = TimeSpan.FromMilliseconds(_workspaceInitProgressTimeoutMs);
+            _workspaceInitTimeoutTask = Task.Run(async () =>
+            {
+                try
+                {
+                    var completed = await Task.WhenAny(
+                        _roslynProjectInitialized.Task,
+                        Task.Delay(timeout, _lifetimeCts.Token));
+
+                    if (completed != _roslynProjectInitialized.Task && !_roslynProjectInitialized.Task.IsCompleted)
+                    {
+                        _logger.LogWarning(
+                            "Workspace initialization did not complete within {TimeoutSeconds}s; stopping progress indicator.",
+                            timeout.TotalSeconds);
+                        await EndWorkspaceInitializationProgressAsync();
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Shutdown requested.
+                }
+                finally
+                {
+                    lock (_workspaceInitLock)
+                    {
+                        _workspaceInitTimeoutTask = null;
+                    }
+                }
+            });
+        }
     }
 
     private void StartAutoUpdateCheck()
@@ -2393,13 +2469,42 @@ public class RazorLanguageServer : IAsyncDisposable
                     break;
 
                 case "window/logMessage":
-                    // Log window messages for debugging
-                    if (item.Params.HasValue && item.Params.Value.TryGetProperty("message", out var msgProp))
+                    if (item.Params.HasValue)
                     {
-                        _logger.LogDebug("[Roslyn] {Message}", msgProp.GetString());
+                        var message = item.Params.Value.TryGetProperty("message", out var msgProp)
+                            ? msgProp.GetString()
+                            : null;
+                        var type = item.Params.Value.TryGetProperty("type", out var typeProp)
+                            ? typeProp.GetInt32()
+                            : 0;
+
+                        // Roslyn uses this channel for extremely noisy tracing (including assembly-load probing).
+                        // Never forward those to the client (they should go to logs instead).
+                        if (type > 4 ||
+                            (message != null && message.Contains("not found in this load context", StringComparison.OrdinalIgnoreCase)))
+                        {
+                            if (message != null)
+                            {
+                                _logger.LogTrace("[Roslyn] {Message}", message);
+                            }
+                            break;
+                        }
+
+                        if (message != null)
+                        {
+                            _logger.LogDebug("[Roslyn] {Message}", message);
+                        }
+
+                        var clampedType = Math.Clamp(type, 1, 4);
+                        var forwardedParams = JsonSerializer.SerializeToElement(new { type = clampedType, message });
+                        await ForwardNotificationToClientAsync(item.Method, forwardedParams);
                     }
-                    await ForwardNotificationToClientAsync(item.Method, item.Params);
+                    else
+                    {
+                        await ForwardNotificationToClientAsync(item.Method, item.Params);
+                    }
                     break;
+
 
                 case "window/showMessage":
                     // Forward window messages to client
@@ -2407,6 +2512,11 @@ public class RazorLanguageServer : IAsyncDisposable
                     break;
 
                 case LspMethods.Progress:
+                    var progressToken = TryGetProgressToken(item.Params);
+                    var progressKind = TryGetProgressKind(item.Params);
+                    _logger.LogDebug("Forwarding progress to client: token={Token}, kind={Kind}",
+                        progressToken ?? "<none>",
+                        progressKind ?? "<none>");
                     // Forward progress notifications to client for status bar spinners
                     await ForwardNotificationToClientAsync(item.Method, item.Params);
                     break;
@@ -2424,7 +2534,16 @@ public class RazorLanguageServer : IAsyncDisposable
 
     private void OnRoslynNotification(object? sender, RoslynNotificationEventArgs e)
     {
-        _logger.LogDebug("Received notification from Roslyn: {Method}", e.Method);
+        // This can get extremely noisy (especially for `window/logMessage` and `razor/log`),
+        // so keep it at trace level for chatty notifications.
+        if (e.Method == LspMethods.RazorLog || e.Method == "window/logMessage")
+        {
+            _logger.LogTrace("Received notification from Roslyn: {Method}", e.Method);
+        }
+        else
+        {
+            _logger.LogDebug("Received notification from Roslyn: {Method}", e.Method);
+        }
 
         var item = new NotificationWorkItem(e.Method, e.Params);
         if (!_notificationChannel.Writer.TryWrite(item))
@@ -2451,6 +2570,8 @@ public class RazorLanguageServer : IAsyncDisposable
             // Handle progress creation requests - forward to editor for status bar spinners
             if (method == LspMethods.WindowWorkDoneProgressCreate)
             {
+                var token = TryGetProgressToken(@params);
+                _logger.LogDebug("Forwarding workDoneProgress/create to client: token={Token}", token ?? "<none>");
                 return await ForwardRequestToClientAsync(method, @params, ct);
             }
 
@@ -2703,7 +2824,6 @@ public class RazorLanguageServer : IAsyncDisposable
         var id = Interlocked.Increment(ref _workDoneProgressCounter);
         return $"{prefix}:{id}";
     }
-
     private async Task<bool> SendWorkDoneProgressBeginAsync(
         string token,
         string title,
@@ -2715,15 +2835,66 @@ public class RazorLanguageServer : IAsyncDisposable
             return false;
         }
 
+        var created = false;
+        // Avoid server->client requests (workDoneProgress/create) while we are still in the
+        // initialize handshake. Many clients will not respond until after `initialized`.
+        if (_clientInitialized)
+        {
+            var createTimeout = TimeSpan.FromMilliseconds(WorkDoneProgressCreateTimeoutMs);
+            try
+            {
+                // Some clients may not respond to workDoneProgress/create quickly (or at all).
+                // Don't let that block begin/report/end; attempt create, but proceed after a timeout.
+                using var timeoutCts = new CancellationTokenSource(createTimeout);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+                var createTask = _progressRpc.InvokeWithParameterObjectAsync(
+                    LspMethods.WindowWorkDoneProgressCreate,
+                    new { token },
+                    linkedCts.Token);
+
+                try
+                {
+                    await createTask.WaitAsync(createTimeout, ct);
+                    created = true;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // Caller cancelled: don't emit progress.
+                    return false;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Timed out or cancelled by the create timeout; proceed anyway.
+                }
+                catch (TimeoutException)
+                {
+                    // Timed out; proceed anyway.
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to create work done progress {Token}", token);
+                }
+
+                // Observe any late exceptions to avoid unobserved task exceptions if the create
+                // call finishes after we stop awaiting it.
+                _ = createTask.ContinueWith(
+                    t =>
+                    {
+                        if (t.IsFaulted && t.Exception != null)
+                        {
+                            _logger.LogDebug(t.Exception, "workDoneProgress/create failed for {Token}", token);
+                        }
+                    },
+                    TaskScheduler.Default);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return false;
+            }
+        }
+
         try
         {
-            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(WorkDoneProgressCreateTimeoutMs));
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-            await _progressRpc.InvokeWithParameterObjectAsync(
-                LspMethods.WindowWorkDoneProgressCreate,
-                new { token },
-                linkedCts.Token);
-
             await _progressRpc.NotifyWithParameterObjectAsync(LspMethods.Progress, new
             {
                 token,
@@ -2736,11 +2907,9 @@ public class RazorLanguageServer : IAsyncDisposable
                 }
             });
 
+            _logger.LogDebug("Sent progress begin to client: token={Token} created={Created}", token, created);
+
             return true;
-        }
-        catch (OperationCanceledException)
-        {
-            return false;
         }
         catch (Exception ex)
         {
@@ -2767,6 +2936,8 @@ public class RazorLanguageServer : IAsyncDisposable
                     message
                 }
             });
+
+            _logger.LogDebug("Sent progress end to client: token={Token}", token);
         }
         catch (Exception ex)
         {
@@ -2792,11 +2963,44 @@ public class RazorLanguageServer : IAsyncDisposable
                     message
                 }
             });
+
+            _logger.LogDebug("Sent progress report to client: token={Token}", token);
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "Failed to report work done progress {Token}", token);
         }
+    }
+
+    private static string? TryGetProgressToken(JsonElement? @params)
+    {
+        if (!@params.HasValue)
+        {
+            return null;
+        }
+
+        if (!@params.Value.TryGetProperty("token", out var token))
+        {
+            return null;
+        }
+
+        return token.ValueKind == JsonValueKind.String ? token.GetString() : token.GetRawText();
+    }
+
+    private static string? TryGetProgressKind(JsonElement? @params)
+    {
+        if (!@params.HasValue)
+        {
+            return null;
+        }
+
+        if (!@params.Value.TryGetProperty("value", out var value) ||
+            !value.TryGetProperty("kind", out var kind))
+        {
+            return null;
+        }
+
+        return kind.GetString();
     }
 
     private Task SendRoslynNotificationAsync(string method, object? parameters)
@@ -2833,6 +3037,7 @@ public class RazorLanguageServer : IAsyncDisposable
         readonly RazorLanguageServer _server;
         readonly string _token;
         readonly string _title;
+        readonly CancellationToken _ct;
         readonly string? _message;
         readonly CancellationTokenSource _delayCts;
         readonly Task<bool> _startTask;
@@ -2849,6 +3054,7 @@ public class RazorLanguageServer : IAsyncDisposable
             _server = server;
             _token = token;
             _title = title;
+            _ct = ct;
             _message = message;
             _delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             _startTask = StartAsync(delayMs, _delayCts.Token);
@@ -2872,7 +3078,7 @@ public class RazorLanguageServer : IAsyncDisposable
                 _token,
                 _title,
                 _message,
-                CancellationToken.None);
+                _ct);
         }
 
         public async Task ReportAsync(string? message)

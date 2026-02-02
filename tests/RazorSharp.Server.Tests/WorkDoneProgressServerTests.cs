@@ -142,6 +142,7 @@ public class WorkDoneProgressServerTests
             var progressRpc = new FakeProgressRpc();
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.MarkClientInitializedForTests();
             server.SetDiagnosticsProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, __, ct) =>
             {
@@ -176,6 +177,7 @@ public class WorkDoneProgressServerTests
             var started = 0;
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.MarkClientInitializedForTests();
             server.SetDiagnosticsProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, __, ct) =>
             {
@@ -311,6 +313,7 @@ public class WorkDoneProgressServerTests
             var progressRpc = new FakeProgressRpc();
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.MarkClientInitializedForTests();
             server.SetUserRequestProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, __, ct) =>
             {
@@ -344,6 +347,7 @@ public class WorkDoneProgressServerTests
             var progressRpc = new FakeProgressRpc();
             server.SetProgressRpcForTests(progressRpc);
             server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.MarkClientInitializedForTests();
             server.SetDiagnosticsProgressDelayForTests(50);
             server.SetForwardToRoslynOverrideForTests(async (_, @params, ct) =>
             {
@@ -439,6 +443,56 @@ public class WorkDoneProgressServerTests
     }
 
     [Fact]
+    public async Task WorkspaceInitProgress_EndsOnTimeout()
+    {
+        await WithServer(async server =>
+        {
+            var progressRpc = new FakeProgressRpc();
+            server.SetProgressRpcForTests(progressRpc);
+            server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.SetWorkspaceInitProgressTimeoutForTests(50);
+            server.SetStartRoslynOverrideForTests(_ => Task.FromResult(true));
+
+            server.HandleInitialized();
+            await AwaitOrTimeout(progressRpc.BeginCalled.Task, 1000, "Progress begin was not sent.");
+            await AwaitOrTimeout(progressRpc.EndCalled.Task, 1000, "Progress end was not sent.");
+        });
+    }
+
+    [Fact]
+    public async Task DiagnosticsProgress_EndsWhenCreateTimesOut()
+    {
+        await WithServer(async server =>
+        {
+            var progressRpc = new FakeProgressRpc
+            {
+                OnRequest = async (_, __, ct) =>
+                {
+                    await Task.Delay(Timeout.Infinite, ct);
+                    return JsonDocument.Parse("{}").RootElement;
+                }
+            };
+            server.SetProgressRpcForTests(progressRpc);
+            server.SetInitializeParamsForTests(InitParamsWithProgress(true));
+            server.MarkClientInitializedForTests();
+            server.SetDiagnosticsProgressDelayForTests(0);
+            server.SetForwardToRoslynOverrideForTests((_, __, _) =>
+                Task.FromResult<JsonElement?>(JsonSerializer.SerializeToElement(new
+                {
+                    kind = "full",
+                    resultId = "test",
+                    items = Array.Empty<object>()
+                })));
+
+            await server.HandleRoslynNotificationForTests(LspMethods.ProjectInitializationComplete, null, CancellationToken.None);
+
+            await server.HandleDiagnosticAsync(CreateDiagnosticParams("file:///test.razor"), CancellationToken.None);
+
+            await AwaitOrTimeout(progressRpc.EndCalled.Task, 3000, "Progress end was not sent.");
+        });
+    }
+
+    [Fact]
     public async Task WorkDoneProgressCreate_TimesOut_WhenRequestHangs()
     {
         await WithServer(async server =>
@@ -452,12 +506,14 @@ public class WorkDoneProgressServerTests
                 }
             };
             server.SetProgressRpcForTests(progressRpc);
+            server.MarkClientInitializedForTests();
 
             var result = await server.SendWorkDoneProgressBeginForTests("test-token", "RazorSharp", null, CancellationToken.None);
 
-            Assert.False(result);
+            Assert.True(result);
             Assert.Single(progressRpc.Requests);
-            Assert.Empty(progressRpc.Notifications);
+            Assert.Single(progressRpc.Notifications);
+            Assert.Equal("begin", GetProgressKind(progressRpc.Notifications[0].Params));
         });
     }
 
@@ -475,6 +531,7 @@ public class WorkDoneProgressServerTests
                 }
             };
             server.SetProgressRpcForTests(progressRpc);
+            server.MarkClientInitializedForTests();
 
             using var cts = new CancellationTokenSource(50);
             var result = await server.SendWorkDoneProgressBeginForTests("test-token", "RazorSharp", null, cts.Token);

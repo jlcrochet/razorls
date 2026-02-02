@@ -9,6 +9,7 @@ static string GetVersion() =>
     ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
     ?? "[unknown version]";
 
+
 // Parse command line arguments
 var logLevel = LogLevel.Information;
 var logLevelSpecifiedByCli = false;
@@ -109,9 +110,8 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-// Print any warnings
-// Use stdout when output is redirected (e.g., editor logs), stderr when interactive
-var warningOutput = Console.IsOutputRedirected ? Console.Out : Console.Error;
+// Print any warnings (never write to stdout; stdout is reserved for LSP).
+var warningOutput = Console.Error;
 foreach (var warning in warnings)
 {
     warningOutput.WriteLine($"Warning: {warning}");
@@ -122,6 +122,7 @@ if (downloadDependenciesOnly)
 {
     return await DownloadDependenciesAsync();
 }
+
 
 // Configure logging
 var logLevelSwitch = new LoggingLevelSwitch(logLevel);
