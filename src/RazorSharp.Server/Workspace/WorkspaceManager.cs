@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using RazorSharp.Utilities;
 
 namespace RazorSharp.Server.Workspace;
 
@@ -15,10 +16,6 @@ public class WorkspaceManager
         IgnoreInaccessible = true,
         AttributesToSkip = FileAttributes.ReparsePoint
     };
-    static readonly bool IsCaseInsensitiveFileSystem = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
-    static readonly StringComparer DirectoryNameComparer = IsCaseInsensitiveFileSystem
-        ? StringComparer.OrdinalIgnoreCase
-        : StringComparer.Ordinal;
     static readonly string[] DefaultExcludedDirectoryNames =
     [
         "bin",
@@ -27,14 +24,28 @@ public class WorkspaceManager
         ".vs",
         "node_modules"
     ];
+    bool _isCaseInsensitiveFileSystem;
+    StringComparer _directoryNameComparer = StringComparer.Ordinal;
+    string[]? _excludedOverrideDirectories;
+    string[]? _excludedAdditionalDirectories;
     HashSet<string> _excludedDirectoryNames;
     List<GlobPattern> _excludedDirectoryPatterns;
 
     public WorkspaceManager(ILogger<WorkspaceManager> logger)
     {
         _logger = logger;
-        _excludedDirectoryNames = new HashSet<string>(DefaultExcludedDirectoryNames, DirectoryNameComparer);
+        _excludedDirectoryNames = new HashSet<string>(DefaultExcludedDirectoryNames, _directoryNameComparer);
         _excludedDirectoryPatterns = new List<GlobPattern>();
+        SetCaseSensitivity(null);
+    }
+
+    public void SetCaseSensitivity(string? probePath)
+    {
+        _isCaseInsensitiveFileSystem = FileSystemCaseSensitivity.IsCaseInsensitiveForPath(probePath);
+        _directoryNameComparer = _isCaseInsensitiveFileSystem
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+        RebuildExclusions();
     }
 
     /// <summary>
@@ -44,21 +55,9 @@ public class WorkspaceManager
     /// </summary>
     public void ConfigureExcludedDirectories(string[]? overrideDirectories, string[]? additionalDirectories)
     {
-        var newSet = new HashSet<string>(DirectoryNameComparer);
-        var newPatterns = new List<GlobPattern>();
-
-        if (overrideDirectories != null)
-        {
-            AddExclusions(newSet, newPatterns, overrideDirectories);
-        }
-        else
-        {
-            AddExclusions(newSet, newPatterns, DefaultExcludedDirectoryNames);
-        }
-
-        AddExclusions(newSet, newPatterns, additionalDirectories);
-        _excludedDirectoryNames = newSet;
-        _excludedDirectoryPatterns = newPatterns;
+        _excludedOverrideDirectories = overrideDirectories;
+        _excludedAdditionalDirectories = additionalDirectories;
+        RebuildExclusions();
     }
 
     /// <summary>
@@ -188,7 +187,26 @@ public class WorkspaceManager
         return false;
     }
 
-    static void AddExclusions(HashSet<string> names, List<GlobPattern> patterns, IEnumerable<string>? directories)
+    void RebuildExclusions()
+    {
+        var newSet = new HashSet<string>(_directoryNameComparer);
+        var newPatterns = new List<GlobPattern>();
+
+        if (_excludedOverrideDirectories != null)
+        {
+            AddExclusions(newSet, newPatterns, _excludedOverrideDirectories);
+        }
+        else
+        {
+            AddExclusions(newSet, newPatterns, DefaultExcludedDirectoryNames);
+        }
+
+        AddExclusions(newSet, newPatterns, _excludedAdditionalDirectories);
+        _excludedDirectoryNames = newSet;
+        _excludedDirectoryPatterns = newPatterns;
+    }
+
+    void AddExclusions(HashSet<string> names, List<GlobPattern> patterns, IEnumerable<string>? directories)
     {
         if (directories == null)
         {
@@ -205,7 +223,7 @@ public class WorkspaceManager
             var trimmed = dir.Trim();
             if (IsPattern(trimmed))
             {
-                patterns.Add(new GlobPattern(trimmed, IsCaseInsensitiveFileSystem));
+                patterns.Add(new GlobPattern(trimmed, _isCaseInsensitiveFileSystem));
             }
             else
             {
@@ -230,8 +248,8 @@ public class WorkspaceManager
             _regex = new Regex(
                 $"^{GlobToRegex(normalized)}$",
                 ignoreCase
-                    ? RegexOptions.CultureInvariant | RegexOptions.IgnoreCase
-                    : RegexOptions.CultureInvariant);
+                    ? RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Compiled
+                    : RegexOptions.CultureInvariant | RegexOptions.Compiled);
         }
 
         public bool IsMatch(string relativePath)

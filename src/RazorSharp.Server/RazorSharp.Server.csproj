@@ -36,6 +36,7 @@
   <ItemGroup>
     <ProjectReference Include="..\RazorSharp.Protocol\RazorSharp.Protocol.csproj" />
     <ProjectReference Include="..\RazorSharp.Dependencies\RazorSharp.Dependencies.csproj" />
+    <ProjectReference Include="..\RazorSharp.Utilities\RazorSharp.Utilities.csproj" />
   </ItemGroup>
 
 </Project>

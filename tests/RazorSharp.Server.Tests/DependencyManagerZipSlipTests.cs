@@ -96,6 +96,64 @@ public class DependencyManagerZipSlipTests
         }
     }
 
+    [Fact]
+    public void ExtractZipToDirectorySafe_RejectsTooManyEntries()
+    {
+        var tempRoot = CreateTempDir();
+        var zipPath = Path.Combine(tempRoot, "test.zip");
+        var extractPath = Path.Combine(tempRoot, "extract");
+
+        try
+        {
+            using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+            {
+                for (var i = 0; i < 3; i++)
+                {
+                    var entry = zip.CreateEntry($"file{i}.txt");
+                    using var stream = entry.Open();
+                    using var writer = new StreamWriter(stream);
+                    writer.Write("ok");
+                }
+            }
+
+            Assert.Throws<InvalidOperationException>(() =>
+                DependencyManager.ExtractZipToDirectorySafe(zipPath, extractPath, maxEntries: 2));
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
+    public void ExtractZipToDirectorySafe_RejectsTooLargeTotalSize()
+    {
+        var tempRoot = CreateTempDir();
+        var zipPath = Path.Combine(tempRoot, "test.zip");
+        var extractPath = Path.Combine(tempRoot, "extract");
+
+        try
+        {
+            using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+            {
+                for (var i = 0; i < 2; i++)
+                {
+                    var entry = zip.CreateEntry($"file{i}.txt");
+                    using var stream = entry.Open();
+                    using var writer = new StreamWriter(stream);
+                    writer.Write(new string('a', 8));
+                }
+            }
+
+            Assert.Throws<InvalidOperationException>(() =>
+                DependencyManager.ExtractZipToDirectorySafe(zipPath, extractPath, maxTotalBytes: 10));
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
     private static string CreateTempDir()
     {
         var path = Path.Combine(Path.GetTempPath(), "razorsharp-tests", Guid.NewGuid().ToString("N"));

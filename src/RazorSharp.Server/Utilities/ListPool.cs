@@ -10,7 +10,7 @@ public static class ListPool<T>
 {
     const int MaxPoolSize = 16;
     const int MaxRetainedCapacity = 8192;
-    static readonly ConcurrentBag<List<T>> Pool = new();
+    static readonly ConcurrentStack<List<T>> Pool = new();
     static int _poolSize;
 
     /// <summary>
@@ -19,7 +19,7 @@ public static class ListPool<T>
     /// </summary>
     public static List<T> Rent()
     {
-        if (Pool.TryTake(out var list))
+        if (Pool.TryPop(out var list))
         {
             Interlocked.Decrement(ref _poolSize);
             return list;
@@ -32,7 +32,7 @@ public static class ListPool<T>
     /// </summary>
     public static List<T> Rent(int minCapacity)
     {
-        if (Pool.TryTake(out var list))
+        if (Pool.TryPop(out var list))
         {
             Interlocked.Decrement(ref _poolSize);
             if (list.Capacity < minCapacity)
@@ -49,7 +49,7 @@ public static class ListPool<T>
     /// </summary>
     public static void Return(List<T> list)
     {
-        if (list.Capacity > MaxRetainedCapacity || Volatile.Read(ref _poolSize) >= MaxPoolSize)
+        if (list.Capacity > MaxRetainedCapacity)
         {
             // Pool is full, let GC handle this one
             list.Clear();
@@ -57,7 +57,12 @@ public static class ListPool<T>
         }
 
         list.Clear();
-        Pool.Add(list);
-        Interlocked.Increment(ref _poolSize);
+        if (Interlocked.Increment(ref _poolSize) > MaxPoolSize)
+        {
+            Interlocked.Decrement(ref _poolSize);
+            return;
+        }
+
+        Pool.Push(list);
     }
 }

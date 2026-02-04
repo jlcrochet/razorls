@@ -162,7 +162,7 @@ if (hostPid.HasValue)
     {
         try
         {
-            var hostProcess = System.Diagnostics.Process.GetProcessById(hostPid.Value);
+            using var hostProcess = System.Diagnostics.Process.GetProcessById(hostPid.Value);
             await hostProcess.WaitForExitAsync(cts.Token);
             cts.Cancel();
         }
@@ -288,6 +288,7 @@ internal class ProgressBar
         int width;
         try { width = Console.WindowWidth; }
         catch (IOException) { width = 120; }  // Console not available (e.g., redirected output)
+        catch (PlatformNotSupportedException) { width = 120; }
         _padding = new char[width];
         Array.Fill(_padding, ' ');
     }
@@ -306,7 +307,14 @@ internal class ProgressBar
                 numStart--;
             }
 
-            var percent = int.Parse(message.AsSpan(numStart, message.Length - 1 - numStart));
+            if (!int.TryParse(message.AsSpan(numStart, message.Length - 1 - numStart), out var percent))
+            {
+                ClearLine();
+                Console.WriteLine(message);
+                _lastPercent = -1;
+                return;
+            }
+            percent = Math.Clamp(percent, 0, 100);
             var label = message.AsSpan(0, numStart).TrimEnd();
             RenderProgressBar(label, percent);
             _lastPercent = percent;
@@ -331,12 +339,18 @@ internal class ProgressBar
     private void RenderProgressBar(ReadOnlySpan<char> label, int percent)
     {
         var filled = (int)(percent / 100.0 * BarWidth);
+        if (filled > BarWidth) filled = BarWidth;
+        if (filled < 0) filled = 0;
 
         _bar.AsSpan(0, filled).Fill('█');
         _bar.AsSpan(filled).Fill('░');
 
         // Truncate label if too long
-        var maxLabelWidth = Math.Max(10, Console.WindowWidth - BarWidth - 10);
+        int consoleWidth;
+        try { consoleWidth = Console.WindowWidth; }
+        catch (IOException) { consoleWidth = _padding.Length; }
+        catch (PlatformNotSupportedException) { consoleWidth = _padding.Length; }
+        var maxLabelWidth = Math.Max(10, consoleWidth - BarWidth - 10);
         var labelSpan = label.Length <= maxLabelWidth
             ? label
             : label[0..(maxLabelWidth - 3)];

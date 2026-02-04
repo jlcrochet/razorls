@@ -87,15 +87,17 @@ public class RoslynClient : IAsyncDisposable
         }
 
         _processCts = new CancellationTokenSource();
+        var process = _process;
+        var processCts = _processCts;
 
         // Capture stderr for logging (track task for cleanup)
         _stderrTask = Task.Run(async () =>
         {
             try
             {
-                while (!_process.HasExited)
+                while (!process.HasExited)
                 {
-                    var line = await _process.StandardError.ReadLineAsync(_processCts.Token);
+                    var line = await process.StandardError.ReadLineAsync(processCts.Token);
                     if (line != null)
                     {
                         _logger.LogDebug("[Roslyn stderr] {Line}", line);
@@ -104,15 +106,15 @@ public class RoslynClient : IAsyncDisposable
             }
             catch (OperationCanceledException) { }
             catch (ObjectDisposedException) { }
-        }, _processCts.Token);
+        }, processCts.Token);
 
         // Monitor process exit (track task for cleanup)
         _exitMonitorTask = Task.Run(async () =>
         {
             try
             {
-                await _process.WaitForExitAsync(_processCts.Token);
-                var exitCode = _process.ExitCode;
+                await process.WaitForExitAsync(processCts.Token);
+                var exitCode = process.ExitCode;
                 _logger.LogWarning("Roslyn process exited with code {ExitCode}", exitCode);
 
                 // Fail all pending requests
@@ -127,25 +129,29 @@ public class RoslynClient : IAsyncDisposable
             {
                 // Expected during shutdown
             }
-        }, _processCts.Token);
+            catch (ObjectDisposedException)
+            {
+                // Process disposed during shutdown
+            }
+        }, processCts.Token);
 
         // Start reading LSP messages from stdout
         _readCts = new CancellationTokenSource();
-        _readTask = ReadMessagesAsync(_readCts.Token);
+        _readTask = ReadMessagesAsync(process, _readCts.Token);
 
-        _logger.LogInformation("Roslyn language server started (PID: {Pid})", _process.Id);
+        _logger.LogInformation("Roslyn language server started (PID: {Pid})", process.Id);
     }
 
-    private async Task ReadMessagesAsync(CancellationToken ct)
+    private async Task ReadMessagesAsync(Process process, CancellationToken ct)
     {
         using var parser = new LspMessageParser();
 
         try
         {
-            while (!ct.IsCancellationRequested && _process != null && !_process.HasExited)
+            while (!ct.IsCancellationRequested && !process.HasExited)
             {
                 var buffer = parser.GetBuffer();
-                var bytesRead = await _process.StandardOutput.BaseStream.ReadAsync(buffer, ct);
+                var bytesRead = await process.StandardOutput.BaseStream.ReadAsync(buffer, ct);
                 if (bytesRead == 0) break;
 
                 parser.Advance(bytesRead);
@@ -180,6 +186,7 @@ public class RoslynClient : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error reading from Roslyn");
@@ -522,8 +529,16 @@ public class RoslynClient : IAsyncDisposable
 
     private async Task SendMessageAsync(object message)
     {
-        if (_process == null) throw new InvalidOperationException("Process not started");
-        if (_process.HasExited) throw new IOException($"Roslyn process has exited (code {_process.ExitCode})");
+        var process = _process;
+        if (process == null) throw new InvalidOperationException("Process not started");
+        try
+        {
+            if (process.HasExited) throw new IOException($"Roslyn process has exited (code {process.ExitCode})");
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new IOException("Roslyn process is no longer available.", ex);
+        }
 
         // Serialize writes to prevent interleaved messages when multiple requests are sent concurrently
         // The lock also protects _headerBuffer and _sendBufferWriter which are shared instance fields
@@ -545,10 +560,20 @@ public class RoslynClient : IAsyncDisposable
             "\r\n\r\n"u8.CopyTo(_headerBuffer.AsSpan(16 + bytesWritten));
             var headerLength = 16 + bytesWritten + 4;
 
-            var stream = _process.StandardInput.BaseStream;
-            await stream.WriteAsync(_headerBuffer.AsMemory(0, headerLength));
-            await stream.WriteAsync(_sendBufferWriter.WrittenMemory);
-            await stream.FlushAsync();
+            try
+            {
+                var stream = process.StandardInput.BaseStream;
+                await stream.WriteAsync(_headerBuffer.AsMemory(0, headerLength));
+                await stream.WriteAsync(_sendBufferWriter.WrittenMemory);
+            }
+            catch (ObjectDisposedException ex)
+            {
+                throw new IOException("Roslyn process is no longer available.", ex);
+            }
+            catch (InvalidOperationException ex)
+            {
+                throw new IOException("Roslyn process is no longer available.", ex);
+            }
         }
         finally
         {

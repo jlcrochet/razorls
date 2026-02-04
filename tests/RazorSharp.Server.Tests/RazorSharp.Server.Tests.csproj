@@ -15,6 +15,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\RazorSharp.Server\RazorSharp.Server.csproj" />
     <ProjectReference Include="..\..\src\RazorSharp.Protocol\RazorSharp.Protocol.csproj" />
+    <ProjectReference Include="..\..\src\RazorSharp.Utilities\RazorSharp.Utilities.csproj" />
   </ItemGroup>
 
   <ItemGroup>

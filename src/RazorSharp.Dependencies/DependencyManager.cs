@@ -1,9 +1,11 @@
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Buffers;
 using System.Threading;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using RazorSharp.Utilities;
 
 namespace RazorSharp.Dependencies;
 
@@ -14,16 +16,20 @@ public class DependencyManager : IDisposable
 {
     readonly ILogger<DependencyManager> _logger;
     readonly string _basePath;
+    readonly StringComparison _dependencyPathComparison;
     readonly HttpClient _httpClient;
     bool _disposed;
-    static readonly bool IsCaseInsensitiveFileSystem = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
     static readonly TimeSpan DefaultDownloadTimeout = TimeSpan.FromMinutes(10);
     static readonly TimeSpan VersionInfoStaleThreshold = TimeSpan.FromDays(30);
     static readonly TimeSpan DependencyLockTimeout = TimeSpan.FromSeconds(30);
     static readonly TimeSpan DependencyLockRetryDelay = TimeSpan.FromMilliseconds(200);
+    static readonly JsonSerializerOptions VersionInfoJsonOptions = new() { WriteIndented = true };
     const int MaxDownloadRetries = 3;
     const int MaxUpdateCheckRetries = 2;
     const int UpdateRetryBaseDelayMs = 250;
+    const int MaxZipEntries = 20000;
+    const long MaxTotalUncompressedBytes = 1L * 1024 * 1024 * 1024;
+    const long MaxSingleEntryUncompressedBytes = 256L * 1024 * 1024;
     long _downloadRetryCount;
 
     const string UpdateRootDirectoryName = "updates";
@@ -39,6 +45,9 @@ public class DependencyManager : IDisposable
     {
         _logger = logger;
         _basePath = basePath ?? GetDefaultBasePath();
+        _dependencyPathComparison = FileSystemCaseSensitivity.IsCaseInsensitiveForPath(_basePath)
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
         _httpClient = new HttpClient();
         _httpClient.DefaultRequestHeaders.Add("User-Agent", $"RazorSharp/{version}");
         _httpClient.Timeout = DefaultDownloadTimeout;
@@ -304,10 +313,10 @@ public class DependencyManager : IDisposable
 
     public bool ApplyPendingUpdateIfAvailable()
     {
-        using var dependencyLock = TryAcquireDependencyLock(DependencyLockTimeout);
+        using var dependencyLock = TryAcquireDependencyLock();
         if (dependencyLock == null)
         {
-            _logger.LogWarning("Timed out waiting for dependency lock; skipping pending update apply.");
+            _logger.LogWarning("Dependency lock unavailable; skipping pending update apply.");
             return false;
         }
 
@@ -586,7 +595,13 @@ public class DependencyManager : IDisposable
             Directory.CreateDirectory(destinationPath);
 
             // Extract to roslyn directory
-            await Task.Run(() => ExtractZipToDirectorySafe(tempZipPath, destinationPath), cancellationToken);
+            await Task.Run(() => ExtractZipToDirectorySafeInternal(
+                tempZipPath,
+                destinationPath,
+                _dependencyPathComparison,
+                MaxZipEntries,
+                MaxTotalUncompressedBytes,
+                MaxSingleEntryUncompressedBytes), cancellationToken);
 
             _logger.LogInformation("Extracted Roslyn language server to {Path}", destinationPath);
         }
@@ -636,32 +651,46 @@ public class DependencyManager : IDisposable
 
                 var totalBytes = response.Content.Headers.ContentLength;
                 await using var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken);
-                await using var fileStream = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None);
-
-                var buffer = new byte[81920];
-                long totalRead = 0;
-                int bytesRead;
-                int lastLoggedPercent = -10; // Start at -10 so first 0% gets logged
-
-                while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken)) > 0)
+                await using var fileStream = new FileStream(destinationPath, new FileStreamOptions
                 {
-                    await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
-                    totalRead += bytesRead;
+                    Mode = FileMode.Create,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None,
+                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+                    BufferSize = 81920
+                });
 
-                    if (totalBytes.HasValue && totalBytes.Value > 0)
+                var buffer = ArrayPool<byte>.Shared.Rent(81920);
+                try
+                {
+                    long totalRead = 0;
+                    int bytesRead;
+                    int lastLoggedPercent = -10; // Start at -10 so first 0% gets logged
+
+                    while ((bytesRead = await contentStream.ReadAsync(buffer, cancellationToken)) > 0)
                     {
-                        var percent = (int)(totalRead * 100 / totalBytes.Value);
-                        // Only log/report every 10% to avoid spamming
-                        if (percent >= lastLoggedPercent + 10)
+                        await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+                        totalRead += bytesRead;
+
+                        if (totalBytes.HasValue && totalBytes.Value > 0)
                         {
-                            _logger.LogDebug("Download progress: {Percent}%", percent);
-                            onProgress?.Invoke(percent);
-                            lastLoggedPercent = percent;
+                            var percent = (int)(totalRead * 100 / totalBytes.Value);
+                            // Only log/report every 10% to avoid spamming
+                            if (percent >= lastLoggedPercent + 10)
+                            {
+                                _logger.LogDebug("Download progress: {Percent}%", percent);
+                                onProgress?.Invoke(percent);
+                                lastLoggedPercent = percent;
+                            }
                         }
                     }
-                }
 
-                return;
+                    return;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
             }
             catch (Exception ex) when (IsTransientDownloadFailure(ex, cancellationToken) && attempt < MaxDownloadRetries)
             {
@@ -716,7 +745,13 @@ public class DependencyManager : IDisposable
             _logger.LogInformation("Extracting Razor extension...");
 
             // VSIX is just a ZIP file
-            await Task.Run(() => ExtractZipToDirectorySafe(zipPath, tempExtractPath), cancellationToken);
+            await Task.Run(() => ExtractZipToDirectorySafeInternal(
+                zipPath,
+                tempExtractPath,
+                _dependencyPathComparison,
+                MaxZipEntries,
+                MaxTotalUncompressedBytes,
+                MaxSingleEntryUncompressedBytes), cancellationToken);
 
             // Find and copy Razor extension
             var razorSource = Path.Combine(tempExtractPath, "extension", ".razorExtension");
@@ -760,7 +795,32 @@ public class DependencyManager : IDisposable
         }
     }
 
-    internal static void ExtractZipToDirectorySafe(string zipPath, string destinationPath)
+    internal static void ExtractZipToDirectorySafe(
+        string zipPath,
+        string destinationPath,
+        int maxEntries = MaxZipEntries,
+        long maxTotalBytes = MaxTotalUncompressedBytes,
+        long maxEntryBytes = MaxSingleEntryUncompressedBytes)
+    {
+        var comparison = FileSystemCaseSensitivity.IsCaseInsensitiveForPath(destinationPath)
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        ExtractZipToDirectorySafeInternal(
+            zipPath,
+            destinationPath,
+            comparison,
+            maxEntries,
+            maxTotalBytes,
+            maxEntryBytes);
+    }
+
+    private static void ExtractZipToDirectorySafeInternal(
+        string zipPath,
+        string destinationPath,
+        StringComparison comparison,
+        int maxEntries,
+        long maxTotalBytes,
+        long maxEntryBytes)
     {
         Directory.CreateDirectory(destinationPath);
 
@@ -770,11 +830,29 @@ public class DependencyManager : IDisposable
             destinationFullPath += Path.DirectorySeparatorChar;
         }
 
-        var comparison = IsCaseInsensitiveFileSystem ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-
         using var archive = ZipFile.OpenRead(zipPath);
+        var entryCount = 0;
+        long totalBytes = 0;
         foreach (var entry in archive.Entries)
         {
+            entryCount++;
+            if (entryCount > maxEntries)
+            {
+                throw new InvalidOperationException($"Zip entry count exceeds limit ({maxEntries}).");
+            }
+
+            var entryLength = entry.Length;
+            if (entryLength > maxEntryBytes)
+            {
+                throw new InvalidOperationException($"Zip entry exceeds max uncompressed size ({maxEntryBytes} bytes).");
+            }
+
+            totalBytes += entryLength;
+            if (totalBytes > maxTotalBytes)
+            {
+                throw new InvalidOperationException($"Zip uncompressed size exceeds limit ({maxTotalBytes} bytes).");
+            }
+
             if (string.IsNullOrEmpty(entry.FullName))
             {
                 continue;
@@ -926,15 +1004,15 @@ public class DependencyManager : IDisposable
 
     private void WriteVersionInfo(DependencyVersionInfo info)
     {
-        try
-        {
-            Directory.CreateDirectory(_basePath);
-            var json = JsonSerializer.Serialize(info, new JsonSerializerOptions { WriteIndented = true });
-            var directory = Path.GetDirectoryName(VersionFilePath);
-            if (string.IsNullOrEmpty(directory))
+            try
             {
-                return;
-            }
+                Directory.CreateDirectory(_basePath);
+                var json = JsonSerializer.Serialize(info, VersionInfoJsonOptions);
+                var directory = Path.GetDirectoryName(VersionFilePath);
+                if (string.IsNullOrEmpty(directory))
+                {
+                    return;
+                }
 
             var tempPath = Path.Combine(directory, $"version.json.tmp-{Guid.NewGuid():N}");
             File.WriteAllText(tempPath, json);
@@ -1139,36 +1217,22 @@ public class DependencyManager : IDisposable
         }
     }
 
-    private DependencyLock? TryAcquireDependencyLock(TimeSpan timeout)
+    private DependencyLock? TryAcquireDependencyLock()
     {
-        var deadline = DateTime.UtcNow + timeout;
-        while (true)
+        try
         {
-            try
-            {
-                Directory.CreateDirectory(_basePath);
-                var lockPath = Path.Combine(_basePath, DependencyLockFileName);
-                var stream = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-                return new DependencyLock(stream);
-            }
-            catch (IOException)
-            {
-                if (DateTime.UtcNow >= deadline)
-                {
-                    return null;
-                }
-
-                Thread.Sleep(DependencyLockRetryDelay);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                if (DateTime.UtcNow >= deadline)
-                {
-                    return null;
-                }
-
-                Thread.Sleep(DependencyLockRetryDelay);
-            }
+            Directory.CreateDirectory(_basePath);
+            var lockPath = Path.Combine(_basePath, DependencyLockFileName);
+            var stream = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            return new DependencyLock(stream);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
         }
     }
 

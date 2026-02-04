@@ -224,4 +224,88 @@ public class LspMessageParserTests
         }
     }
 
+    [Fact]
+    public void TryParseMessage_HeaderWithoutContentLength_DropsHeaderAndNextMessageParses()
+    {
+        var reports = new List<string>();
+        using var parser = new LspMessageParser(reports.Add);
+        AppendToParser(parser, "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n");
+
+        var first = parser.TryParseMessage(out var pooledDoc1);
+        using (pooledDoc1)
+        {
+            Assert.False(first);
+            Assert.Null(pooledDoc1.Document);
+        }
+        Assert.Contains("Missing Content-Length header", reports);
+
+        var message = """{"id":3}""";
+        var lspMessage = $"Content-Length: {Encoding.UTF8.GetByteCount(message)}\r\n\r\n{message}";
+        AppendToParser(parser, lspMessage);
+
+        var second = parser.TryParseMessage(out var pooledDoc2);
+        using (pooledDoc2)
+        {
+            Assert.True(second);
+            Assert.NotNull(pooledDoc2.Document);
+            Assert.Equal(3, pooledDoc2.Document!.RootElement.GetProperty("id").GetInt32());
+        }
+    }
+
+    [Fact]
+    public void TryParseMessage_InvalidContentLength_DropsAndNextMessageParses()
+    {
+        var reports = new List<string>();
+        using var parser = new LspMessageParser(reports.Add);
+
+        AppendToParser(parser, "Content-Length: abc\r\n\r\n{}");
+
+        var first = parser.TryParseMessage(out var pooledDoc1);
+        using (pooledDoc1)
+        {
+            Assert.False(first);
+            Assert.Null(pooledDoc1.Document);
+        }
+        Assert.Contains("Invalid Content-Length header", reports);
+
+        var message = """{"id":4}""";
+        var lspMessage = $"Content-Length: {Encoding.UTF8.GetByteCount(message)}\r\n\r\n{message}";
+        AppendToParser(parser, lspMessage);
+
+        var second = parser.TryParseMessage(out var pooledDoc2);
+        using (pooledDoc2)
+        {
+            Assert.True(second);
+            Assert.NotNull(pooledDoc2.Document);
+            Assert.Equal(4, pooledDoc2.Document!.RootElement.GetProperty("id").GetInt32());
+        }
+    }
+
+    [Fact]
+    public void TryParseMessage_ManyMalformedHeaders_ResyncsAndParses()
+    {
+        var reports = new List<string>();
+        using var parser = new LspMessageParser(reports.Add);
+
+        var builder = new StringBuilder();
+        for (var i = 0; i < 10; i++)
+        {
+            builder.Append("Content-Length: abc\r\n\r\n");
+        }
+
+        var message = """{"id":5}""";
+        builder.Append($"Content-Length: {Encoding.UTF8.GetByteCount(message)}\r\n\r\n{message}");
+        AppendToParser(parser, builder.ToString());
+
+        var result = parser.TryParseMessage(out var pooledDoc);
+        using (pooledDoc)
+        {
+            Assert.True(result);
+            Assert.NotNull(pooledDoc.Document);
+            Assert.Equal(5, pooledDoc.Document!.RootElement.GetProperty("id").GetInt32());
+        }
+
+        Assert.Equal(10, reports.Count);
+    }
+
 }

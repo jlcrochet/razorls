@@ -8,4 +8,8 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\RazorSharp.Utilities\RazorSharp.Utilities.csproj" />
+  </ItemGroup>
+
 </Project>

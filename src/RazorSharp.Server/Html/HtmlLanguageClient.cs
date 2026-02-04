@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RazorSharp.Server.Configuration;
+using RazorSharp.Utilities;
 using StreamJsonRpc;
 
 namespace RazorSharp.Server.Html;
@@ -18,6 +19,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     Process? _process;
     JsonRpc? _rpc;
     Task? _stderrTask;
+    CancellationTokenSource? _processCts;
     bool _initialized;
     bool _disposed;
     bool _enabled = true;
@@ -25,11 +27,12 @@ public class HtmlLanguageClient : IAsyncDisposable
     bool _restartAttempted;
     string? _rootUri;
     Func<object, Task>? _didOpenOverrideForTests;
+    StringComparer _uriComparer = StringComparer.Ordinal;
 
     // Track HTML projections by checksum (Roslyn uses checksums to identify HTML versions)
     readonly Dictionary<string, HtmlProjection> _projections = new();
     // Secondary index for O(1) lookup by Razor URI
-    readonly Dictionary<string, string> _razorUriToChecksum = new(UriComparer);
+    Dictionary<string, string> _razorUriToChecksum;
     // Lock for atomic updates to both projection dictionaries
     readonly Lock _projectionsLock = new();
 
@@ -39,17 +42,13 @@ public class HtmlLanguageClient : IAsyncDisposable
         PropertyNameCaseInsensitive = true
     };
 
-    static readonly bool IsCaseInsensitiveFileSystem = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
-    static readonly StringComparer UriComparer = IsCaseInsensitiveFileSystem
-        ? StringComparer.OrdinalIgnoreCase
-        : StringComparer.Ordinal;
-
     // Cached suffix for virtual HTML URIs to avoid repeated string allocations
     const string VirtualHtmlSuffix = "__virtual.html";
 
     public HtmlLanguageClient(ILogger<HtmlLanguageClient> logger)
     {
         _logger = logger;
+        _razorUriToChecksum = new Dictionary<string, string>(_uriComparer);
     }
 
     public bool IsRunning => _process != null && !_process.HasExited;
@@ -65,7 +64,41 @@ public class HtmlLanguageClient : IAsyncDisposable
             _enabled = false;
             _logger.LogInformation("HTML language server disabled by configuration");
         }
+        SetUriComparer(rootUri);
         _rootUri = rootUri;
+    }
+
+    private void SetUriComparer(string? rootUri)
+    {
+        var probePath = TryGetLocalPath(rootUri);
+        var isCaseInsensitive = FileSystemCaseSensitivity.IsCaseInsensitiveForPath(probePath);
+        _uriComparer = isCaseInsensitive ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        lock (_projectionsLock)
+        {
+            _razorUriToChecksum = new Dictionary<string, string>(_uriComparer);
+        }
+    }
+
+    private static string? TryGetLocalPath(string? uriOrPath)
+    {
+        if (string.IsNullOrWhiteSpace(uriOrPath))
+        {
+            return null;
+        }
+
+        if (Uri.TryCreate(uriOrPath, UriKind.Absolute, out var uri) && uri.IsFile)
+        {
+            return uri.LocalPath;
+        }
+
+        try
+        {
+            return Path.GetFullPath(uriOrPath);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -165,6 +198,10 @@ public class HtmlLanguageClient : IAsyncDisposable
             return false;
         }
 
+        _processCts?.Cancel();
+        _processCts?.Dispose();
+        _processCts = new CancellationTokenSource();
+
         // Capture stderr (track task for cleanup)
         _stderrTask = Task.Run(async () =>
         {
@@ -172,7 +209,7 @@ public class HtmlLanguageClient : IAsyncDisposable
             {
                 while (_process != null && !_process.HasExited)
                 {
-                    var line = await _process.StandardError.ReadLineAsync(cancellationToken);
+                    var line = await _process.StandardError.ReadLineAsync(_processCts.Token);
                     if (line != null)
                     {
                         _logger.LogDebug("[HTML LS stderr] {Line}", line);
@@ -181,7 +218,7 @@ public class HtmlLanguageClient : IAsyncDisposable
             }
             catch (OperationCanceledException) { }
             catch (ObjectDisposedException) { }
-        }, cancellationToken);
+        }, _processCts.Token);
 
         var formatter = new SystemTextJsonFormatter
         {
@@ -726,6 +763,10 @@ public class HtmlLanguageClient : IAsyncDisposable
         _initialized = false;
         _startAttempted = false;
 
+        _processCts?.Cancel();
+        _processCts?.Dispose();
+        _processCts = null;
+
         _rpc?.Dispose();
         _rpc = null;
 
@@ -820,6 +861,8 @@ public class HtmlLanguageClient : IAsyncDisposable
                     _logger.LogDebug("HTML language server exited gracefully");
                 }
 
+                _processCts?.Cancel();
+
                 // Wait for stderr task to complete
                 if (_stderrTask != null)
                 {
@@ -868,6 +911,10 @@ public class HtmlLanguageClient : IAsyncDisposable
                 _process = null;
             }
         }
+
+        _processCts?.Cancel();
+        _processCts?.Dispose();
+        _processCts = null;
     }
 }
 
