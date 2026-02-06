@@ -172,8 +172,6 @@ public partial class RazorLanguageServer : IAsyncDisposable
     });
     static readonly JsonElement SuccessResponse = JsonSerializer.SerializeToElement(new { success = true });
 
-    const string VirtualHtmlSuffix = "__virtual.html";
-
     // Language identifiers
     const string LanguageIdAspNetCoreRazor = "aspnetcorerazor";
     const string LanguageIdCSharp = "csharp";
@@ -2330,54 +2328,47 @@ public partial class RazorLanguageServer : IAsyncDisposable
                     }
                 }
 
-                var bufferWriter = new ArrayPoolBufferWriter();
-                try
-                {
-                    using var writer = new Utf8JsonWriter(bufferWriter);
-                    writer.WriteStartObject();
-                    writer.WriteString("kind", "full");
-                    writer.WriteString("resultId", $"merged:{DateTime.UtcNow.Ticks}");
-                    writer.WritePropertyName("items");
-                    writer.WriteStartArray();
+                using var bufferWriter = new ArrayPoolBufferWriter();
+                using var writer = new Utf8JsonWriter(bufferWriter);
+                writer.WriteStartObject();
+                writer.WriteString("kind", "full");
+                writer.WriteString("resultId", $"merged:{DateTime.UtcNow.Ticks}");
+                writer.WritePropertyName("items");
+                writer.WriteStartArray();
 
-                    var mergedCount = 0;
-                    foreach (var result in results)
+                var mergedCount = 0;
+                foreach (var result in results)
+                {
+                    if (result.HasValue && result.Value.TryGetProperty("items", out var items))
                     {
-                        if (result.HasValue && result.Value.TryGetProperty("items", out var items))
+                        foreach (var item in items.EnumerateArray())
                         {
-                            foreach (var item in items.EnumerateArray())
-                            {
-                                item.WriteTo(writer);
-                                mergedCount++;
-                            }
+                            item.WriteTo(writer);
+                            mergedCount++;
                         }
                     }
+                }
 
-                    writer.WriteEndArray();
+                writer.WriteEndArray();
 
-                    if (relatedDocuments != null && relatedDocuments.Count > 0)
+                if (relatedDocuments != null && relatedDocuments.Count > 0)
+                {
+                    writer.WritePropertyName("relatedDocuments");
+                    writer.WriteStartObject();
+                    foreach (var kvp in relatedDocuments)
                     {
-                        writer.WritePropertyName("relatedDocuments");
-                        writer.WriteStartObject();
-                        foreach (var kvp in relatedDocuments)
-                        {
-                            writer.WritePropertyName(kvp.Key);
-                            kvp.Value.WriteTo(writer);
-                        }
-                        writer.WriteEndObject();
+                        writer.WritePropertyName(kvp.Key);
+                        kvp.Value.WriteTo(writer);
                     }
                     writer.WriteEndObject();
-                    writer.Flush();
-
-                    _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedCount, uri);
-
-                    using var doc = JsonDocument.Parse(bufferWriter.WrittenMemory);
-                    return doc.RootElement.Clone();
                 }
-                finally
-                {
-                    bufferWriter.Dispose();
-                }
+                writer.WriteEndObject();
+                writer.Flush();
+
+                _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedCount, uri);
+
+                using var doc = JsonDocument.Parse(bufferWriter.WrittenMemory);
+                return doc.RootElement.Clone();
             }
 
             // For non-C# files, forward as-is
@@ -2711,7 +2702,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
             return (null, null, default, default);
         }
 
-        var razorUri = uri.EndsWith(VirtualHtmlSuffix) ? uri[..^VirtualHtmlSuffix.Length] : uri;
+        var razorUri = uri.EndsWith(HtmlLanguageClient.VirtualHtmlSuffix) ? uri[..^HtmlLanguageClient.VirtualHtmlSuffix.Length] : uri;
 
         var checksum = @params.TryGetProperty("checksum", out var checksumProp)
             ? checksumProp.GetString()
@@ -2817,9 +2808,9 @@ public partial class RazorLanguageServer : IAsyncDisposable
 
             _logger.Log(logLevel, "[Razor] {Message}", message);
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore log parsing errors
+            _logger.LogDebug(ex, "Failed to parse razor log message");
         }
     }
 

@@ -43,7 +43,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     };
 
     // Cached suffix for virtual HTML URIs to avoid repeated string allocations
-    const string VirtualHtmlSuffix = "__virtual.html";
+    internal const string VirtualHtmlSuffix = "__virtual.html";
 
     public HtmlLanguageClient(ILogger<HtmlLanguageClient> logger)
     {

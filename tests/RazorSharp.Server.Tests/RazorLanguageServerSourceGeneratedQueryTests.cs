@@ -1,4 +1,7 @@
 using System.Reflection;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using RazorSharp.Dependencies;
 using RazorSharp.Server;
 
 namespace RazorSharp.Server.Tests;
@@ -27,6 +30,92 @@ public class RazorLanguageServerSourceGeneratedQueryTests
         Assert.True(typeFound);
         Assert.Equal("My Assembly", assemblyName);
         Assert.Equal("My Type", typeName);
+    }
+
+    [Fact]
+    public async Task TransformSourceGeneratedUris_ArrayWithNoChanges_ReturnsSameElement()
+    {
+        using var loggerFactory = LoggerFactory.Create(_ => { });
+        using var deps = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), "test");
+        var server = new RazorLanguageServer(loggerFactory, deps);
+        try
+        {
+            // Set _workspaceRoot so TransformSourceGeneratedUris doesn't bail early
+            var field = typeof(RazorLanguageServer).GetField("_workspaceRoot", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(field);
+            field!.SetValue(server, "/tmp/test-workspace");
+
+            var locations = JsonSerializer.SerializeToElement(new[]
+            {
+                new { uri = "file:///tmp/test-workspace/Program.cs", range = new { start = new { line = 0, character = 0 }, end = new { line = 0, character = 5 } } },
+                new { uri = "file:///tmp/test-workspace/Startup.cs", range = new { start = new { line = 1, character = 0 }, end = new { line = 1, character = 10 } } }
+            });
+
+            var result = InvokeTransformSourceGeneratedUris(server, locations);
+
+            // When no URIs need transformation, the original should be returned
+            Assert.Equal(locations.GetRawText(), result.GetRawText());
+        }
+        finally
+        {
+            await server.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task TransformSourceGeneratedUris_NullResponse_ReturnsSame()
+    {
+        using var loggerFactory = LoggerFactory.Create(_ => { });
+        using var deps = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), "test");
+        var server = new RazorLanguageServer(loggerFactory, deps);
+        try
+        {
+            var field = typeof(RazorLanguageServer).GetField("_workspaceRoot", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(field);
+            field!.SetValue(server, "/tmp/test-workspace");
+
+            var nullElement = JsonSerializer.SerializeToElement<object?>(null);
+            var result = InvokeTransformSourceGeneratedUris(server, nullElement);
+
+            Assert.Equal(JsonValueKind.Null, result.ValueKind);
+        }
+        finally
+        {
+            await server.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task TransformSourceGeneratedUris_EmptyArray_ReturnsSame()
+    {
+        using var loggerFactory = LoggerFactory.Create(_ => { });
+        using var deps = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), "test");
+        var server = new RazorLanguageServer(loggerFactory, deps);
+        try
+        {
+            var field = typeof(RazorLanguageServer).GetField("_workspaceRoot", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(field);
+            field!.SetValue(server, "/tmp/test-workspace");
+
+            var emptyArray = JsonSerializer.SerializeToElement(Array.Empty<object>());
+            var result = InvokeTransformSourceGeneratedUris(server, emptyArray);
+
+            Assert.Equal(JsonValueKind.Array, result.ValueKind);
+            Assert.Equal(0, result.GetArrayLength());
+        }
+        finally
+        {
+            await server.DisposeAsync();
+        }
+    }
+
+    private static JsonElement InvokeTransformSourceGeneratedUris(RazorLanguageServer server, JsonElement response)
+    {
+        var method = typeof(RazorLanguageServer).GetMethod(
+            "TransformSourceGeneratedUris",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(method);
+        return (JsonElement)method!.Invoke(server, [response])!;
     }
 
     private static bool TryGetQueryValue(string query, string key, out string? value)

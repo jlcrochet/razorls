@@ -21,7 +21,11 @@ public static class ListPool<T>
     {
         if (Pool.TryPop(out var list))
         {
-            Interlocked.Decrement(ref _poolSize);
+            int current;
+            do
+            {
+                current = _poolSize;
+            } while (current > 0 && Interlocked.CompareExchange(ref _poolSize, current - 1, current) != current);
             return list;
         }
         return new List<T>();
@@ -34,7 +38,11 @@ public static class ListPool<T>
     {
         if (Pool.TryPop(out var list))
         {
-            Interlocked.Decrement(ref _poolSize);
+            int current;
+            do
+            {
+                current = _poolSize;
+            } while (current > 0 && Interlocked.CompareExchange(ref _poolSize, current - 1, current) != current);
             if (list.Capacity < minCapacity)
             {
                 list.Capacity = minCapacity;
@@ -57,12 +65,12 @@ public static class ListPool<T>
         }
 
         list.Clear();
-        if (Interlocked.Increment(ref _poolSize) > MaxPoolSize)
+        int current;
+        do
         {
-            Interlocked.Decrement(ref _poolSize);
-            return;
-        }
-
+            current = _poolSize;
+            if (current >= MaxPoolSize) return;
+        } while (Interlocked.CompareExchange(ref _poolSize, current + 1, current) != current);
         Pool.Push(list);
     }
 }

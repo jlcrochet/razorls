@@ -128,40 +128,16 @@ public partial class RazorLanguageServer
 
         if (response.ValueKind == JsonValueKind.Array)
         {
-            // First pass: check if any items need transformation
-            List<JsonElement>? transformed = null;
-            var index = 0;
-
+            var items = new List<JsonElement>(response.GetArrayLength());
+            var anyChanged = false;
             foreach (var item in response.EnumerateArray())
             {
                 var newItem = TransformLocationElement(item, out var changed);
-
-                if (transformed != null)
-                {
-                    // Already started collecting, add this item
-                    transformed.Add(newItem);
-                }
-                else if (changed)
-                {
-                    // First changed item - copy all previous items and this one
-                    transformed = new List<JsonElement>(response.GetArrayLength());
-                    var prevIndex = 0;
-                    foreach (var prev in response.EnumerateArray())
-                    {
-                        if (prevIndex >= index) break;
-                        transformed.Add(prev);
-                        prevIndex++;
-                    }
-                    transformed.Add(newItem);
-                }
-                index++;
+                if (changed) anyChanged = true;
+                items.Add(changed ? newItem : item);
             }
-
-            if (transformed != null)
-            {
-                return JsonSerializer.SerializeToElement(transformed);
-            }
-            return response;
+            if (!anyChanged) return response;
+            return JsonSerializer.SerializeToElement(items);
         }
 
         // Single location
@@ -201,33 +177,26 @@ public partial class RazorLanguageServer
     /// </summary>
     private static JsonElement CloneJsonElementWithReplacedProperty(JsonElement element, string propertyName, string newValue)
     {
-        var bufferWriter = new ArrayPoolBufferWriter();
-        try
+        using var bufferWriter = new ArrayPoolBufferWriter();
+        using (var writer = new Utf8JsonWriter(bufferWriter))
         {
-            using (var writer = new Utf8JsonWriter(bufferWriter))
+            writer.WriteStartObject();
+            foreach (var prop in element.EnumerateObject())
             {
-                writer.WriteStartObject();
-                foreach (var prop in element.EnumerateObject())
+                if (prop.Name == propertyName)
                 {
-                    if (prop.Name == propertyName)
-                    {
-                        writer.WriteString(propertyName, newValue);
-                    }
-                    else
-                    {
-                        prop.WriteTo(writer);
-                    }
+                    writer.WriteString(propertyName, newValue);
                 }
-                writer.WriteEndObject();
+                else
+                {
+                    prop.WriteTo(writer);
+                }
             }
+            writer.WriteEndObject();
+        }
 
-            using var doc = JsonDocument.Parse(bufferWriter.WrittenMemory);
-            return doc.RootElement.Clone();
-        }
-        finally
-        {
-            bufferWriter.Dispose();
-        }
+        using var doc = JsonDocument.Parse(bufferWriter.WrittenMemory);
+        return doc.RootElement.Clone();
     }
 
     /// <summary>
