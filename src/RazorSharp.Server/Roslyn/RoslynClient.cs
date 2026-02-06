@@ -203,41 +203,12 @@ public class RoslynClient : IAsyncDisposable
             // It's a response
             if (idProp.ValueKind == JsonValueKind.Number)
             {
-                var id = idProp.GetInt64();
-                if (_pendingRequests.TryRemove(id, out var tcs))
-                {
-                    if (root.TryGetProperty("result", out var result))
-                    {
-                        tcs.TrySetResult(result.Clone());
-                    }
-                    else if (root.TryGetProperty("error", out var error))
-                    {
-                        tcs.TrySetException(new Exception($"JSON-RPC error: {error}"));
-                    }
-                    else
-                    {
-                        tcs.TrySetResult(null);
-                    }
-                }
+                CompleteRequest(idProp.GetInt64(), root);
             }
             else if (idProp.ValueKind == JsonValueKind.String &&
                      long.TryParse(idProp.GetString(), out var stringId))
             {
-                if (_pendingRequests.TryRemove(stringId, out var tcs))
-                {
-                    if (root.TryGetProperty("result", out var result))
-                    {
-                        tcs.TrySetResult(result.Clone());
-                    }
-                    else if (root.TryGetProperty("error", out var error))
-                    {
-                        tcs.TrySetException(new Exception($"JSON-RPC error: {error}"));
-                    }
-                    else
-                    {
-                        tcs.TrySetResult(null);
-                    }
-                }
+                CompleteRequest(stringId, root);
             }
             else
             {
@@ -319,6 +290,25 @@ public class RoslynClient : IAsyncDisposable
         }
         // Note: Document disposal is handled by the caller (ReadMessagesAsync)
         // which disposes the PooledJsonDocument wrapper
+    }
+
+    private void CompleteRequest(long id, JsonElement root)
+    {
+        if (_pendingRequests.TryRemove(id, out var tcs))
+        {
+            if (root.TryGetProperty("result", out var result))
+            {
+                tcs.TrySetResult(result.Clone());
+            }
+            else if (root.TryGetProperty("error", out var error))
+            {
+                tcs.TrySetException(new Exception($"JSON-RPC error: {error}"));
+            }
+            else
+            {
+                tcs.TrySetResult(null);
+            }
+        }
     }
 
     private object?[] HandleWorkspaceConfiguration(JsonElement? @params)

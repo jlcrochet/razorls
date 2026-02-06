@@ -17,6 +17,8 @@ using StreamJsonRpc;
 
 namespace RazorSharp.Server;
 
+enum SourceGeneratedIndexState { Uninitialized, IncrementalOnly, FullScan }
+
 /// <summary>
 /// The main Razor language server that orchestrates communication with Roslyn.
 /// </summary>
@@ -64,8 +66,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
     readonly Dictionary<string, List<SourceGeneratedEntry>> _sourceGeneratedIndex = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock _sourceGeneratedCacheLock = new();
     DateTime _sourceGeneratedIndexLastFullScan;
-    bool _sourceGeneratedIndexHasFullScan;
-    bool _sourceGeneratedIndexHasIncrementalUpdates;
+    SourceGeneratedIndexState _sourceGeneratedIndexState;
     int _sourceGeneratedIndexRefreshInProgress;
     readonly Lock _workspaceReloadLock = new();
     readonly Lock _workspaceInitLock = new();
@@ -1454,50 +1455,6 @@ public partial class RazorLanguageServer : IAsyncDisposable
         return lineProp.TryGetInt32(out line) && charProp.TryGetInt32(out character);
     }
 
-    private static bool TryGetOffset(string text, int line, int character, out int offset)
-    {
-        offset = 0;
-
-        if (line < 0 || character < 0)
-        {
-            return false;
-        }
-
-        var lineStart = 0;
-        var currentLine = 0;
-        while (currentLine < line)
-        {
-            var nextLine = text.IndexOf('\n', lineStart);
-            if (nextLine < 0)
-            {
-                return false;
-            }
-
-            lineStart = nextLine + 1;
-            currentLine++;
-        }
-
-        var lineEnd = text.IndexOf('\n', lineStart);
-        if (lineEnd < 0)
-        {
-            lineEnd = text.Length;
-        }
-
-        if (lineEnd > lineStart && text[lineEnd - 1] == '\r')
-        {
-            lineEnd--;
-        }
-
-        var lineLength = lineEnd - lineStart;
-        if (character > lineLength)
-        {
-            return false;
-        }
-
-        offset = lineStart + character;
-        return true;
-    }
-
     private static List<int> BuildLineStartIndex(string text)
     {
         var lineStarts = new List<int> { 0 };
@@ -2124,22 +2081,22 @@ public partial class RazorLanguageServer : IAsyncDisposable
             // Resolve the code action to get the workspace edit
             var resolveResult = await ForwardToRoslynAsync(LspMethods.CodeActionResolve, selectedAction, ct);
 
-                if (resolveResult.HasValue && resolveResult.Value.TryGetProperty("edit", out var edit))
+            if (resolveResult.HasValue && resolveResult.Value.TryGetProperty("edit", out var edit))
+            {
+                if (_clientRpc == null)
                 {
-                    if (_clientRpc == null)
-                    {
-                        _logger.LogWarning("nestedCodeAction: Client RPC not available to apply edit");
-                        return null;
-                    }
-
-                    // Apply the workspace edit via the client
-                    _logger.LogDebug("nestedCodeAction: Applying workspace edit");
-                    await _clientRpc.InvokeWithParameterObjectAsync<JsonElement?>(
-                        LspMethods.WorkspaceApplyEdit,
-                        new { edit },
-                        ct);
-                    return SuccessResponse;
+                    _logger.LogWarning("nestedCodeAction: Client RPC not available to apply edit");
+                    return null;
                 }
+
+                // Apply the workspace edit via the client
+                _logger.LogDebug("nestedCodeAction: Applying workspace edit");
+                await _clientRpc.InvokeWithParameterObjectAsync<JsonElement?>(
+                    LspMethods.WorkspaceApplyEdit,
+                    new { edit },
+                    ct);
+                return SuccessResponse;
+            }
 
             _logger.LogWarning("nestedCodeAction: No edit in resolved action");
             return null;
@@ -2259,116 +2216,120 @@ public partial class RazorLanguageServer : IAsyncDisposable
                 var requestAnalyzerSemantic = diagConfig?.AnalyzerSemantic ?? false;
 
                 var tasks = ListPool<Task<JsonElement?>>.Rent(4);
-
-                if (requestSyntax)
+                try
                 {
-                    var syntaxParams = JsonSerializer.SerializeToElement(new
+                    if (requestSyntax)
                     {
-                        identifier = "syntax",
-                        textDocument = new { uri }
-                    }, JsonOptions);
-                    tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, syntaxParams, ct));
-                }
-
-                if (requestSemantic)
-                {
-                    var semanticParams = JsonSerializer.SerializeToElement(new
-                    {
-                        identifier = "DocumentCompilerSemantic",
-                        textDocument = new { uri }
-                    }, JsonOptions);
-                    tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, semanticParams, ct));
-                }
-
-                if (requestAnalyzerSyntax)
-                {
-                    var analyzerSyntaxParams = JsonSerializer.SerializeToElement(new
-                    {
-                        identifier = "DocumentAnalyzerSyntax",
-                        textDocument = new { uri }
-                    }, JsonOptions);
-                    tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSyntaxParams, ct));
-                }
-
-                if (requestAnalyzerSemantic)
-                {
-                    var analyzerSemanticParams = JsonSerializer.SerializeToElement(new
-                    {
-                        identifier = "DocumentAnalyzerSemantic",
-                        textDocument = new { uri }
-                    }, JsonOptions);
-                    tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSemanticParams, ct));
-                }
-
-                if (tasks.Count == 0)
-                {
-                    // All categories disabled
-                    ListPool<Task<JsonElement?>>.Return(tasks);
-                    return DiagnosticResponseNone;
-                }
-
-                _logger.LogDebug("Requesting {Count} diagnostic categories for {Uri}", tasks.Count, uri);
-
-                // Request all categories in parallel
-                var results = await Task.WhenAll(tasks);
-                ListPool<Task<JsonElement?>>.Return(tasks);
-
-                Dictionary<string, JsonElement>? relatedDocuments = null;
-                foreach (var result in results)
-                {
-                    if (result.HasValue &&
-                        result.Value.TryGetProperty("relatedDocuments", out var related) &&
-                        related.ValueKind == JsonValueKind.Object)
-                    {
-                        relatedDocuments ??= new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
-                        foreach (var property in related.EnumerateObject())
+                        var syntaxParams = JsonSerializer.SerializeToElement(new
                         {
-                            relatedDocuments[property.Name] = property.Value.Clone();
+                            identifier = "syntax",
+                            textDocument = new { uri }
+                        }, JsonOptions);
+                        tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, syntaxParams, ct));
+                    }
+
+                    if (requestSemantic)
+                    {
+                        var semanticParams = JsonSerializer.SerializeToElement(new
+                        {
+                            identifier = "DocumentCompilerSemantic",
+                            textDocument = new { uri }
+                        }, JsonOptions);
+                        tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, semanticParams, ct));
+                    }
+
+                    if (requestAnalyzerSyntax)
+                    {
+                        var analyzerSyntaxParams = JsonSerializer.SerializeToElement(new
+                        {
+                            identifier = "DocumentAnalyzerSyntax",
+                            textDocument = new { uri }
+                        }, JsonOptions);
+                        tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSyntaxParams, ct));
+                    }
+
+                    if (requestAnalyzerSemantic)
+                    {
+                        var analyzerSemanticParams = JsonSerializer.SerializeToElement(new
+                        {
+                            identifier = "DocumentAnalyzerSemantic",
+                            textDocument = new { uri }
+                        }, JsonOptions);
+                        tasks.Add(ForwardToRoslynAsync(LspMethods.TextDocumentDiagnostic, analyzerSemanticParams, ct));
+                    }
+
+                    if (tasks.Count == 0)
+                    {
+                        // All categories disabled
+                        return DiagnosticResponseNone;
+                    }
+
+                    _logger.LogDebug("Requesting {Count} diagnostic categories for {Uri}", tasks.Count, uri);
+
+                    // Request all categories in parallel
+                    var results = await Task.WhenAll(tasks);
+
+                    Dictionary<string, JsonElement>? relatedDocuments = null;
+                    foreach (var result in results)
+                    {
+                        if (result.HasValue &&
+                            result.Value.TryGetProperty("relatedDocuments", out var related) &&
+                            related.ValueKind == JsonValueKind.Object)
+                        {
+                            relatedDocuments ??= new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+                            foreach (var property in related.EnumerateObject())
+                            {
+                                relatedDocuments[property.Name] = property.Value.Clone();
+                            }
                         }
                     }
-                }
 
-                using var bufferWriter = new ArrayPoolBufferWriter();
-                using var writer = new Utf8JsonWriter(bufferWriter);
-                writer.WriteStartObject();
-                writer.WriteString("kind", "full");
-                writer.WriteString("resultId", $"merged:{DateTime.UtcNow.Ticks}");
-                writer.WritePropertyName("items");
-                writer.WriteStartArray();
-
-                var mergedCount = 0;
-                foreach (var result in results)
-                {
-                    if (result.HasValue && result.Value.TryGetProperty("items", out var items))
-                    {
-                        foreach (var item in items.EnumerateArray())
-                        {
-                            item.WriteTo(writer);
-                            mergedCount++;
-                        }
-                    }
-                }
-
-                writer.WriteEndArray();
-
-                if (relatedDocuments != null && relatedDocuments.Count > 0)
-                {
-                    writer.WritePropertyName("relatedDocuments");
+                    using var bufferWriter = new ArrayPoolBufferWriter();
+                    using var writer = new Utf8JsonWriter(bufferWriter);
                     writer.WriteStartObject();
-                    foreach (var kvp in relatedDocuments)
+                    writer.WriteString("kind", "full");
+                    writer.WriteString("resultId", $"merged:{DateTime.UtcNow.Ticks}");
+                    writer.WritePropertyName("items");
+                    writer.WriteStartArray();
+
+                    var mergedCount = 0;
+                    foreach (var result in results)
                     {
-                        writer.WritePropertyName(kvp.Key);
-                        kvp.Value.WriteTo(writer);
+                        if (result.HasValue && result.Value.TryGetProperty("items", out var items))
+                        {
+                            foreach (var item in items.EnumerateArray())
+                            {
+                                item.WriteTo(writer);
+                                mergedCount++;
+                            }
+                        }
+                    }
+
+                    writer.WriteEndArray();
+
+                    if (relatedDocuments != null && relatedDocuments.Count > 0)
+                    {
+                        writer.WritePropertyName("relatedDocuments");
+                        writer.WriteStartObject();
+                        foreach (var kvp in relatedDocuments)
+                        {
+                            writer.WritePropertyName(kvp.Key);
+                            kvp.Value.WriteTo(writer);
+                        }
+                        writer.WriteEndObject();
                     }
                     writer.WriteEndObject();
+                    writer.Flush();
+
+                    _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedCount, uri);
+
+                    using var doc = JsonDocument.Parse(bufferWriter.WrittenMemory);
+                    return doc.RootElement.Clone();
                 }
-                writer.WriteEndObject();
-                writer.Flush();
-
-                _logger.LogDebug("Merged {Count} diagnostics for {Uri}", mergedCount, uri);
-
-                using var doc = JsonDocument.Parse(bufferWriter.WrittenMemory);
-                return doc.RootElement.Clone();
+                finally
+                {
+                    ListPool<Task<JsonElement?>>.Return(tasks);
+                }
             }
 
             // For non-C# files, forward as-is

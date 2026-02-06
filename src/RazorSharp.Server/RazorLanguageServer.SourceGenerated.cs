@@ -53,7 +53,8 @@ public partial class RazorLanguageServer
                 AddOrUpdateSourceGeneratedEntry(_sourceGeneratedIndex, key, path, isDebug);
             }
 
-            _sourceGeneratedIndexHasIncrementalUpdates = true;
+            if (_sourceGeneratedIndexState == SourceGeneratedIndexState.Uninitialized)
+                _sourceGeneratedIndexState = SourceGeneratedIndexState.IncrementalOnly;
         }
 
         Interlocked.Increment(ref _sourceGeneratedIndexIncrementalUpdates);
@@ -320,7 +321,20 @@ public partial class RazorLanguageServer
     }
 
     private static string MakeSourceGeneratedKey(string assemblyName, string typeName, string hintName)
-        => string.Concat(assemblyName, "\0", typeName, "\0", hintName);
+    {
+        var length = assemblyName.Length + 1 + typeName.Length + 1 + hintName.Length;
+        return string.Create(length, (assemblyName, typeName, hintName), static (span, state) =>
+        {
+            var pos = 0;
+            state.assemblyName.AsSpan().CopyTo(span);
+            pos += state.assemblyName.Length;
+            span[pos++] = '\0';
+            state.typeName.AsSpan().CopyTo(span[pos..]);
+            pos += state.typeName.Length;
+            span[pos++] = '\0';
+            state.hintName.AsSpan().CopyTo(span[pos..]);
+        });
+    }
 
     private static string? GetSourceGeneratedProjectId(Uri uri)
     {
@@ -348,8 +362,8 @@ public partial class RazorLanguageServer
 
         lock (_sourceGeneratedCacheLock)
         {
-            shouldRefresh = (!_sourceGeneratedIndexHasFullScan && !_sourceGeneratedIndexHasIncrementalUpdates) ||
-                            (_sourceGeneratedIndexHasFullScan &&
+            shouldRefresh = _sourceGeneratedIndexState == SourceGeneratedIndexState.Uninitialized ||
+                            (_sourceGeneratedIndexState == SourceGeneratedIndexState.FullScan &&
                              (now - _sourceGeneratedIndexLastFullScan) > SourceGeneratedIndexRefreshInterval);
 
             if (_sourceGeneratedIndex.TryGetValue(key, out entries))
@@ -626,9 +640,8 @@ public partial class RazorLanguageServer
                 {
                     _sourceGeneratedIndex[kvp.Key] = kvp.Value;
                 }
-                _sourceGeneratedIndexHasFullScan = true;
+                _sourceGeneratedIndexState = SourceGeneratedIndexState.FullScan;
                 _sourceGeneratedIndexLastFullScan = scanTime;
-                _sourceGeneratedIndexHasIncrementalUpdates = false;
             }
         }
         catch (Exception ex)

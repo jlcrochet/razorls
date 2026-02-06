@@ -304,12 +304,6 @@ public class HtmlLanguageClient : IAsyncDisposable
             return;
         }
 
-        if (_process != null && _process.HasExited)
-        {
-            HandleHtmlServerExit("process exited unexpectedly");
-            await EnsureStartedAsync(cancellationToken).ConfigureAwait(false);
-        }
-
         // Store the projection even if HTML LS failed to start
         if (_rpc == null || !_initialized)
         {

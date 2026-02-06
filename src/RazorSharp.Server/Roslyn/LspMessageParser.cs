@@ -195,45 +195,28 @@ public class LspMessageParser : IDisposable
             catch (JsonException)
             {
                 Pool.Return(jsonBytes);
-
-                // Drop the invalid payload and reset state so parsing can continue
-                var restLength = _length - _contentLength;
-                if (restLength > 0)
-                {
-                    Buffer.BlockCopy(_buffer, _contentLength, _buffer, 0, restLength);
-                }
-                _length = restLength;
-                _contentLength = -1;
-
-                return false;
             }
             catch
             {
                 Pool.Return(jsonBytes);
-
-                // Drop the invalid payload and reset state so parsing can continue
-                var restLength = _length - _contentLength;
-                if (restLength > 0)
-                {
-                    Buffer.BlockCopy(_buffer, _contentLength, _buffer, 0, restLength);
-                }
-                _length = restLength;
-                _contentLength = -1;
-
+                ConsumeContent();
                 throw;
             }
 
-            // Remove processed content from buffer
-            var contentRemainingLength = _length - _contentLength;
-            if (contentRemainingLength > 0)
-            {
-                Buffer.BlockCopy(_buffer, _contentLength, _buffer, 0, contentRemainingLength);
-            }
-            _length = contentRemainingLength;
-            _contentLength = -1;
-
-            return true;
+            ConsumeContent();
+            return message.Document != null;
         }
+    }
+
+    private void ConsumeContent()
+    {
+        var restLength = _length - _contentLength;
+        if (restLength > 0)
+        {
+            Buffer.BlockCopy(_buffer, _contentLength, _buffer, 0, restLength);
+        }
+        _length = restLength;
+        _contentLength = -1;
     }
 
     public void Dispose()

@@ -1286,6 +1286,8 @@ public class DependencyManager : IDisposable
             {
                 return VersionFetchResult.CreateFromCache(cachedVersion, etag);
             }
+            _logger.LogWarning("Received 304 Not Modified but no cached Roslyn version available.");
+            return VersionFetchResult.Failed;
         }
 
         if (IsRateLimited(response))
