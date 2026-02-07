@@ -106,28 +106,17 @@ public class HtmlLanguageClient : IAsyncDisposable
     /// </summary>
     private async Task EnsureStartedAsync(CancellationToken cancellationToken)
     {
-        if (_process != null && _process.HasExited)
-        {
-            await _startLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                if (_process != null && _process.HasExited)
-                {
-                    HandleHtmlServerExit("process exited unexpectedly");
-                }
-            }
-            finally
-            {
-                _startLock.Release();
-            }
-        }
-
-        if (!_enabled || _initialized || _startAttempted)
+        if (!_enabled || (_initialized && _process != null && !_process.HasExited))
             return;
 
         await _startLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (_process != null && _process.HasExited)
+            {
+                HandleHtmlServerExit("process exited unexpectedly");
+            }
+
             if (_initialized || _startAttempted)
                 return;
 

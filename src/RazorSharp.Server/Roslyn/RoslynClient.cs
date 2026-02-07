@@ -535,26 +535,37 @@ public class RoslynClient : IAsyncDisposable
         await _sendLock.WaitAsync();
         try
         {
-            // Serialize to pooled buffer (reset clears previous content but keeps pooled memory)
+            // Serialize JSON to pooled buffer, then build complete message (header + body) for a single write
             _sendBufferWriter.Reset();
             using (var writer = new Utf8JsonWriter(_sendBufferWriter))
             {
                 JsonSerializer.Serialize(writer, message, SendJsonOptions);
                 writer.Flush();
             }
-            var content = _sendBufferWriter.WrittenSpan;
+            var contentLength = _sendBufferWriter.WrittenCount;
 
-            // Build header directly in bytes: "Content-Length: {length}\r\n\r\n"
+            // Build header in _headerBuffer: "Content-Length: {length}\r\n\r\n"
             "Content-Length: "u8.CopyTo(_headerBuffer);
-            Utf8Formatter.TryFormat(content.Length, _headerBuffer.AsSpan(16), out var bytesWritten);
+            Utf8Formatter.TryFormat(contentLength, _headerBuffer.AsSpan(16), out var bytesWritten);
             "\r\n\r\n"u8.CopyTo(_headerBuffer.AsSpan(16 + bytesWritten));
             var headerLength = 16 + bytesWritten + 4;
 
             try
             {
                 var stream = process.StandardInput.BaseStream;
-                await stream.WriteAsync(_headerBuffer.AsMemory(0, headerLength));
-                await stream.WriteAsync(_sendBufferWriter.WrittenMemory);
+                // Single write: copy header + body into a contiguous buffer
+                var totalLength = headerLength + contentLength;
+                var combined = System.Buffers.ArrayPool<byte>.Shared.Rent(totalLength);
+                try
+                {
+                    _headerBuffer.AsSpan(0, headerLength).CopyTo(combined);
+                    _sendBufferWriter.WrittenSpan.CopyTo(combined.AsSpan(headerLength));
+                    await stream.WriteAsync(combined.AsMemory(0, totalLength));
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<byte>.Shared.Return(combined);
+                }
             }
             catch (ObjectDisposedException ex)
             {

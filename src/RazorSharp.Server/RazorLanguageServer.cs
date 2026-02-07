@@ -2457,8 +2457,15 @@ public partial class RazorLanguageServer : IAsyncDisposable
                         }
 
                         var clampedType = Math.Clamp(type, 1, 4);
-                        var forwardedParams = JsonSerializer.SerializeToElement(new { type = clampedType, message });
-                        await ForwardNotificationToClientAsync(item.Method, forwardedParams);
+                        if (clampedType != type)
+                        {
+                            var forwardedParams = JsonSerializer.SerializeToElement(new { type = clampedType, message });
+                            await ForwardNotificationToClientAsync(item.Method, forwardedParams);
+                        }
+                        else
+                        {
+                            await ForwardNotificationToClientAsync(item.Method, item.Params);
+                        }
                     }
                     else
                     {
@@ -3222,23 +3229,20 @@ public partial class RazorLanguageServer : IAsyncDisposable
         try
         {
             _logger.LogDebug("Forwarding {Method} to Roslyn", method);
-            using var timeoutCts = new CancellationTokenSource(_roslynRequestTimeout);
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-            var result = await _roslynClient.SendRequestAsync(method, @params, linkedCts.Token);
+            var result = await _roslynClient.SendRequestAsync(method, @params, ct)
+                .WaitAsync(_roslynRequestTimeout, ct);
             _logger.LogDebug("Received response from Roslyn for {Method}", method);
             return result;
         }
+        catch (TimeoutException)
+        {
+            RecordRoslynRequestTimeout(method);
+            _logger.LogDebug("Roslyn request timed out for {Method}", method);
+            return null;
+        }
         catch (OperationCanceledException)
         {
-            if (!ct.IsCancellationRequested)
-            {
-                RecordRoslynRequestTimeout(method);
-                _logger.LogDebug("Roslyn request timed out for {Method}", method);
-            }
-            else
-            {
-                _logger.LogDebug("Roslyn request canceled by client for {Method}", method);
-            }
+            _logger.LogDebug("Roslyn request canceled by client for {Method}", method);
             return null;
         }
         catch (IOException ex)

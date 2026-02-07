@@ -109,6 +109,35 @@ public class RazorLanguageServerSourceGeneratedQueryTests
         }
     }
 
+    [Fact]
+    public async Task TransformSourceGeneratedUris_ArrayWithNormalUris_ReturnsSameElement()
+    {
+        using var loggerFactory = LoggerFactory.Create(_ => { });
+        using var deps = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), "test");
+        var server = new RazorLanguageServer(loggerFactory, deps);
+        try
+        {
+            var field = typeof(RazorLanguageServer).GetField("_workspaceRoot", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(field);
+            field!.SetValue(server, "/tmp/test-workspace");
+
+            var locations = JsonSerializer.SerializeToElement(new[]
+            {
+                new { uri = "file:///tmp/test-workspace/Controllers/HomeController.cs", range = new { start = new { line = 5, character = 0 }, end = new { line = 5, character = 10 } } },
+                new { uri = "file:///tmp/test-workspace/Models/User.cs", range = new { start = new { line = 10, character = 4 }, end = new { line = 10, character = 20 } } }
+            });
+
+            var result = InvokeTransformSourceGeneratedUris(server, locations);
+
+            // Fast path: no roslyn-source-generated:// URIs, so the original element should be returned as-is
+            Assert.Equal(locations.GetRawText(), result.GetRawText());
+        }
+        finally
+        {
+            await server.DisposeAsync();
+        }
+    }
+
     private static JsonElement InvokeTransformSourceGeneratedUris(RazorLanguageServer server, JsonElement response)
     {
         var method = typeof(RazorLanguageServer).GetMethod(

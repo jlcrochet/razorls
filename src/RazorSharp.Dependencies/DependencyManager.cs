@@ -24,6 +24,20 @@ public class DependencyManager : IDisposable
     static readonly TimeSpan DependencyLockTimeout = TimeSpan.FromSeconds(30);
     static readonly TimeSpan DependencyLockRetryDelay = TimeSpan.FromMilliseconds(200);
     static readonly JsonSerializerOptions VersionInfoJsonOptions = new() { WriteIndented = true };
+    static readonly string ExtensionQueryPayload = JsonSerializer.Serialize(new
+    {
+        filters = new[]
+        {
+            new
+            {
+                criteria = new[]
+                {
+                    new { filterType = 7, value = "ms-dotnettools.csharp" }
+                }
+            }
+        },
+        flags = 1 // IncludeVersions
+    });
     const int MaxDownloadRetries = 3;
     const int MaxUpdateCheckRetries = 2;
     const int UpdateRetryBaseDelayMs = 250;
@@ -1316,23 +1330,9 @@ public class DependencyManager : IDisposable
     private async Task<VersionFetchResult> GetLatestExtensionVersionAsync(string? etag, string? cachedVersion, CancellationToken cancellationToken)
     {
         const string url = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=3.0-preview.1";
-        var payload = new
-        {
-            filters = new[]
-            {
-                new
-                {
-                    criteria = new[]
-                    {
-                        new { filterType = 7, value = "ms-dotnettools.csharp" }
-                    }
-                }
-            },
-            flags = 1 // IncludeVersions
-        };
         using var request = new HttpRequestMessage(HttpMethod.Post, url)
         {
-            Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+            Content = new StringContent(ExtensionQueryPayload, Encoding.UTF8, "application/json")
         };
         if (!string.IsNullOrWhiteSpace(etag))
         {
@@ -1346,6 +1346,9 @@ public class DependencyManager : IDisposable
             {
                 return VersionFetchResult.CreateFromCache(cachedVersion, etag);
             }
+            // 304 without cached version - can't use this response
+            _logger.LogWarning("Extension API returned 304 NotModified but no cached version available");
+            return VersionFetchResult.Failed;
         }
 
         if (IsRateLimited(response))

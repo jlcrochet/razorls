@@ -15,9 +15,31 @@ public partial class RazorLanguageServer
             return false;
         }
 
-        var normalized = path.Replace('\\', '/');
-        return normalized.IndexOf("/obj/", StringComparison.OrdinalIgnoreCase) >= 0 &&
-               normalized.IndexOf("/generated/", StringComparison.OrdinalIgnoreCase) >= 0;
+        return ContainsPathSegment(path.AsSpan(), "obj") &&
+               ContainsPathSegment(path.AsSpan(), "generated");
+    }
+
+    /// <summary>
+    /// Checks if a path contains a segment matching the given name, delimited by '/' or '\'.
+    /// Avoids allocations by scanning the span directly.
+    /// </summary>
+    private static bool ContainsPathSegment(ReadOnlySpan<char> path, ReadOnlySpan<char> segment)
+    {
+        var searchFrom = 0;
+        while (searchFrom <= path.Length - segment.Length)
+        {
+            var idx = path[searchFrom..].IndexOf(segment, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return false;
+            idx += searchFrom;
+
+            var beforeOk = idx == 0 || path[idx - 1] == '/' || path[idx - 1] == '\\';
+            var afterIdx = idx + segment.Length;
+            var afterOk = afterIdx == path.Length || path[afterIdx] == '/' || path[afterIdx] == '\\';
+
+            if (beforeOk && afterOk) return true;
+            searchFrom = idx + 1;
+        }
+        return false;
     }
 
     private bool TryUpdateSourceGeneratedIndexForChange(string path, FileChangeType changeType)
@@ -66,47 +88,92 @@ public partial class RazorLanguageServer
         key = "";
         isDebug = false;
 
-        var normalized = path.Replace('\\', '/');
-        var objIndex = normalized.IndexOf("/obj/", StringComparison.OrdinalIgnoreCase);
+        var span = path.AsSpan();
+
+        // Find "/obj/" or "\obj\" (case-insensitive)
+        var objIndex = FindPathSegment(span, "obj");
         if (objIndex < 0)
         {
             return false;
         }
 
-        var afterObj = normalized[(objIndex + 5)..];
-        var segments = afterObj.Split('/', StringSplitOptions.RemoveEmptyEntries);
-
-        var generatedIndex = -1;
-        for (var i = 0; i < segments.Length; i++)
+        // After "/obj/", walk segments: config/tfm/.../generated/assemblyName/typeName/hintName
+        var afterObj = span[(objIndex + 4)..]; // skip "obj" + separator
+        // Extract segments by walking the span
+        Span<Range> segmentRanges = stackalloc Range[16];
+        var segmentCount = 0;
+        var pos = 0;
+        while (pos < afterObj.Length && segmentCount < segmentRanges.Length)
         {
-            if (segments[i].Equals("generated", StringComparison.OrdinalIgnoreCase))
+            // Skip leading separators
+            while (pos < afterObj.Length && (afterObj[pos] == '/' || afterObj[pos] == '\\'))
+                pos++;
+            if (pos >= afterObj.Length) break;
+
+            var start = pos;
+            while (pos < afterObj.Length && afterObj[pos] != '/' && afterObj[pos] != '\\')
+                pos++;
+
+            segmentRanges[segmentCount++] = new Range(start, pos);
+        }
+
+        // Find "generated" segment
+        var generatedIndex = -1;
+        for (var i = 0; i < segmentCount; i++)
+        {
+            if (afterObj[segmentRanges[i]].Equals("generated", StringComparison.OrdinalIgnoreCase))
             {
                 generatedIndex = i;
                 break;
             }
         }
 
-        if (generatedIndex < 0 || segments.Length < generatedIndex + 4)
+        if (generatedIndex < 0 || segmentCount < generatedIndex + 4)
         {
             return false;
         }
 
-        var config = segments[0];
+        var config = afterObj[segmentRanges[0]];
         isDebug = config.Equals("Debug", StringComparison.OrdinalIgnoreCase);
 
-        var assemblyName = segments[generatedIndex + 1];
-        var typeName = segments[generatedIndex + 2];
-        var hintName = segments[generatedIndex + 3];
+        var assemblyName = afterObj[segmentRanges[generatedIndex + 1]];
+        var typeName = afterObj[segmentRanges[generatedIndex + 2]];
+        var hintName = afterObj[segmentRanges[generatedIndex + 3]];
 
-        if (string.IsNullOrEmpty(assemblyName) ||
-            string.IsNullOrEmpty(typeName) ||
-            string.IsNullOrEmpty(hintName))
+        if (assemblyName.IsEmpty || typeName.IsEmpty || hintName.IsEmpty)
         {
             return false;
         }
 
-        key = MakeSourceGeneratedKey(assemblyName, typeName, hintName);
+        key = MakeSourceGeneratedKey(
+            assemblyName.ToString(),
+            typeName.ToString(),
+            hintName.ToString());
         return true;
+    }
+
+    /// <summary>
+    /// Finds a path segment in a span, returning the index of the segment start.
+    /// Matches both '/' and '\' as separators, case-insensitive.
+    /// Returns -1 if not found.
+    /// </summary>
+    private static int FindPathSegment(ReadOnlySpan<char> path, ReadOnlySpan<char> segment)
+    {
+        var searchFrom = 0;
+        while (searchFrom <= path.Length - segment.Length)
+        {
+            var idx = path[searchFrom..].IndexOf(segment, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return -1;
+            idx += searchFrom;
+
+            var beforeOk = idx == 0 || path[idx - 1] == '/' || path[idx - 1] == '\\';
+            var afterIdx = idx + segment.Length;
+            var afterOk = afterIdx == path.Length || path[afterIdx] == '/' || path[afterIdx] == '\\';
+
+            if (beforeOk && afterOk) return idx;
+            searchFrom = idx + 1;
+        }
+        return -1;
     }
 
     /// <summary>
@@ -129,6 +196,23 @@ public partial class RazorLanguageServer
 
         if (response.ValueKind == JsonValueKind.Array)
         {
+            // Fast path: check if any URIs need transformation before allocating
+            var hasSourceGenerated = false;
+            foreach (var item in response.EnumerateArray())
+            {
+                if ((item.TryGetProperty("uri", out var u) || item.TryGetProperty("targetUri", out u)) &&
+                    u.ValueKind == JsonValueKind.String)
+                {
+                    var uriStr = u.GetString();
+                    if (uriStr != null && uriStr.StartsWith("roslyn-source-generated://", StringComparison.OrdinalIgnoreCase))
+                    {
+                        hasSourceGenerated = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasSourceGenerated) return response;
+
             var items = new List<JsonElement>(response.GetArrayLength());
             var anyChanged = false;
             foreach (var item in response.EnumerateArray())

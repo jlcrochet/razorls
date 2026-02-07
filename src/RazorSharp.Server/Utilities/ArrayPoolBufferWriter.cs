@@ -28,6 +28,7 @@ public sealed class ArrayPoolBufferWriter : IBufferWriter<byte>, IDisposable
 
     public void Advance(int count)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
         if (_written + count > _buffer.Length) throw new InvalidOperationException("Cannot advance past the end of the buffer.");
         _written += count;
@@ -35,12 +36,14 @@ public sealed class ArrayPoolBufferWriter : IBufferWriter<byte>, IDisposable
 
     public Memory<byte> GetMemory(int sizeHint = 0)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         EnsureCapacity(sizeHint);
         return _buffer.AsMemory(_written);
     }
 
     public Span<byte> GetSpan(int sizeHint = 0)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         EnsureCapacity(sizeHint);
         return _buffer.AsSpan(_written);
     }
