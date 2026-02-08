@@ -44,11 +44,16 @@ jobs:
         run: |
           dotnet publish src/RazorSharp.Server -c Release -r ${{ matrix.rid }} -o publish -p:Version=${{ steps.version.outputs.VERSION }}
 
-      - name: Create zip
-        shell: bash
+      - name: Create zip (Linux/macOS)
+        if: runner.os != 'Windows'
         run: |
           cd publish
           zip -r ../razorsharp-${{ matrix.rid }}.zip .
+
+      - name: Create zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path publish/* -DestinationPath razorsharp-${{ matrix.rid }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
