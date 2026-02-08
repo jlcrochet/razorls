@@ -194,6 +194,58 @@ public class WorkspaceManagerTests
         }
     }
 
+    [Fact]
+    public void FindSolution_FindsSolutionFiltersAndSlnx()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            var workspace = Path.Combine(tempRoot, "MyWorkspace");
+            Directory.CreateDirectory(workspace);
+
+            var filter = Path.Combine(workspace, "MyWorkspace.slnf");
+            var slnx = Path.Combine(workspace, "MyWorkspace.slnx");
+            TouchFile(filter);
+            TouchFile(slnx);
+
+            var manager = CreateManager();
+            var found = manager.FindSolution(workspace);
+
+            Assert.Equal(Path.GetFullPath(filter), found);
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
+    public void FindSolution_PrefersSlnOverSlnfAndSlnx()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            var workspace = Path.Combine(tempRoot, "MyWorkspace");
+            Directory.CreateDirectory(workspace);
+
+            var sln = Path.Combine(workspace, "MyWorkspace.sln");
+            var slnf = Path.Combine(workspace, "MyWorkspace.slnf");
+            var slnx = Path.Combine(workspace, "MyWorkspace.slnx");
+            TouchFile(sln);
+            TouchFile(slnf);
+            TouchFile(slnx);
+
+            var manager = CreateManager();
+            var found = manager.FindSolution(workspace);
+
+            Assert.Equal(Path.GetFullPath(sln), found);
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
     private static WorkspaceManager CreateManager()
     {
         var loggerFactory = LoggerFactory.Create(builder => { });

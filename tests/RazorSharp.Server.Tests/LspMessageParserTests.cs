@@ -308,4 +308,15 @@ public class LspMessageParserTests
         Assert.Equal(10, reports.Count);
     }
 
+    [Fact]
+    public void DisposedParser_ThrowsOnOperations()
+    {
+        var parser = new LspMessageParser();
+        parser.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => parser.GetBuffer());
+        Assert.Throws<ObjectDisposedException>(() => parser.Advance(1));
+        Assert.Throws<ObjectDisposedException>(() => parser.TryParseMessage(out _));
+    }
+
 }

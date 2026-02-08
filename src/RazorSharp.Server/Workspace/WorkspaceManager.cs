@@ -69,10 +69,13 @@ public class WorkspaceManager
 
         while (directory != null)
         {
-            FileInfo[] solutions;
+            List<FileInfo> solutions;
             try
             {
-                solutions = directory.GetFiles("*.sln");
+                solutions = new List<FileInfo>();
+                solutions.AddRange(directory.GetFiles("*.sln"));
+                solutions.AddRange(directory.GetFiles("*.slnf"));
+                solutions.AddRange(directory.GetFiles("*.slnx"));
             }
             catch (Exception ex)
             {
@@ -81,14 +84,18 @@ public class WorkspaceManager
                 continue;
             }
 
-            if (solutions.Length > 0)
+            if (solutions.Count > 0)
             {
                 // If multiple solutions, prefer ones that match the directory name
-                var preferred = solutions.FirstOrDefault(s =>
+                var ordered = solutions
+                    .OrderBy(s => GetSolutionExtensionPriority(s.Extension))
+                    .ThenBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                var preferred = ordered.FirstOrDefault(s =>
                     Path.GetFileNameWithoutExtension(s.Name)
                         .Equals(directory.Name, StringComparison.OrdinalIgnoreCase));
 
-                var solution = (preferred ?? solutions[0]).FullName;
+                var solution = (preferred ?? ordered[0]).FullName;
                 _logger.LogDebug("Found solution: {Solution}", solution);
                 return solution;
             }
@@ -98,6 +105,15 @@ public class WorkspaceManager
 
         return null;
     }
+
+    static int GetSolutionExtensionPriority(string extension)
+        => extension.ToLowerInvariant() switch
+        {
+            ".sln" => 0,
+            ".slnf" => 1,
+            ".slnx" => 2,
+            _ => 3
+        };
 
     /// <summary>
     /// Finds all project files in the given directory and subdirectories.

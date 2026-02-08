@@ -59,11 +59,12 @@ public partial class RazorLanguageServer : IAsyncDisposable
     readonly TaskCompletionSource _roslynProjectInitialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
     DateTime _workspaceOpenedAt;
     HashSet<string> _openDocuments;
+    HashSet<string> _replayingOpenDocuments;
     Dictionary<string, PendingOpenState> _pendingOpens;
     Dictionary<string, List<JsonElement>> _pendingChanges;
     readonly Lock _documentTrackingLock = new();
     Dictionary<string, string> _sourceGeneratedUriCache;
-    readonly Dictionary<string, List<SourceGeneratedEntry>> _sourceGeneratedIndex = new(StringComparer.OrdinalIgnoreCase);
+    Dictionary<string, List<SourceGeneratedEntry>> _sourceGeneratedIndex = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock _sourceGeneratedCacheLock = new();
     DateTime _sourceGeneratedIndexLastFullScan;
     SourceGeneratedIndexState _sourceGeneratedIndexState;
@@ -85,8 +86,10 @@ public partial class RazorLanguageServer : IAsyncDisposable
     Func<string, object?, Task>? _clientNotificationOverride;
     Func<CancellationToken, Task<bool>>? _startRoslynOverride;
     bool _clientInitialized;
+    readonly Channel<NotificationWorkItem> _priorityNotificationChannel;
     readonly Channel<NotificationWorkItem> _notificationChannel;
     readonly CancellationTokenSource _notificationCts;
+    readonly Task _priorityNotificationTask;
     readonly Task _notificationTask;
     readonly CancellationTokenSource _lifetimeCts = new();
     static readonly TimeSpan DependencyProgressReportThrottle = TimeSpan.FromMilliseconds(250);
@@ -253,6 +256,11 @@ public partial class RazorLanguageServer : IAsyncDisposable
         _workspaceManager = new WorkspaceManager(loggerFactory.CreateLogger<WorkspaceManager>());
         _configurationLoader = new ConfigurationLoader(loggerFactory.CreateLogger<ConfigurationLoader>());
         _htmlClient = new HtmlLanguageClient(loggerFactory.CreateLogger<HtmlLanguageClient>());
+        _priorityNotificationChannel = Channel.CreateUnbounded<NotificationWorkItem>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false
+        });
         _notificationChannel = Channel.CreateBounded<NotificationWorkItem>(new BoundedChannelOptions(1024)
         {
             SingleReader = true,
@@ -260,8 +268,10 @@ public partial class RazorLanguageServer : IAsyncDisposable
             FullMode = BoundedChannelFullMode.DropOldest
         });
         _notificationCts = new CancellationTokenSource();
-        _notificationTask = Task.Run(() => ProcessNotificationsAsync(_notificationCts.Token));
+        _priorityNotificationTask = Task.Run(() => ProcessNotificationsAsync(_priorityNotificationChannel.Reader, _notificationCts.Token));
+        _notificationTask = Task.Run(() => ProcessNotificationsAsync(_notificationChannel.Reader, _notificationCts.Token));
         _openDocuments = new HashSet<string>(_uriComparer);
+        _replayingOpenDocuments = new HashSet<string>(_uriComparer);
         _pendingOpens = new Dictionary<string, PendingOpenState>(_uriComparer);
         _pendingChanges = new Dictionary<string, List<JsonElement>>(_uriComparer);
         _sourceGeneratedUriCache = new Dictionary<string, string>(_uriComparer);
@@ -713,7 +723,12 @@ public partial class RazorLanguageServer : IAsyncDisposable
         {
             if (_dependencyDownloadTask != null)
             {
-                return;
+                if (!_dependencyDownloadTask.IsCompleted)
+                {
+                    return;
+                }
+
+                _dependencyDownloadTask = null;
             }
 
             _dependencyDownloadTask = Task.Run(async () =>
@@ -1524,12 +1539,17 @@ public partial class RazorLanguageServer : IAsyncDisposable
         // Check document state and buffer if needed atomically
         // to prevent race conditions with HandleDidOpenAsync
         bool isOpen;
+        bool isReplayInProgress;
+        bool forwardImmediately;
         lock (_documentTrackingLock)
         {
             isOpen = _openDocuments.Contains(uri);
-            if (!isOpen)
+            isReplayInProgress = isOpen && _replayingOpenDocuments.Contains(uri);
+            forwardImmediately = isOpen && !isReplayInProgress;
+            if (!forwardImmediately)
             {
-                if (_pendingOpens.TryGetValue(uri, out var pendingOpen) &&
+                if (!isOpen &&
+                    _pendingOpens.TryGetValue(uri, out var pendingOpen) &&
                     TryUpdatePendingOpenText(pendingOpen, paramsJson, out var updatedOpen))
                 {
                     _pendingOpens[uri] = updatedOpen;
@@ -1539,7 +1559,11 @@ public partial class RazorLanguageServer : IAsyncDisposable
                 else
                 {
                     // Buffer the change to replay after didOpen is forwarded
-                    _logger.LogDebug("Buffering didChange for {Uri} - document not yet open in Roslyn", uri);
+                    _logger.LogDebug(
+                        "Buffering didChange for {Uri} - document not ready in Roslyn (isOpen={IsOpen}, replaying={Replaying})",
+                        uri,
+                        isOpen,
+                        isReplayInProgress);
                     if (!_pendingChanges.TryGetValue(uri, out var changes))
                     {
                         changes = new List<JsonElement>();
@@ -1565,7 +1589,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
             return;
         }
 
-        if (isOpen)
+        if (forwardImmediately)
         {
             await SendRoslynNotificationAsync(LspMethods.TextDocumentDidChange, paramsJson);
         }
@@ -1585,6 +1609,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
         lock (_documentTrackingLock)
         {
             _openDocuments.Remove(uri);
+            _replayingOpenDocuments.Remove(uri);
             _pendingOpens.Remove(uri);
             _pendingChanges.Remove(uri);
         }
@@ -1824,13 +1849,18 @@ public partial class RazorLanguageServer : IAsyncDisposable
         nestedActions = default;
 
         if (action.TryGetProperty("command", out var command) &&
+            command.ValueKind == JsonValueKind.Object &&
             command.TryGetProperty("command", out var commandName) &&
-            commandName.GetString() == NestedCodeActionCommand &&
+            commandName.ValueKind == JsonValueKind.String &&
+            string.Equals(commandName.GetString(), NestedCodeActionCommand, StringComparison.Ordinal) &&
             command.TryGetProperty("arguments", out var arguments) &&
+            arguments.ValueKind == JsonValueKind.Array &&
             arguments.GetArrayLength() > 0)
         {
             var arg = arguments[0];
-            if (arg.TryGetProperty("NestedCodeActions", out nestedActions))
+            if (arg.ValueKind == JsonValueKind.Object &&
+                arg.TryGetProperty("NestedCodeActions", out nestedActions) &&
+                nestedActions.ValueKind == JsonValueKind.Array)
             {
                 return true;
             }
@@ -1845,8 +1875,10 @@ public partial class RazorLanguageServer : IAsyncDisposable
     private static bool IsNestedCodeActionWithoutChildren(JsonElement action)
     {
         return action.TryGetProperty("command", out var command) &&
+               command.ValueKind == JsonValueKind.Object &&
                command.TryGetProperty("command", out var commandName) &&
-               commandName.GetString() == NestedCodeActionCommand;
+               commandName.ValueKind == JsonValueKind.String &&
+               string.Equals(commandName.GetString(), NestedCodeActionCommand, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -2369,16 +2401,17 @@ public partial class RazorLanguageServer : IAsyncDisposable
             _pendingOpens.Clear();
             _pendingChanges.Clear();
             _openDocuments.Clear();
+            _replayingOpenDocuments.Clear();
         }
     }
 
-    private async Task ProcessNotificationsAsync(CancellationToken ct)
+    private async Task ProcessNotificationsAsync(ChannelReader<NotificationWorkItem> reader, CancellationToken ct)
     {
         try
         {
-            while (await _notificationChannel.Reader.WaitToReadAsync(ct))
+            while (await reader.WaitToReadAsync(ct))
             {
-                while (_notificationChannel.Reader.TryRead(out var item))
+                while (reader.TryRead(out var item))
                 {
                     await HandleRoslynNotificationAsync(item, ct);
                 }
@@ -2514,19 +2547,29 @@ public partial class RazorLanguageServer : IAsyncDisposable
         }
 
         var item = new NotificationWorkItem(e.Method, e.Params);
-        if (!_notificationChannel.Writer.TryWrite(item))
+        if (IsHighPriorityRoslynNotification(e.Method))
         {
-            // Ensure initialization completion isn't dropped under backpressure
-            if (e.Method == LspMethods.ProjectInitializationComplete)
+            if (!_priorityNotificationChannel.Writer.TryWrite(item))
             {
+                // Writer should only fail during shutdown. Best-effort handling avoids losing
+                // initialization completion/diagnostics if cancellation races channel completion.
                 _ = HandleRoslynNotificationAsync(item, _notificationCts.Token);
             }
-            else
-            {
-                RecordDroppedRoslynNotification(e.Method);
-                _logger.LogDebug("Dropping Roslyn notification due to backpressure: {Method}", e.Method);
-            }
+
+            return;
         }
+
+        if (!_notificationChannel.Writer.TryWrite(item))
+        {
+            RecordDroppedRoslynNotification(e.Method);
+            _logger.LogDebug("Dropping Roslyn notification due to backpressure: {Method}", e.Method);
+        }
+    }
+
+    private static bool IsHighPriorityRoslynNotification(string method)
+    {
+        return method == LspMethods.ProjectInitializationComplete
+            || method == LspMethods.TextDocumentPublishDiagnostics;
     }
 
     private void RecordDroppedRoslynNotification(string method)
@@ -3312,23 +3355,57 @@ public partial class RazorLanguageServer : IAsyncDisposable
         var roslynParamsJson = JsonSerializer.SerializeToElement(roslynParams, JsonOptions);
         await SendRoslynNotificationAsync(LspMethods.TextDocumentDidOpen, roslynParamsJson);
 
-        List<JsonElement>? pendingChanges = null;
         lock (_documentTrackingLock)
         {
             _openDocuments.Add(openState.Uri);
+            _replayingOpenDocuments.Add(openState.Uri);
             _pendingOpens.Remove(openState.Uri);
-            if (_pendingChanges.TryGetValue(openState.Uri, out pendingChanges))
-            {
-                _pendingChanges.Remove(openState.Uri);
-            }
         }
 
-        if (pendingChanges != null && pendingChanges.Count > 0)
+        try
         {
-            _logger.LogDebug("Replaying {Count} buffered changes for {Uri}", pendingChanges.Count, openState.Uri);
-            foreach (var change in pendingChanges)
+            while (true)
             {
-                await SendRoslynNotificationAsync(LspMethods.TextDocumentDidChange, change);
+                List<JsonElement>? pendingChanges = null;
+                lock (_documentTrackingLock)
+                {
+                    if (!_openDocuments.Contains(openState.Uri))
+                    {
+                        _pendingChanges.Remove(openState.Uri);
+                        return;
+                    }
+
+                    if (_pendingChanges.TryGetValue(openState.Uri, out pendingChanges))
+                    {
+                        _pendingChanges.Remove(openState.Uri);
+                    }
+                }
+
+                if (pendingChanges == null || pendingChanges.Count == 0)
+                {
+                    return;
+                }
+
+                _logger.LogDebug("Replaying {Count} buffered changes for {Uri}", pendingChanges.Count, openState.Uri);
+                foreach (var change in pendingChanges)
+                {
+                    lock (_documentTrackingLock)
+                    {
+                        if (!_openDocuments.Contains(openState.Uri))
+                        {
+                            return;
+                        }
+                    }
+
+                    await SendRoslynNotificationAsync(LspMethods.TextDocumentDidChange, change);
+                }
+            }
+        }
+        finally
+        {
+            lock (_documentTrackingLock)
+            {
+                _replayingOpenDocuments.Remove(openState.Uri);
             }
         }
     }
@@ -4143,8 +4220,18 @@ public partial class RazorLanguageServer : IAsyncDisposable
 
         _clientRpc?.Dispose();
 
+        _priorityNotificationChannel.Writer.TryComplete();
         _notificationChannel.Writer.TryComplete();
         _notificationCts.Cancel();
+        try
+        {
+            await _priorityNotificationTask.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        catch
+        {
+            // Ignore shutdown errors
+        }
+
         try
         {
             await _notificationTask.WaitAsync(TimeSpan.FromSeconds(1));

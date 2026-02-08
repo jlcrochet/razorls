@@ -442,6 +442,9 @@ public partial class RazorLanguageServer
         filePath = "";
         var now = DateTime.UtcNow;
         var shouldRefresh = false;
+        var refreshAfterReturn = false;
+        var found = false;
+        SourceGeneratedEntry selected = default;
         List<SourceGeneratedEntry>? entries = null;
 
         lock (_sourceGeneratedCacheLock)
@@ -452,13 +455,13 @@ public partial class RazorLanguageServer
 
             if (_sourceGeneratedIndex.TryGetValue(key, out entries))
             {
-                if (!shouldRefresh && TrySelectSourceGeneratedEntry(key, entries, projectId, out var selected))
+                if (TrySelectSourceGeneratedEntry(key, entries, projectId, out selected))
                 {
-                    filePath = selected.Path;
-                    return true;
+                    found = true;
+                    refreshAfterReturn = shouldRefresh;
                 }
 
-                if (!AnyEntryExists(entries))
+                if (!found && !AnyEntryExists(entries))
                 {
                     _sourceGeneratedIndex.Remove(key);
                     shouldRefresh = true;
@@ -466,18 +469,15 @@ public partial class RazorLanguageServer
             }
         }
 
-        if (shouldRefresh)
+        if (shouldRefresh || refreshAfterReturn)
         {
             RefreshSourceGeneratedIndex();
-            lock (_sourceGeneratedCacheLock)
-            {
-                if (_sourceGeneratedIndex.TryGetValue(key, out entries) &&
-                    TrySelectSourceGeneratedEntry(key, entries, projectId, out var selected))
-                {
-                    filePath = selected.Path;
-                    return true;
-                }
-            }
+        }
+
+        if (found)
+        {
+            filePath = selected.Path;
+            return true;
         }
 
         return false;
@@ -643,7 +643,8 @@ public partial class RazorLanguageServer
 
     private void RefreshSourceGeneratedIndex()
     {
-        if (_workspaceRoot == null)
+        var workspaceRoot = _workspaceRoot;
+        if (workspaceRoot == null)
         {
             return;
         }
@@ -653,13 +654,17 @@ public partial class RazorLanguageServer
             return;
         }
 
+        _ = Task.Run(() => RefreshSourceGeneratedIndexCore(workspaceRoot, _lifetimeCts.Token));
+    }
+
+    private void RefreshSourceGeneratedIndexCore(string workspaceRoot, CancellationToken ct)
+    {
         try
         {
             Interlocked.Increment(ref _sourceGeneratedIndexRefreshes);
             var newIndex = new Dictionary<string, List<SourceGeneratedEntry>>(StringComparer.OrdinalIgnoreCase);
 
-            var ct = _lifetimeCts.Token;
-            foreach (var objDir in EnumerateObjDirectories(_workspaceRoot))
+            foreach (var objDir in EnumerateObjDirectories(workspaceRoot))
             {
                 ct.ThrowIfCancellationRequested();
                 try
@@ -719,14 +724,14 @@ public partial class RazorLanguageServer
             var scanTime = DateTime.UtcNow;
             lock (_sourceGeneratedCacheLock)
             {
-                _sourceGeneratedIndex.Clear();
-                foreach (var kvp in newIndex)
-                {
-                    _sourceGeneratedIndex[kvp.Key] = kvp.Value;
-                }
+                _sourceGeneratedIndex = newIndex;
                 _sourceGeneratedIndexState = SourceGeneratedIndexState.FullScan;
                 _sourceGeneratedIndexLastFullScan = scanTime;
             }
+        }
+        catch (OperationCanceledException)
+        {
+            // Server shutdown requested.
         }
         catch (Exception ex)
         {

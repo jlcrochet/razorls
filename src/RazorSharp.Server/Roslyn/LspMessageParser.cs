@@ -38,6 +38,8 @@ public class LspMessageParser : IDisposable
     /// </summary>
     public Memory<byte> GetBuffer(int minSize = 4096)
     {
+        ThrowIfDisposed();
+
         // Ensure there's at least minSize bytes available for reading into
         var available = _buffer.Length - _length;
         if (available < minSize)
@@ -67,6 +69,8 @@ public class LspMessageParser : IDisposable
     /// </summary>
     public void Advance(int count)
     {
+        ThrowIfDisposed();
+
         if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
         if (_length + count > _buffer.Length) throw new InvalidOperationException("Cannot advance past the end of the buffer.");
         _length += count;
@@ -79,6 +83,8 @@ public class LspMessageParser : IDisposable
     /// </summary>
     public bool TryParseMessage(out PooledJsonDocument message)
     {
+        ThrowIfDisposed();
+
         message = default;
         var resyncAttempts = 0;
 
@@ -224,6 +230,14 @@ public class LspMessageParser : IDisposable
         if (_disposed) return;
         _disposed = true;
         Pool.Return(_buffer);
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(LspMessageParser));
+        }
     }
 
     static bool StartsWithHeaderIgnoreCase(ReadOnlySpan<byte> line, ReadOnlySpan<byte> header)

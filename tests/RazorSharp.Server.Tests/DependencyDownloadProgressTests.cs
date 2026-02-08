@@ -63,6 +63,43 @@ public class DependencyDownloadProgressTests
         }
     }
 
+    [Fact]
+    public async Task BackgroundDownload_CanRestartAfterCompletion()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var loggerFactory = LoggerFactory.Create(builder => { });
+            using var deps = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), "test", tempRoot);
+            var server = new RazorLanguageServer(loggerFactory, deps);
+            try
+            {
+                var ensureCalls = 0;
+                deps.EnsureDependenciesOverride = (_, _) =>
+                {
+                    Interlocked.Increment(ref ensureCalls);
+                    return Task.FromResult(false);
+                };
+
+                var firstTask = server.StartBackgroundDependencyDownloadForTests();
+                await AwaitOrTimeout(firstTask, 2000, "First dependency download did not complete.");
+
+                var secondTask = server.StartBackgroundDependencyDownloadForTests();
+                await AwaitOrTimeout(secondTask, 2000, "Second dependency download did not complete.");
+
+                Assert.Equal(2, ensureCalls);
+            }
+            finally
+            {
+                await server.DisposeAsync();
+            }
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
     sealed class FakeProgressRpc : IProgressRpc
     {
         public Action<int, string, object>? OnNotificationRecorded { get; set; }
