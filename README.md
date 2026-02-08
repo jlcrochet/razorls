@@ -58,10 +58,10 @@ unzip razorsharp.zip -d ~/.local/share/razorsharp
 
 ```bash
 # Build debug
-dotnet build RazorSharp.sln
+dotnet build RazorSharp.slnx
 
 # Build release
-dotnet build RazorSharp.sln -c Release
+dotnet build RazorSharp.slnx -c Release
 ```
 
 ## Usage

@@ -1,0 +1,8 @@
+{
+  "configProperties": {
+    "System.Runtime.TieredPGO": true,
+    "System.Threading.ThreadPool.UsePortableThreadPool": true,
+    "System.Diagnostics.Tracing.FrameworkEventSource.IsSupported": false,
+    "System.Net.Http.EnableActivityPropagation": false
+  }
+}

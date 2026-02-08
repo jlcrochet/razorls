@@ -10,7 +10,19 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - rid: linux-x64
+            os: ubuntu-latest
+          - rid: linux-arm64
+            os: ubuntu-latest
+          - rid: osx-arm64
+            os: macos-latest
+          - rid: win-x64
+            os: windows-latest
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -25,25 +37,44 @@ jobs:
 
       - name: Get version from tag
         id: version
+        shell: bash
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Publish
         run: |
-          dotnet publish src/RazorSharp.Server -c Release -o publish -p:Version=${{ steps.version.outputs.VERSION }}
+          dotnet publish src/RazorSharp.Server -c Release -r ${{ matrix.rid }} -o publish -p:Version=${{ steps.version.outputs.VERSION }}
 
       - name: Create zip
+        shell: bash
         run: |
           cd publish
-          zip -r ../razorsharp.zip .
+          zip -r ../razorsharp-${{ matrix.rid }}.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: razorsharp-${{ matrix.rid }}
+          path: razorsharp-${{ matrix.rid }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
       - name: Create checksums
-        run: sha256sum razorsharp.zip > checksums.txt
+        run: sha256sum artifacts/razorsharp-*.zip > checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            razorsharp.zip
+            artifacts/razorsharp-*.zip
             checksums.txt
           generate_release_notes: true
           draft: false

@@ -18,6 +18,12 @@
     <!-- Ahead-of-time compilation for faster startup -->
     <PublishReadyToRun>true</PublishReadyToRun>
 
+    <!-- Server GC: higher throughput and lower pause times for long-running server -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+
+    <!-- No culture-sensitive operations; eliminates ICU/NLS data -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+
     <!-- Strip debug symbols from output -->
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
@@ -28,9 +34,6 @@
     <PackageReference Include="StreamJsonRpc" Version="2.21.69" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Configuration" Version="9.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.CommandLine" Version="9.0.0" />
   </ItemGroup>
 
   <ItemGroup>

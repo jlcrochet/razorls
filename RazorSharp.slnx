@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="src/RazorSharp.Server/RazorSharp.Server.csproj" />
+  <Project Path="src/RazorSharp.Protocol/RazorSharp.Protocol.csproj" />
+  <Project Path="src/RazorSharp.Dependencies/RazorSharp.Dependencies.csproj" />
+  <Project Path="src/RazorSharp.Utilities/RazorSharp.Utilities.csproj" />
+  <Folder Name="/tests/">
+    <Project Path="tests/RazorSharp.Server.Tests/RazorSharp.Server.Tests.csproj" />
+  </Folder>
+</Solution>
