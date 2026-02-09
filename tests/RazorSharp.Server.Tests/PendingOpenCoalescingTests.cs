@@ -145,6 +145,50 @@ public class PendingOpenCoalescingTests
         Assert.Equal(1, updated.Version);
     }
 
+    [Fact]
+    public void TryUpdatePendingOpenText_AllowsTrailingEmptyLinePosition()
+    {
+        using var server = CreateServer();
+        var pending = CreatePendingOpenState("file:///test.cs", "csharp", 1, "a\n");
+        var change = CreateChangeParams("file:///test.cs", 2, new
+        {
+            range = new
+            {
+                start = new { line = 1, character = 0 },
+                end = new { line = 1, character = 0 }
+            },
+            text = "b"
+        });
+
+        var updated = InvokeTryUpdatePendingOpenText(server, pending, change, out var result);
+
+        Assert.True(result);
+        Assert.Equal("a\nb", updated.Text);
+        Assert.Equal(2, updated.Version);
+    }
+
+    [Fact]
+    public void TryUpdatePendingOpenText_InvalidTrailingEmptyLineCharacter_ReturnsFalse()
+    {
+        using var server = CreateServer();
+        var pending = CreatePendingOpenState("file:///test.cs", "csharp", 1, "a\n");
+        var change = CreateChangeParams("file:///test.cs", 2, new
+        {
+            range = new
+            {
+                start = new { line = 1, character = 1 },
+                end = new { line = 1, character = 1 }
+            },
+            text = "b"
+        });
+
+        var updated = InvokeTryUpdatePendingOpenText(server, pending, change, out var result);
+
+        Assert.False(result);
+        Assert.Equal("a\n", updated.Text);
+        Assert.Equal(1, updated.Version);
+    }
+
     sealed class ServerHolder : IDisposable
     {
         readonly ILoggerFactory _loggerFactory;

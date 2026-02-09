@@ -1,7 +1,6 @@
 using System.Buffers;
 using System.Reflection;
 using System.Text.Json;
-using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using RazorSharp.Dependencies;
 using RazorSharp.Protocol;
@@ -64,15 +63,13 @@ public partial class RazorLanguageServer : IAsyncDisposable
     Dictionary<string, List<JsonElement>> _pendingChanges;
     readonly Lock _documentTrackingLock = new();
     Dictionary<string, string> _sourceGeneratedUriCache;
+    Dictionary<string, DateTime> _sourceGeneratedPathValidationUtc;
     Dictionary<string, List<SourceGeneratedEntry>> _sourceGeneratedIndex = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock _sourceGeneratedCacheLock = new();
     DateTime _sourceGeneratedIndexLastFullScan;
     SourceGeneratedIndexState _sourceGeneratedIndexState;
     int _sourceGeneratedIndexRefreshInProgress;
-    readonly Lock _workspaceReloadLock = new();
     readonly Lock _workspaceInitLock = new();
-    CancellationTokenSource? _workspaceReloadCts;
-    Task? _workspaceReloadTask;
     WorkDoneProgressScope? _workspaceInitProgress;
     Task? _workspaceInitTimeoutTask;
     bool _workspaceInitStarted;
@@ -86,14 +83,20 @@ public partial class RazorLanguageServer : IAsyncDisposable
     Func<string, object?, Task>? _clientNotificationOverride;
     Func<CancellationToken, Task<bool>>? _startRoslynOverride;
     bool _clientInitialized;
-    readonly Channel<NotificationWorkItem> _priorityNotificationChannel;
-    readonly Channel<NotificationWorkItem> _notificationChannel;
-    readonly CancellationTokenSource _notificationCts;
-    readonly Task _priorityNotificationTask;
-    readonly Task _notificationTask;
+    readonly RoslynNotificationDispatcher _notificationDispatcher;
+    readonly RoslynReverseRequestDispatcher _requestDispatcher;
+    readonly RoslynClientCommandDispatcher _clientCommandDispatcher;
+    readonly OmniSharpConfigPathResolver _omniSharpConfigPathResolver;
+    readonly WorkspaceWatchConfigContextFactory _workspaceWatchConfigContextFactory;
+    readonly WorkspaceWatchedFilesAnalyzer _watchedFilesAnalyzer;
+    readonly WorkspaceWatchedFilesPipeline _workspaceWatchedFilesPipeline;
+    readonly FileWatcherRegistrationService _fileWatcherRegistrationService;
+    readonly WorkspaceTargetResolver _workspaceTargetResolver;
+    readonly WorkspaceOpenCoordinator _workspaceOpenCoordinator;
+    readonly WorkspaceReloadScheduler _workspaceReloadScheduler;
+    readonly RoslynNotificationPump _notificationPump;
     readonly CancellationTokenSource _lifetimeCts = new();
     static readonly TimeSpan DependencyProgressReportThrottle = TimeSpan.FromMilliseconds(250);
-    long _droppedRoslynNotifications;
     long _roslynRequestTimeouts;
     long _sourceGeneratedCacheHits;
     long _sourceGeneratedCacheMisses;
@@ -103,6 +106,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
     long _nextRoslynTimeoutWarnAt = RoslynTimeoutsWarnEvery;
     DateTime _lastTelemetryWarnUtc;
     readonly Lock _telemetryWarnLock = new();
+    readonly NotificationBackpressureTracker _notificationBackpressure = new();
     const int DefaultDiagnosticsProgressDelayMs = 250;
     const int WorkDoneProgressCreateTimeoutMs = 2000;
     const int MaxFastStartDelayMs = 60000;
@@ -135,6 +139,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
     TimeSpan _roslynRequestTimeout = DefaultRoslynRequestTimeout;
     int _userRequestProgressDelayMs = DefaultUserRequestProgressDelayMs;
     static readonly TimeSpan SourceGeneratedIndexRefreshInterval = TimeSpan.FromSeconds(60);
+    static readonly TimeSpan SourceGeneratedPathValidationInterval = TimeSpan.FromSeconds(30);
     static readonly EnumerationOptions SourceGeneratedEnumerateOptions = new()
     {
         IgnoreInaccessible = true,
@@ -159,6 +164,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
 
     // Cached JSON elements for common responses
     static readonly JsonElement EmptyArrayResponse = JsonSerializer.SerializeToElement(Array.Empty<object>());
+    static readonly JsonElement EmptyObjectResponse = JsonSerializer.SerializeToElement(new { });
     static readonly JsonElement DefaultFormattingOptions = JsonSerializer.SerializeToElement(new { tabSize = 4, insertSpaces = true });
 
     // Cached diagnostic response templates (static parts that don't change per-request)
@@ -237,7 +243,6 @@ public partial class RazorLanguageServer : IAsyncDisposable
         GlobalJsonFileName
     ];
 
-    readonly record struct NotificationWorkItem(string Method, JsonElement? Params);
     readonly record struct PendingOpenState(string Uri, string LanguageId, int Version, string Text);
     readonly record struct SourceGeneratedEntry(string Path, bool IsDebug, DateTime LastWriteUtc);
     internal enum MessageType
@@ -256,25 +261,84 @@ public partial class RazorLanguageServer : IAsyncDisposable
         _workspaceManager = new WorkspaceManager(loggerFactory.CreateLogger<WorkspaceManager>());
         _configurationLoader = new ConfigurationLoader(loggerFactory.CreateLogger<ConfigurationLoader>());
         _htmlClient = new HtmlLanguageClient(loggerFactory.CreateLogger<HtmlLanguageClient>());
-        _priorityNotificationChannel = Channel.CreateUnbounded<NotificationWorkItem>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = false
-        });
-        _notificationChannel = Channel.CreateBounded<NotificationWorkItem>(new BoundedChannelOptions(1024)
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropOldest
-        });
-        _notificationCts = new CancellationTokenSource();
-        _priorityNotificationTask = Task.Run(() => ProcessNotificationsAsync(_priorityNotificationChannel.Reader, _notificationCts.Token));
-        _notificationTask = Task.Run(() => ProcessNotificationsAsync(_notificationChannel.Reader, _notificationCts.Token));
+        _notificationDispatcher = new RoslynNotificationDispatcher(
+            _logger,
+            HandleRazorLog,
+            () => _roslynProjectInitialized.Task.IsCompletedSuccessfully,
+            HandleProjectInitializationCompleteAsync,
+            ForwardNotificationToClientAsync,
+            TryGetProgressToken,
+            TryGetProgressKind);
+        _requestDispatcher = new RoslynReverseRequestDispatcher(
+            _logger,
+            TryGetProgressToken,
+            ForwardRequestToClientAsync,
+            HandleRazorUpdateHtmlAsync,
+            HandleHtmlFormattingRequestAsync,
+            HandleHtmlRangeFormattingRequestAsync,
+            () => EmptyObjectResponse);
+        _clientCommandDispatcher = new RoslynClientCommandDispatcher(
+            _logger,
+            NestedCodeActionCommand,
+            FixAllCodeActionCommand,
+            CompletionComplexEditCommand,
+            HandleNestedCodeActionAsync,
+            HandleFixAllCodeActionAsync);
+        _omniSharpConfigPathResolver = new OmniSharpConfigPathResolver(TryGetFullPath, OmniSharpConfigFileName);
+        _workspaceWatchConfigContextFactory = new WorkspaceWatchConfigContextFactory(
+            TryGetFullPath,
+            TryGetGlobalOmniSharpConfigPath,
+            OmniSharpConfigFileName);
+        _watchedFilesAnalyzer = new WorkspaceWatchedFilesAnalyzer(
+            TryGetLocalPath,
+            IsOmniSharpConfigPath,
+            IsSourceGeneratedPath,
+            TryUpdateSourceGeneratedIndexForChange,
+            IsWorkspaceReloadTriggerPath);
+        var workspaceWatchedFilesRequestParser = new WorkspaceWatchedFilesRequestParser(_logger, JsonOptions);
+        var workspaceWatchedFilesHandler = new WorkspaceWatchedFilesHandler(
+            _logger,
+            _workspaceWatchConfigContextFactory,
+            _watchedFilesAnalyzer,
+            _configurationLoader.Reload,
+            SendRoslynNotificationAsync,
+            RefreshSourceGeneratedIndex,
+            ScheduleWorkspaceReload);
+        _workspaceWatchedFilesPipeline = new WorkspaceWatchedFilesPipeline(
+            workspaceWatchedFilesRequestParser,
+            workspaceWatchedFilesHandler);
+        _fileWatcherRegistrationService = new FileWatcherRegistrationService(
+            new FileWatcherRegistrationCoordinator(
+                _logger,
+                FileWatchRegistrationId,
+                LspMethods.WorkspaceDidChangeWatchedFiles,
+                CreateFileWatchers),
+            TryGetWorkspaceBaseUri);
+        _workspaceTargetResolver = new WorkspaceTargetResolver(TryGetLocalPath, TryGetFullPath);
+        _workspaceOpenCoordinator = new WorkspaceOpenCoordinator(
+            _logger,
+            _workspaceManager,
+            TryGetLocalPath,
+            SendRoslynNotificationAsync,
+            SolutionFilterFileName,
+            SolutionXmlFileName);
+        _workspaceReloadScheduler = new WorkspaceReloadScheduler(
+            _logger,
+            GetWorkspaceOpenTarget,
+            () => CanSendRoslynNotifications,
+            OpenWorkspaceAsync,
+            WorkspaceReloadDebounceMs);
+        _notificationPump = new RoslynNotificationPump(
+            _logger,
+            _notificationBackpressure,
+            HandleRoslynNotificationAsync,
+            IsHighPriorityRoslynNotification);
         _openDocuments = new HashSet<string>(_uriComparer);
         _replayingOpenDocuments = new HashSet<string>(_uriComparer);
         _pendingOpens = new Dictionary<string, PendingOpenState>(_uriComparer);
         _pendingChanges = new Dictionary<string, List<JsonElement>>(_uriComparer);
         _sourceGeneratedUriCache = new Dictionary<string, string>(_uriComparer);
+        _sourceGeneratedPathValidationUtc = new Dictionary<string, DateTime>(_uriComparer);
         _workspaceOpenedAt = DateTime.UtcNow;
     }
 
@@ -318,12 +382,17 @@ public partial class RazorLanguageServer : IAsyncDisposable
         => _startRoslynOverride = overrideFunc;
     internal void SetDependenciesMissingForTests(bool missing)
         => _dependenciesMissing = missing;
+    internal IReadOnlyDictionary<string, long> GetDroppedNotificationCountsForTests()
+        => _notificationBackpressure.GetDroppedByMethodSnapshotForTests();
+    internal void SetNotificationQueueSnapshotForTests(int notificationDepth, int notificationPeak, int priorityDepth, int priorityPeak)
+        => _notificationBackpressure.SetQueueSnapshotForTests(
+            new NotificationBackpressureTracker.QueueSnapshot(notificationDepth, notificationPeak, priorityDepth, priorityPeak));
     internal void MarkClientInitializedForTests()
     {
         _clientInitialized = true;
     }
     internal Task HandleRoslynNotificationForTests(string method, JsonElement? @params, CancellationToken ct)
-        => HandleRoslynNotificationAsync(new NotificationWorkItem(method, @params), ct);
+        => HandleRoslynNotificationAsync(new RoslynNotificationWorkItem(method, @params), ct);
     internal void HandleRoslynProcessExitedForTests(int exitCode)
         => OnRoslynProcessExited(this, exitCode);
     internal Task<bool> SendWorkDoneProgressBeginForTests(string token, string title, string? message, CancellationToken ct)
@@ -1483,10 +1552,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
             }
 
             var nextStart = newline + 1;
-            if (nextStart < text.Length)
-            {
-                lineStarts.Add(nextStart);
-            }
+            lineStarts.Add(nextStart);
 
             index = nextStart;
         }
@@ -1637,90 +1703,11 @@ public partial class RazorLanguageServer : IAsyncDisposable
     [JsonRpcMethod(LspMethods.WorkspaceDidChangeWatchedFiles, UseSingleObjectParameterDeserialization = true)]
     public async Task HandleDidChangeWatchedFilesAsync(JsonElement paramsJson)
     {
-        if (!FileWatchingEnabled)
-        {
-            _logger.LogDebug("Ignoring workspace/didChangeWatchedFiles (disabled by initOptions).");
-            return;
-        }
-
-        var @params = JsonSerializer.Deserialize<DidChangeWatchedFilesParams>(paramsJson, JsonOptions);
-        if (@params?.Changes == null || @params.Changes.Length == 0)
-        {
-            return;
-        }
-
-        // Forward to Roslyn first so it can react immediately.
-        if (CanSendRoslynNotifications)
-        {
-            await SendRoslynNotificationAsync(LspMethods.WorkspaceDidChangeWatchedFiles, paramsJson);
-        }
-
-        var workspaceRoot = _workspaceRoot;
-        var localConfigPath = workspaceRoot != null
-            ? TryGetFullPath(Path.Combine(workspaceRoot, OmniSharpConfigFileName))
-            : null;
-        var globalConfigPath = TryGetGlobalOmniSharpConfigPath();
-
-        var configChanged = false;
-        var sourceGeneratedFullRefreshNeeded = false;
-        var sourceGeneratedIncrementalApplied = false;
-        var workspaceReloadNeeded = false;
-
-        foreach (var change in @params.Changes)
-        {
-            var localPath = TryGetLocalPath(change.Uri);
-            if (localPath == null)
-            {
-                continue;
-            }
-
-            if (!configChanged && IsOmniSharpConfigPath(localPath, localConfigPath, globalConfigPath))
-            {
-                configChanged = true;
-            }
-
-            if (IsSourceGeneratedPath(localPath))
-            {
-                if (TryUpdateSourceGeneratedIndexForChange(localPath, change.Type))
-                {
-                    sourceGeneratedIncrementalApplied = true;
-                }
-                else
-                {
-                    sourceGeneratedFullRefreshNeeded = true;
-                }
-            }
-
-            if (!workspaceReloadNeeded && IsWorkspaceReloadTriggerPath(localPath))
-            {
-                workspaceReloadNeeded = true;
-            }
-        }
-
-        if (configChanged)
-        {
-            _logger.LogInformation("omnisharp.json changed; reloading configuration");
-            _configurationLoader.Reload();
-            if (CanSendRoslynNotifications)
-            {
-                await SendRoslynNotificationAsync(LspMethods.WorkspaceDidChangeConfiguration, new { settings = new { } });
-            }
-        }
-
-        if (sourceGeneratedFullRefreshNeeded)
-        {
-            _logger.LogDebug("Source-generated files changed; refreshing index");
-            RefreshSourceGeneratedIndex();
-        }
-        else if (sourceGeneratedIncrementalApplied)
-        {
-            _logger.LogDebug("Source-generated files changed; updated index incrementally");
-        }
-
-        if (workspaceReloadNeeded)
-        {
-            ScheduleWorkspaceReload();
-        }
+        await _workspaceWatchedFilesPipeline.HandleAsync(
+            FileWatchingEnabled,
+            paramsJson,
+            _workspaceRoot,
+            CanSendRoslynNotifications);
     }
 
     #endregion
@@ -2050,35 +2037,13 @@ public partial class RazorLanguageServer : IAsyncDisposable
     /// <summary>
     /// Handles roslyn.client.* commands that Roslyn expects the client to process.
     /// </summary>
-    private async Task<JsonElement?> HandleRoslynClientCommandAsync(string command, JsonElement @params, CancellationToken ct)
-    {
-        _logger.LogDebug("Handling Roslyn client command: {Command}", command);
-
-        switch (command)
-        {
-            case NestedCodeActionCommand:
-                return await HandleNestedCodeActionAsync(@params, ct);
-
-            case FixAllCodeActionCommand:
-                // Fix All actions need special handling - forward to Roslyn's fix all resolver
-                return await HandleFixAllCodeActionAsync(@params, ct);
-
-            case CompletionComplexEditCommand:
-                // Complex completion edits - these should be handled by the editor
-                // We can't do much here as they require cursor positioning
-                _logger.LogDebug("completionComplexEdit: Ignoring (editor should handle)");
-                return null;
-
-            default:
-                _logger.LogWarning("Unknown Roslyn client command: {Command}", command);
-                return null;
-        }
-    }
+    private Task<JsonElement?> HandleRoslynClientCommandAsync(string command, JsonElement @params, CancellationToken ct)
+        => _clientCommandDispatcher.HandleAsync(command, @params, ct);
 
     /// <summary>
     /// Handles roslyn.client.nestedCodeAction by resolving the selected nested action.
-    /// The arguments contain NestedCodeActions array - we take the first one (user's selection)
-    /// and resolve it to get the workspace edit.
+    /// The arguments contain NestedCodeActions array and, for multiple actions, must include
+    /// a deterministic selection (index or selected action payload).
     /// </summary>
     private async Task<JsonElement?> HandleNestedCodeActionAsync(JsonElement @params, CancellationToken ct)
     {
@@ -2086,6 +2051,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
         {
             // Extract arguments from the command params
             if (!@params.TryGetProperty("arguments", out var arguments) ||
+                arguments.ValueKind != JsonValueKind.Array ||
                 arguments.GetArrayLength() == 0)
             {
                 _logger.LogWarning("nestedCodeAction: No arguments provided");
@@ -2102,13 +2068,15 @@ public partial class RazorLanguageServer : IAsyncDisposable
                 return null;
             }
 
-            // For now, take the first nested action
-            // In a proper implementation, we'd ask the user to choose,
-            // but since we're a proxy, we'll just take the first one
-            // The editor has already selected which action to execute
-            var selectedAction = nestedActions[0];
+            if (!TrySelectNestedCodeAction(@params, arguments, nestedActions, out var selectedAction))
+            {
+                _logger.LogWarning(
+                    "nestedCodeAction: Unable to determine selected nested action from command arguments ({Count} candidates)",
+                    nestedActions.GetArrayLength());
+                return null;
+            }
 
-            _logger.LogDebug("nestedCodeAction: Resolving first nested action");
+            _logger.LogDebug("nestedCodeAction: Resolving selected nested action");
 
             // Resolve the code action to get the workspace edit
             var resolveResult = await ForwardToRoslynAsync(LspMethods.CodeActionResolve, selectedAction, ct);
@@ -2138,6 +2106,176 @@ public partial class RazorLanguageServer : IAsyncDisposable
             _logger.LogError(ex, "Error handling nestedCodeAction");
             return null;
         }
+    }
+
+    private static bool TrySelectNestedCodeAction(
+        JsonElement commandParams,
+        JsonElement arguments,
+        JsonElement nestedActions,
+        out JsonElement selectedAction)
+    {
+        selectedAction = default;
+
+        var nestedCount = nestedActions.GetArrayLength();
+        if (nestedCount == 1)
+        {
+            selectedAction = nestedActions[0];
+            return true;
+        }
+
+        if (TryGetSelectedNestedActionIndex(commandParams, arguments, out var index) &&
+            index >= 0 &&
+            index < nestedCount)
+        {
+            selectedAction = nestedActions[index];
+            return true;
+        }
+
+        if (TryGetSelectedNestedActionObject(commandParams, arguments, out var selectedCandidate) &&
+            TryFindMatchingNestedAction(nestedActions, selectedCandidate, out selectedAction))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryGetSelectedNestedActionIndex(JsonElement commandParams, JsonElement arguments, out int index)
+    {
+        index = default;
+        if (TryGetIntProperty(commandParams, out index))
+        {
+            return true;
+        }
+
+        foreach (var argument in arguments.EnumerateArray())
+        {
+            if (argument.ValueKind == JsonValueKind.Number && argument.TryGetInt32(out index))
+            {
+                return true;
+            }
+
+            if (argument.ValueKind == JsonValueKind.Object && TryGetIntProperty(argument, out index))
+            {
+                return true;
+            }
+        }
+
+        return false;
+
+        static bool TryGetIntProperty(JsonElement value, out int selectedIndex)
+        {
+            selectedIndex = default;
+            return TryGetIntPropertyByName(value, "NestedCodeActionIndex", out selectedIndex) ||
+                   TryGetIntPropertyByName(value, "nestedCodeActionIndex", out selectedIndex) ||
+                   TryGetIntPropertyByName(value, "SelectedIndex", out selectedIndex) ||
+                   TryGetIntPropertyByName(value, "selectedIndex", out selectedIndex) ||
+                   TryGetIntPropertyByName(value, "Index", out selectedIndex) ||
+                   TryGetIntPropertyByName(value, "index", out selectedIndex);
+        }
+    }
+
+    private static bool TryGetSelectedNestedActionObject(
+        JsonElement commandParams,
+        JsonElement arguments,
+        out JsonElement selectedAction)
+    {
+        selectedAction = default;
+        if (TryGetObjectProperty(commandParams, out selectedAction))
+        {
+            return true;
+        }
+
+        foreach (var argument in arguments.EnumerateArray())
+        {
+            if (argument.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            if (TryGetObjectProperty(argument, out selectedAction))
+            {
+                return true;
+            }
+
+            // Some clients may include the selected action directly as an argument.
+            if (!argument.TryGetProperty("NestedCodeActions", out _))
+            {
+                selectedAction = argument;
+                return true;
+            }
+        }
+
+        return false;
+
+        static bool TryGetObjectProperty(JsonElement value, out JsonElement selected)
+        {
+            selected = default;
+            return TryGetObjectPropertyByName(value, "NestedCodeAction", out selected) ||
+                   TryGetObjectPropertyByName(value, "nestedCodeAction", out selected) ||
+                   TryGetObjectPropertyByName(value, "SelectedCodeAction", out selected) ||
+                   TryGetObjectPropertyByName(value, "selectedCodeAction", out selected) ||
+                   TryGetObjectPropertyByName(value, "SelectedAction", out selected) ||
+                   TryGetObjectPropertyByName(value, "selectedAction", out selected) ||
+                   TryGetObjectPropertyByName(value, "CodeAction", out selected) ||
+                   TryGetObjectPropertyByName(value, "codeAction", out selected);
+        }
+    }
+
+    private static bool TryFindMatchingNestedAction(
+        JsonElement nestedActions,
+        JsonElement selectedCandidate,
+        out JsonElement selectedAction)
+    {
+        selectedAction = default;
+        var selectedTitle = selectedCandidate.TryGetProperty("title", out var titleProp) && titleProp.ValueKind == JsonValueKind.String
+            ? titleProp.GetString()
+            : null;
+
+        JsonElement? titleMatch = null;
+        var titleMatchCount = 0;
+        foreach (var nestedAction in nestedActions.EnumerateArray())
+        {
+            if (JsonElement.DeepEquals(nestedAction, selectedCandidate))
+            {
+                selectedAction = nestedAction;
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(selectedTitle) &&
+                nestedAction.TryGetProperty("title", out var nestedTitleProp) &&
+                nestedTitleProp.ValueKind == JsonValueKind.String &&
+                string.Equals(nestedTitleProp.GetString(), selectedTitle, StringComparison.Ordinal))
+            {
+                titleMatchCount++;
+                if (titleMatchCount == 1)
+                {
+                    titleMatch = nestedAction;
+                }
+            }
+        }
+
+        if (titleMatchCount == 1 && titleMatch.HasValue)
+        {
+            selectedAction = titleMatch.Value;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryGetIntPropertyByName(JsonElement value, string propertyName, out int parsedValue)
+    {
+        parsedValue = default;
+        return value.TryGetProperty(propertyName, out var property) &&
+               property.ValueKind == JsonValueKind.Number &&
+               property.TryGetInt32(out parsedValue);
+    }
+
+    private static bool TryGetObjectPropertyByName(JsonElement value, string propertyName, out JsonElement selected)
+    {
+        selected = default;
+        return value.TryGetProperty(propertyName, out selected) && selected.ValueKind == JsonValueKind.Object;
     }
 
     /// <summary>
@@ -2405,132 +2543,17 @@ public partial class RazorLanguageServer : IAsyncDisposable
         }
     }
 
-    private async Task ProcessNotificationsAsync(ChannelReader<NotificationWorkItem> reader, CancellationToken ct)
+    private async Task HandleRoslynNotificationAsync(RoslynNotificationWorkItem item, CancellationToken ct)
     {
-        try
-        {
-            while (await reader.WaitToReadAsync(ct))
-            {
-                while (reader.TryRead(out var item))
-                {
-                    await HandleRoslynNotificationAsync(item, ct);
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected during shutdown
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error processing Roslyn notifications");
-        }
+        await _notificationDispatcher.HandleAsync(item, ct);
     }
 
-    private async Task HandleRoslynNotificationAsync(NotificationWorkItem item, CancellationToken ct)
+    private async Task HandleProjectInitializationCompleteAsync()
     {
-        try
-        {
-            switch (item.Method)
-            {
-                case LspMethods.RazorLog:
-                    HandleRazorLog(item.Params);
-                    break;
-
-                case LspMethods.TextDocumentPublishDiagnostics:
-                    if (!_roslynProjectInitialized.Task.IsCompletedSuccessfully)
-                    {
-                        _logger.LogDebug("Skipping diagnostics publish before project initialization completes");
-                        break;
-                    }
-                    // Forward diagnostics to client
-                    if (item.Params.HasValue)
-                    {
-                        var uri = item.Params.Value.TryGetProperty("uri", out var uriProp) ? uriProp.GetString() : "unknown";
-                        var diagCount = item.Params.Value.TryGetProperty("diagnostics", out var diags) && diags.ValueKind == JsonValueKind.Array
-                            ? diags.GetArrayLength()
-                            : 0;
-                        _logger.LogInformation("Publishing {Count} diagnostics for {Uri}", diagCount, uri);
-                    }
-                    await ForwardNotificationToClientAsync(item.Method, item.Params);
-                    break;
-
-                case LspMethods.ProjectInitializationComplete:
-                    _logger.LogInformation("Roslyn project initialization complete - server ready");
-                    _roslynProjectInitialized.TrySetResult();
-                    await EndWorkspaceInitializationProgressAsync();
-                    await FlushPendingOpensAsync();
-                    break;
-
-                case "window/logMessage":
-                    if (item.Params.HasValue)
-                    {
-                        var message = item.Params.Value.TryGetProperty("message", out var msgProp)
-                            ? msgProp.GetString()
-                            : null;
-                        var type = item.Params.Value.TryGetProperty("type", out var typeProp)
-                            ? typeProp.GetInt32()
-                            : 0;
-
-                        // Roslyn uses this channel for extremely noisy tracing (including assembly-load probing).
-                        // Never forward those to the client (they should go to logs instead).
-                        if (type > 4 ||
-                            (message != null && message.Contains("not found in this load context", StringComparison.OrdinalIgnoreCase)))
-                        {
-                            if (message != null)
-                            {
-                                _logger.LogTrace("[Roslyn] {Message}", message);
-                            }
-                            break;
-                        }
-
-                        if (message != null)
-                        {
-                            _logger.LogDebug("[Roslyn] {Message}", message);
-                        }
-
-                        var clampedType = Math.Clamp(type, 1, 4);
-                        if (clampedType != type)
-                        {
-                            var forwardedParams = JsonSerializer.SerializeToElement(new { type = clampedType, message });
-                            await ForwardNotificationToClientAsync(item.Method, forwardedParams);
-                        }
-                        else
-                        {
-                            await ForwardNotificationToClientAsync(item.Method, item.Params);
-                        }
-                    }
-                    else
-                    {
-                        await ForwardNotificationToClientAsync(item.Method, item.Params);
-                    }
-                    break;
-
-
-                case "window/showMessage":
-                    // Forward window messages to client
-                    await ForwardNotificationToClientAsync(item.Method, item.Params);
-                    break;
-
-                case LspMethods.Progress:
-                    var progressToken = TryGetProgressToken(item.Params);
-                    var progressKind = TryGetProgressKind(item.Params);
-                    _logger.LogDebug("Forwarding progress to client: token={Token}, kind={Kind}",
-                        progressToken ?? "<none>",
-                        progressKind ?? "<none>");
-                    // Forward progress notifications to client for status bar spinners
-                    await ForwardNotificationToClientAsync(item.Method, item.Params);
-                    break;
-
-                default:
-                    _logger.LogDebug("Unhandled Roslyn notification: {Method}", item.Method);
-                    break;
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error handling Roslyn notification: {Method}", item.Method);
-        }
+        _logger.LogInformation("Roslyn project initialization complete - server ready");
+        _roslynProjectInitialized.TrySetResult();
+        await EndWorkspaceInitializationProgressAsync();
+        await FlushPendingOpensAsync();
     }
 
     private void OnRoslynNotification(object? sender, RoslynNotificationEventArgs e)
@@ -2546,24 +2569,12 @@ public partial class RazorLanguageServer : IAsyncDisposable
             _logger.LogDebug("Received notification from Roslyn: {Method}", e.Method);
         }
 
-        var item = new NotificationWorkItem(e.Method, e.Params);
-        if (IsHighPriorityRoslynNotification(e.Method))
+        var item = new RoslynNotificationWorkItem(e.Method, e.Params);
+        _notificationPump.Enqueue(item, method =>
         {
-            if (!_priorityNotificationChannel.Writer.TryWrite(item))
-            {
-                // Writer should only fail during shutdown. Best-effort handling avoids losing
-                // initialization completion/diagnostics if cancellation races channel completion.
-                _ = HandleRoslynNotificationAsync(item, _notificationCts.Token);
-            }
-
-            return;
-        }
-
-        if (!_notificationChannel.Writer.TryWrite(item))
-        {
-            RecordDroppedRoslynNotification(e.Method);
-            _logger.LogDebug("Dropping Roslyn notification due to backpressure: {Method}", e.Method);
-        }
+            RecordDroppedRoslynNotification(method);
+            _logger.LogDebug("Dropping Roslyn notification due to backpressure: {Method}", method);
+        });
     }
 
     private static bool IsHighPriorityRoslynNotification(string method)
@@ -2574,13 +2585,22 @@ public partial class RazorLanguageServer : IAsyncDisposable
 
     private void RecordDroppedRoslynNotification(string method)
     {
-        var count = Interlocked.Increment(ref _droppedRoslynNotifications);
+        var snapshot = _notificationBackpressure.RecordDropped(method);
         TryLogTelemetryWarning(
-            count,
+            snapshot.TotalDropped,
             DroppedNotificationsWarnEvery,
             ref _nextDroppedNotificationWarnAt,
-            "Dropped {Count} Roslyn notifications due to backpressure. Latest method: {Method}",
-            method);
+            warningCount => _logger.LogWarning(
+                "Dropped {Count} Roslyn notifications due to backpressure. Latest method: {Method}, " +
+                "methodDropCount={MethodDropCount}, queueDepth={QueueDepth}, queuePeak={QueuePeak}, " +
+                "priorityQueueDepth={PriorityQueueDepth}, priorityQueuePeak={PriorityQueuePeak}",
+                warningCount,
+                method,
+                snapshot.MethodDropped,
+                snapshot.Queue.NotificationDepth,
+                snapshot.Queue.NotificationPeak,
+                snapshot.Queue.PriorityDepth,
+                snapshot.Queue.PriorityPeak));
     }
 
     private void RecordRoslynRequestTimeout(string method)
@@ -2590,16 +2610,17 @@ public partial class RazorLanguageServer : IAsyncDisposable
             count,
             RoslynTimeoutsWarnEvery,
             ref _nextRoslynTimeoutWarnAt,
-            "Roslyn request timeouts reached {Count}. Latest method: {Method}",
-            method);
+            warningCount => _logger.LogWarning(
+                "Roslyn request timeouts reached {Count}. Latest method: {Method}",
+                warningCount,
+                method));
     }
 
     private void TryLogTelemetryWarning(
         long count,
         long warnEvery,
         ref long nextWarnAt,
-        string message,
-        string method)
+        Action<long> logWarning)
     {
         if (count < Volatile.Read(ref nextWarnAt))
         {
@@ -2620,49 +2641,15 @@ public partial class RazorLanguageServer : IAsyncDisposable
             }
 
             _lastTelemetryWarnUtc = now;
-            _logger.LogWarning(message, count, method);
+            logWarning(count);
             nextWarnAt = count + warnEvery;
         }
     }
 
-    private async Task<JsonElement?> OnRoslynRequestAsync(string method, JsonElement? @params, long requestId, CancellationToken ct)
+    private Task<JsonElement?> OnRoslynRequestAsync(string method, JsonElement? @params, long requestId, CancellationToken ct)
     {
-        _logger.LogDebug("Roslyn reverse request: {Method}", method);
-
-        try
-        {
-            // Handle progress creation requests - forward to editor for status bar spinners
-            if (method == LspMethods.WindowWorkDoneProgressCreate)
-            {
-                var token = TryGetProgressToken(@params);
-                _logger.LogDebug("Forwarding workDoneProgress/create to client: token={Token}", token ?? "<none>");
-                return await ForwardRequestToClientAsync(method, @params, ct);
-            }
-
-            // Handle razor/updateHtml - sync HTML projection to HTML LS
-            if (method == LspMethods.RazorUpdateHtml && @params.HasValue)
-            {
-                await HandleRazorUpdateHtmlAsync(@params.Value);
-                return JsonSerializer.SerializeToElement(new { }, JsonOptions);
-            }
-
-            // Handle HTML formatting requests from Roslyn's Razor extension
-            if (method == LspMethods.TextDocumentFormatting && @params.HasValue)
-            {
-                return await HandleHtmlFormattingRequestAsync(@params.Value, ct);
-            }
-
-            if (method == LspMethods.TextDocumentRangeFormatting && @params.HasValue)
-            {
-                return await HandleHtmlRangeFormattingRequestAsync(@params.Value, ct);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error handling Roslyn reverse request: {Method}", method);
-        }
-
-        return null;
+        _ = requestId;
+        return _requestDispatcher.HandleAsync(method, @params, ct);
     }
 
     private async Task HandleRazorUpdateHtmlAsync(JsonElement @params)
@@ -3455,275 +3442,37 @@ public partial class RazorLanguageServer : IAsyncDisposable
         }
 
         _workspaceOpenedAt = DateTime.UtcNow;
-        var rootPath = TryGetLocalPath(rootUriOrPath);
-        if (rootPath == null)
-        {
-            _logger.LogWarning("Invalid workspace root: {Root}", rootUriOrPath);
-            return;
-        }
-
-        if (File.Exists(rootPath))
-        {
-            var extension = Path.GetExtension(rootPath);
-            if (extension.Equals(".sln", StringComparison.OrdinalIgnoreCase) ||
-                extension.Equals(SolutionFilterFileName, StringComparison.OrdinalIgnoreCase) ||
-                extension.Equals(SolutionXmlFileName, StringComparison.OrdinalIgnoreCase))
-            {
-                _logger.LogInformation("Opening solution: {Solution}", rootPath);
-                await SendRoslynNotificationAsync(LspMethods.SolutionOpen, new SolutionOpenParams
-                {
-                    Solution = new Uri(rootPath).AbsoluteUri
-                });
-            }
-            else if (extension.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
-            {
-                _logger.LogInformation("Opening project: {Project}", rootPath);
-                await SendRoslynNotificationAsync(LspMethods.ProjectOpen, new ProjectOpenParams
-                {
-                    Projects = [new Uri(rootPath).AbsoluteUri]
-                });
-            }
-            else
-            {
-                _logger.LogWarning("Workspace path is a file but not a supported project/solution: {Path}", rootPath);
-            }
-            return;
-        }
-
-        if (!Directory.Exists(rootPath))
-        {
-            _logger.LogWarning("Workspace root does not exist: {Path}", rootPath);
-            return;
-        }
-
-        var solution = _workspaceManager.FindSolution(rootPath);
-
-        if (solution != null)
-        {
-            _logger.LogInformation("Opening solution: {Solution}", solution);
-            await SendRoslynNotificationAsync(LspMethods.SolutionOpen, new SolutionOpenParams
-            {
-                Solution = new Uri(solution).AbsoluteUri
-            });
-        }
-        else
-        {
-            // No solution file found - open projects directly
-            var projects = _workspaceManager.FindProjects(rootPath);
-            if (projects.Length > 0)
-            {
-                _logger.LogInformation("Opening {Count} projects directly", projects.Length);
-                await SendRoslynNotificationAsync(LspMethods.ProjectOpen, new ProjectOpenParams
-                {
-                    Projects = projects.Select(p => new Uri(p).AbsoluteUri).ToArray()
-                });
-            }
-        }
+        await _workspaceOpenCoordinator.OpenWorkspaceAsync(rootUriOrPath);
     }
 
     private async Task TryRegisterFileWatchersAsync()
     {
-        if (_fileWatchersRegistered)
-        {
-            return;
-        }
-
-        var didChangeWatchedFiles = _initParams?.Capabilities?.Workspace?.DidChangeWatchedFiles;
-        if (didChangeWatchedFiles?.DynamicRegistration != true)
-        {
-            _logger.LogDebug("Client does not support dynamic didChangeWatchedFiles registration; skipping registration");
-            return;
-        }
-
-        var baseUri = TryGetWorkspaceBaseUri();
-        if (baseUri == null)
-        {
-            _logger.LogInformation("Workspace baseUri not available; file watchers will not be scoped to a workspace root.");
-        }
-
-        if (_clientRpc == null)
-        {
-            return;
-        }
-
-        var registrations = new[]
-        {
-            new
-            {
-                id = FileWatchRegistrationId,
-                method = LspMethods.WorkspaceDidChangeWatchedFiles,
-                registerOptions = new
-                {
-                    watchers = CreateFileWatchers(baseUri)
-                }
-            }
-        };
-
-        try
-        {
-            await _clientRpc.InvokeWithParameterObjectAsync<JsonElement?>(
-                "client/registerCapability",
-                new { registrations },
-                CancellationToken.None);
-            _fileWatchersRegistered = true;
-            _logger.LogInformation("Registered workspace/didChangeWatchedFiles with client");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to register workspace/didChangeWatchedFiles with client");
-        }
+        IClientCapabilityRegistrar? registrar = _clientRpc == null
+            ? null
+            : new JsonRpcClientCapabilityRegistrar(_clientRpc, "client/registerCapability");
+        _fileWatchersRegistered = await _fileWatcherRegistrationService.TryRegisterAsync(
+            _fileWatchersRegistered,
+            _initParams,
+            registrar,
+            CancellationToken.None);
     }
 
     private static object[] CreateFileWatchers(string? baseUri)
-    {
-        var watchers = new List<object>();
-        foreach (var extension in WorkspaceReloadExtensions)
-        {
-            watchers.Add(CreateWatcher($"**/*{extension}", baseUri));
-        }
-        foreach (var fileName in WorkspaceReloadFileNames)
-        {
-            watchers.Add(CreateWatcher($"**/{fileName}", baseUri));
-        }
-
-        watchers.Add(CreateWatcher($"**/{OmniSharpConfigFileName}", baseUri));
-        watchers.Add(CreateWatcher("**/*.razor", baseUri));
-        watchers.Add(CreateWatcher("**/*.cshtml", baseUri));
-        watchers.Add(CreateWatcher("**/*.razor.cs", baseUri));
-        watchers.Add(CreateWatcher("**/*.cs", baseUri));
-        watchers.Add(CreateWatcher("**/*.csproj.user", baseUri));
-        watchers.Add(CreateWatcher("**/.editorconfig", baseUri));
-        watchers.Add(CreateWatcher("**/obj/**/generated/**", baseUri));
-        return watchers.ToArray();
-    }
-
-    private static object CreateWatcher(string pattern, string? baseUri)
-    {
-        if (!string.IsNullOrEmpty(baseUri))
-        {
-            return new
-            {
-                globPattern = new
-                {
-                    baseUri,
-                    pattern
-                },
-                kind = FileWatchKindAll
-            };
-        }
-
-        return new
-        {
-            globPattern = pattern,
-            kind = FileWatchKindAll
-        };
-    }
+        => FileWatcherPatternBuilder.CreateFileWatchers(
+            baseUri,
+            WorkspaceReloadExtensions,
+            WorkspaceReloadFileNames,
+            OmniSharpConfigFileName,
+            FileWatchKindAll);
 
     private void ScheduleWorkspaceReload()
-    {
-        var target = GetWorkspaceOpenTarget();
-        if (target == null || !CanSendRoslynNotifications)
-        {
-            return;
-        }
-
-        CancellationTokenSource cts;
-        lock (_workspaceReloadLock)
-        {
-            _workspaceReloadCts?.Cancel();
-            _workspaceReloadCts?.Dispose();
-            _workspaceReloadCts = new CancellationTokenSource();
-            cts = _workspaceReloadCts;
-        }
-
-        _workspaceReloadTask = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(WorkspaceReloadDebounceMs, cts.Token);
-                if (cts.IsCancellationRequested)
-                {
-                    return;
-                }
-
-                _logger.LogInformation("Workspace files changed; re-opening workspace");
-                await OpenWorkspaceAsync(target);
-            }
-            catch (OperationCanceledException)
-            {
-                // Debounced by a newer change
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to re-open workspace after file changes");
-            }
-        }, cts.Token);
-    }
+        => _workspaceReloadScheduler.Schedule();
 
     private string? GetWorkspaceOpenTarget()
-    {
-        if (!string.IsNullOrEmpty(_workspaceOpenTarget))
-        {
-            return _workspaceOpenTarget;
-        }
-
-        if (!string.IsNullOrEmpty(_cliSolutionPath))
-        {
-            return _cliSolutionPath;
-        }
-
-        if (_initParams?.RootUri != null)
-        {
-            return _initParams.RootUri;
-        }
-
-        if (_initParams?.WorkspaceFolders?.Length > 0)
-        {
-            return _initParams.WorkspaceFolders[0].Uri;
-        }
-
-        return _workspaceRoot;
-    }
+        => _workspaceTargetResolver.GetWorkspaceOpenTarget(_workspaceOpenTarget, _cliSolutionPath, _initParams, _workspaceRoot);
 
     private string? TryGetWorkspaceBaseUri()
-    {
-        var rootPath = _workspaceRoot;
-        if (string.IsNullOrWhiteSpace(rootPath))
-        {
-            var target = GetWorkspaceOpenTarget();
-            rootPath = target != null ? TryGetLocalPath(target) : null;
-        }
-
-        if (string.IsNullOrWhiteSpace(rootPath))
-        {
-            return null;
-        }
-
-        if (File.Exists(rootPath))
-        {
-            rootPath = Path.GetDirectoryName(rootPath);
-        }
-
-        if (string.IsNullOrWhiteSpace(rootPath))
-        {
-            return null;
-        }
-
-        var fullPath = TryGetFullPath(rootPath);
-        if (fullPath == null)
-        {
-            return null;
-        }
-
-        try
-        {
-            return new Uri(fullPath).AbsoluteUri;
-        }
-        catch
-        {
-            return null;
-        }
-    }
+        => _workspaceTargetResolver.TryGetWorkspaceBaseUri(_workspaceRoot, _workspaceOpenTarget, _cliSolutionPath, _initParams);
 
     private void ConfigureUriComparers(string? probePath)
     {
@@ -3731,9 +3480,11 @@ public partial class RazorLanguageServer : IAsyncDisposable
         _uriComparer = isCaseInsensitive ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
         _uriComparison = isCaseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         _openDocuments = new HashSet<string>(_uriComparer);
+        _replayingOpenDocuments = new HashSet<string>(_uriComparer);
         _pendingOpens = new Dictionary<string, PendingOpenState>(_uriComparer);
         _pendingChanges = new Dictionary<string, List<JsonElement>>(_uriComparer);
         _sourceGeneratedUriCache = new Dictionary<string, string>(_uriComparer);
+        _sourceGeneratedPathValidationUtc = new Dictionary<string, DateTime>(_uriComparer);
     }
 
     private string? GetWorkspaceProbePath(InitializeParams? initParams)
@@ -3815,22 +3566,8 @@ public partial class RazorLanguageServer : IAsyncDisposable
         return false;
     }
 
-    private static string? TryGetGlobalOmniSharpConfigPath()
-    {
-        var omniSharpHome = Environment.GetEnvironmentVariable("OMNISHARPHOME");
-        if (!string.IsNullOrEmpty(omniSharpHome))
-        {
-            return TryGetFullPath(Path.Combine(omniSharpHome, OmniSharpConfigFileName));
-        }
-
-        var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (!string.IsNullOrEmpty(homeDir))
-        {
-            return TryGetFullPath(Path.Combine(homeDir, ".omnisharp", OmniSharpConfigFileName));
-        }
-
-        return null;
-    }
+    private string? TryGetGlobalOmniSharpConfigPath()
+        => _omniSharpConfigPathResolver.TryGetGlobalConfigPath();
 
     private static string? TryGetFullPath(string path)
     {
@@ -3845,42 +3582,10 @@ public partial class RazorLanguageServer : IAsyncDisposable
     }
 
     private bool IsOmniSharpConfigPath(string path, string? localPath, string? globalPath)
-    {
-        if (localPath != null && path.Equals(localPath, _uriComparison))
-        {
-            return true;
-        }
-
-        if (globalPath != null && path.Equals(globalPath, _uriComparison))
-        {
-            return true;
-        }
-
-        return false;
-    }
+        => OmniSharpConfigPathResolver.IsConfigPath(path, localPath, globalPath, _uriComparison);
 
     private static bool IsWorkspaceReloadTriggerPath(string path)
-    {
-        var extension = Path.GetExtension(path);
-        foreach (var reloadExtension in WorkspaceReloadExtensions)
-        {
-            if (extension.Equals(reloadExtension, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-
-        var fileName = Path.GetFileName(path);
-        foreach (var reloadFileName in WorkspaceReloadFileNames)
-        {
-            if (fileName.Equals(reloadFileName, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+        => WorkspaceReloadTriggerMatcher.IsWorkspaceReloadTriggerPath(path, WorkspaceReloadExtensions, WorkspaceReloadFileNames);
 
     private object CreateRoslynInitParams(InitializeParams? clientParams)
     {
@@ -4199,48 +3904,10 @@ public partial class RazorLanguageServer : IAsyncDisposable
         _lifetimeCts.Cancel();
         _lifetimeCts.Dispose();
 
-        lock (_workspaceReloadLock)
-        {
-            _workspaceReloadCts?.Cancel();
-            _workspaceReloadCts?.Dispose();
-            _workspaceReloadCts = null;
-        }
-
-        if (_workspaceReloadTask != null)
-        {
-            try
-            {
-                await _workspaceReloadTask.WaitAsync(TimeSpan.FromSeconds(1));
-            }
-            catch
-            {
-                // Ignore shutdown errors
-            }
-        }
+        await _workspaceReloadScheduler.DisposeAsync();
 
         _clientRpc?.Dispose();
-
-        _priorityNotificationChannel.Writer.TryComplete();
-        _notificationChannel.Writer.TryComplete();
-        _notificationCts.Cancel();
-        try
-        {
-            await _priorityNotificationTask.WaitAsync(TimeSpan.FromSeconds(1));
-        }
-        catch
-        {
-            // Ignore shutdown errors
-        }
-
-        try
-        {
-            await _notificationTask.WaitAsync(TimeSpan.FromSeconds(1));
-        }
-        catch
-        {
-            // Ignore shutdown errors
-        }
-        _notificationCts.Dispose();
+        await _notificationPump.DisposeAsync();
 
         LogTelemetrySummary();
     }
@@ -4252,12 +3919,23 @@ public partial class RazorLanguageServer : IAsyncDisposable
             return;
         }
 
+        var queueSnapshot = _notificationBackpressure.GetQueueSnapshot();
+        var droppedByMethodSummary = _notificationBackpressure.GetDroppedMethodsSummary(maxEntries: 5);
+
         _logger.LogDebug(
             "Telemetry: droppedRoslynNotifications={DroppedNotifications}, roslynRequestTimeouts={RequestTimeouts}, " +
+            "notificationQueueDepth={NotificationQueueDepth}, notificationQueuePeak={NotificationQueuePeak}, " +
+            "priorityNotificationQueueDepth={PriorityNotificationQueueDepth}, priorityNotificationQueuePeak={PriorityNotificationQueuePeak}, " +
+            "droppedRoslynByMethod={DroppedByMethod}, " +
             "sourceGeneratedCacheHits={CacheHits}, sourceGeneratedCacheMisses={CacheMisses}, " +
             "sourceGeneratedIndexRefreshes={IndexRefreshes}, sourceGeneratedIndexIncrementalUpdates={IncrementalUpdates}",
-            Interlocked.Read(ref _droppedRoslynNotifications),
+            _notificationBackpressure.DroppedTotal,
             Interlocked.Read(ref _roslynRequestTimeouts),
+            queueSnapshot.NotificationDepth,
+            queueSnapshot.NotificationPeak,
+            queueSnapshot.PriorityDepth,
+            queueSnapshot.PriorityPeak,
+            droppedByMethodSummary,
             Interlocked.Read(ref _sourceGeneratedCacheHits),
             Interlocked.Read(ref _sourceGeneratedCacheMisses),
             Interlocked.Read(ref _sourceGeneratedIndexRefreshes),

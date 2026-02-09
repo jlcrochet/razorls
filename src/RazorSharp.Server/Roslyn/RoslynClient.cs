@@ -535,7 +535,7 @@ public class RoslynClient : IAsyncDisposable
         await _sendLock.WaitAsync();
         try
         {
-            // Serialize JSON to pooled buffer, then build complete message (header + body) for a single write
+            // Serialize JSON to pooled buffer.
             _sendBufferWriter.Reset();
             using (var writer = new Utf8JsonWriter(_sendBufferWriter))
             {
@@ -553,19 +553,9 @@ public class RoslynClient : IAsyncDisposable
             try
             {
                 var stream = process.StandardInput.BaseStream;
-                // Single write: copy header + body into a contiguous buffer
-                var totalLength = headerLength + contentLength;
-                var combined = System.Buffers.ArrayPool<byte>.Shared.Rent(totalLength);
-                try
-                {
-                    _headerBuffer.AsSpan(0, headerLength).CopyTo(combined);
-                    _sendBufferWriter.WrittenSpan.CopyTo(combined.AsSpan(headerLength));
-                    await stream.WriteAsync(combined.AsMemory(0, totalLength));
-                }
-                finally
-                {
-                    System.Buffers.ArrayPool<byte>.Shared.Return(combined);
-                }
+                // Two writes under _sendLock avoid interleaving while eliminating an extra rent+copy.
+                await stream.WriteAsync(_headerBuffer.AsMemory(0, headerLength));
+                await stream.WriteAsync(_sendBufferWriter.WrittenMemory);
             }
             catch (ObjectDisposedException ex)
             {

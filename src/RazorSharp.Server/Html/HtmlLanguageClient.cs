@@ -27,6 +27,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     bool _restartAttempted;
     string? _rootUri;
     Func<object, Task>? _didOpenOverrideForTests;
+    string? _htmlServerPathOverrideForTests;
     StringComparer _uriComparer = StringComparer.Ordinal;
 
     // Track HTML projections by checksum (Roslyn uses checksums to identify HTML versions)
@@ -140,7 +141,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     private async Task<bool> StartAsync(CancellationToken cancellationToken)
     {
         // Find vscode-html-language-server
-        var serverPath = FindHtmlLanguageServer();
+        var serverPath = _htmlServerPathOverrideForTests ?? FindHtmlLanguageServer();
         if (serverPath == null)
         {
             DisableHtmlServer("HTML language server not found. Install with: npm/pnpm/yarn global vscode-langservers-extracted.");
@@ -191,14 +192,17 @@ public class HtmlLanguageClient : IAsyncDisposable
         _processCts?.Dispose();
         _processCts = new CancellationTokenSource();
 
+        var process = _process;
+        var stderrToken = _processCts.Token;
+
         // Capture stderr (track task for cleanup)
         _stderrTask = Task.Run(async () =>
         {
             try
             {
-                while (_process != null && !_process.HasExited)
+                while (!process.HasExited)
                 {
-                    var line = await _process.StandardError.ReadLineAsync(_processCts.Token);
+                    var line = await process.StandardError.ReadLineAsync(stderrToken);
                     if (line != null)
                     {
                         _logger.LogDebug("[HTML LS stderr] {Line}", line);
@@ -207,7 +211,7 @@ public class HtmlLanguageClient : IAsyncDisposable
             }
             catch (OperationCanceledException) { }
             catch (ObjectDisposedException) { }
-        }, _processCts.Token);
+        }, stderrToken);
 
         var formatter = new SystemTextJsonFormatter
         {
@@ -610,6 +614,18 @@ public class HtmlLanguageClient : IAsyncDisposable
     {
         return OpenCachedProjectionsAsync(cancellationToken);
     }
+
+    internal Task<bool> StartForTestsAsync(CancellationToken cancellationToken = default)
+    {
+        return StartAsync(cancellationToken);
+    }
+
+    internal void SetHtmlServerPathOverrideForTests(string? path)
+    {
+        _htmlServerPathOverrideForTests = path;
+    }
+
+    internal Task? GetStderrTaskForTests() => _stderrTask;
 
     internal void TriggerHtmlServerExitForTests()
     {

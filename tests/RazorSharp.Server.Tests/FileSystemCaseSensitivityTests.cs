@@ -47,6 +47,61 @@ public class FileSystemCaseSensitivityTests
         }
     }
 
+    [Fact]
+    public void IsCaseInsensitiveForPath_ReadOnlyDirectory_UsesConservativeFallbackOnUnix()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        if (string.Equals(Environment.UserName, "root", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var root = CreateTempDir();
+        var modeChanged = false;
+
+        try
+        {
+            try
+            {
+                File.SetUnixFileMode(root, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+                modeChanged = true;
+            }
+            catch (PlatformNotSupportedException)
+            {
+                return;
+            }
+            catch (NotSupportedException)
+            {
+                return;
+            }
+
+            var result = FileSystemCaseSensitivity.IsCaseInsensitiveForPath(root);
+            Assert.False(result);
+        }
+        finally
+        {
+            if (modeChanged)
+            {
+                try
+                {
+                    File.SetUnixFileMode(
+                        root,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                        UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
+                }
+                catch
+                {
+                }
+            }
+
+            DeleteTempDir(root);
+        }
+    }
+
     private static void TryDelete(string path)
     {
         try

@@ -50,6 +50,7 @@ public partial class RazorLanguageServer
         }
 
         var fileExists = File.Exists(path);
+        var now = DateTime.UtcNow;
         lock (_sourceGeneratedCacheLock)
         {
             if (changeType == FileChangeType.Deleted || !fileExists)
@@ -69,10 +70,14 @@ public partial class RazorLanguageServer
                         _sourceGeneratedIndex.Remove(key);
                     }
                 }
+
+                _sourceGeneratedPathValidationUtc.Remove(path);
+                RemoveSourceGeneratedUriCacheEntriesForPathUnderLock(path);
             }
             else
             {
                 AddOrUpdateSourceGeneratedEntry(_sourceGeneratedIndex, key, path, isDebug);
+                _sourceGeneratedPathValidationUtc[path] = now;
             }
 
             if (_sourceGeneratedIndexState == SourceGeneratedIndexState.Uninitialized)
@@ -298,17 +303,29 @@ public partial class RazorLanguageServer
             return false;
         }
 
+        var now = DateTime.UtcNow;
+        string? cachedPath = null;
         lock (_sourceGeneratedCacheLock)
         {
-            if (_sourceGeneratedUriCache.TryGetValue(uri, out var cachedPath))
+            _sourceGeneratedUriCache.TryGetValue(uri, out cachedPath);
+        }
+
+        if (!string.IsNullOrEmpty(cachedPath))
+        {
+            if (TryValidateSourceGeneratedPath(cachedPath, now))
             {
-                if (File.Exists(cachedPath))
+                Interlocked.Increment(ref _sourceGeneratedCacheHits);
+                filePath = cachedPath;
+                return true;
+            }
+
+            lock (_sourceGeneratedCacheLock)
+            {
+                if (_sourceGeneratedUriCache.TryGetValue(uri, out var currentPath) &&
+                    currentPath.Equals(cachedPath, _uriComparison))
                 {
-                    Interlocked.Increment(ref _sourceGeneratedCacheHits);
-                    filePath = cachedPath;
-                    return true;
+                    _sourceGeneratedUriCache.Remove(uri);
                 }
-                _sourceGeneratedUriCache.Remove(uri);
             }
         }
 
@@ -440,44 +457,52 @@ public partial class RazorLanguageServer
     private bool TryGetSourceGeneratedPath(string key, string? projectId, out string filePath)
     {
         filePath = "";
-        var now = DateTime.UtcNow;
         var shouldRefresh = false;
-        var refreshAfterReturn = false;
-        var found = false;
-        SourceGeneratedEntry selected = default;
-        List<SourceGeneratedEntry>? entries = null;
 
-        lock (_sourceGeneratedCacheLock)
+        while (true)
         {
-            shouldRefresh = _sourceGeneratedIndexState == SourceGeneratedIndexState.Uninitialized ||
-                            (_sourceGeneratedIndexState == SourceGeneratedIndexState.FullScan &&
-                             (now - _sourceGeneratedIndexLastFullScan) > SourceGeneratedIndexRefreshInterval);
+            var now = DateTime.UtcNow;
+            var found = false;
+            SourceGeneratedEntry selected = default;
 
-            if (_sourceGeneratedIndex.TryGetValue(key, out entries))
+            lock (_sourceGeneratedCacheLock)
             {
-                if (TrySelectSourceGeneratedEntry(key, entries, projectId, out selected))
-                {
-                    found = true;
-                    refreshAfterReturn = shouldRefresh;
-                }
+                shouldRefresh |= _sourceGeneratedIndexState == SourceGeneratedIndexState.Uninitialized ||
+                                 (_sourceGeneratedIndexState == SourceGeneratedIndexState.FullScan &&
+                                  (now - _sourceGeneratedIndexLastFullScan) > SourceGeneratedIndexRefreshInterval);
 
-                if (!found && !AnyEntryExists(entries))
+                if (_sourceGeneratedIndex.TryGetValue(key, out var entries))
                 {
-                    _sourceGeneratedIndex.Remove(key);
-                    shouldRefresh = true;
+                    found = TrySelectSourceGeneratedEntry(key, entries, projectId, out selected);
                 }
             }
+
+            if (!found)
+            {
+                break;
+            }
+
+            if (TryValidateSourceGeneratedPath(selected.Path, now))
+            {
+                filePath = selected.Path;
+                if (shouldRefresh)
+                {
+                    RefreshSourceGeneratedIndex();
+                }
+                return true;
+            }
+
+            lock (_sourceGeneratedCacheLock)
+            {
+                RemoveSourceGeneratedEntryUnderLock(key, selected.Path);
+                RemoveSourceGeneratedUriCacheEntriesForPathUnderLock(selected.Path);
+            }
+            shouldRefresh = true;
         }
 
-        if (shouldRefresh || refreshAfterReturn)
+        if (shouldRefresh)
         {
             RefreshSourceGeneratedIndex();
-        }
-
-        if (found)
-        {
-            filePath = selected.Path;
-            return true;
         }
 
         return false;
@@ -491,8 +516,8 @@ public partial class RazorLanguageServer
     {
         selected = default;
 
-        var hasExisting = false;
-        var existingCount = 0;
+        var hasAny = false;
+        var totalCount = 0;
         SourceGeneratedEntry bestAny = default;
 
         var hasMatch = false;
@@ -501,16 +526,11 @@ public partial class RazorLanguageServer
 
         foreach (var entry in entries)
         {
-            if (!File.Exists(entry.Path))
-            {
-                continue;
-            }
-
-            existingCount++;
-            if (!hasExisting || IsBetterSourceGeneratedEntry(entry, bestAny))
+            totalCount++;
+            if (!hasAny || IsBetterSourceGeneratedEntry(entry, bestAny))
             {
                 bestAny = entry;
-                hasExisting = true;
+                hasAny = true;
             }
 
             if (!string.IsNullOrEmpty(projectId) && entry.Path.Contains(projectId, _uriComparison))
@@ -524,7 +544,7 @@ public partial class RazorLanguageServer
             }
         }
 
-        if (!hasExisting)
+        if (!hasAny)
         {
             return false;
         }
@@ -537,7 +557,7 @@ public partial class RazorLanguageServer
                 return true;
             }
 
-            if (existingCount == 1)
+            if (totalCount == 1)
             {
                 selected = bestAny;
                 return true;
@@ -552,7 +572,7 @@ public partial class RazorLanguageServer
                 return false;
             }
 
-            if (existingCount > 1)
+            if (totalCount > 1)
             {
                 _logger.LogDebug(
                     "No source-generated candidates matched projectId {ProjectId} for key {Key}; skipping mapping.",
@@ -563,13 +583,13 @@ public partial class RazorLanguageServer
             return false;
         }
 
-        if (existingCount == 1)
+        if (totalCount == 1)
         {
             selected = bestAny;
             return true;
         }
 
-        if (existingCount > 1)
+        if (totalCount > 1)
         {
             _logger.LogDebug(
                 "Multiple source-generated candidates found for key {Key} without project id; skipping mapping.",
@@ -579,17 +599,79 @@ public partial class RazorLanguageServer
         return false;
     }
 
-    private static bool AnyEntryExists(List<SourceGeneratedEntry> entries)
+    private bool TryValidateSourceGeneratedPath(string path, DateTime now)
     {
-        foreach (var entry in entries)
+        lock (_sourceGeneratedCacheLock)
         {
-            if (File.Exists(entry.Path))
+            if (_sourceGeneratedPathValidationUtc.TryGetValue(path, out var lastValidationUtc) &&
+                (now - lastValidationUtc) <= SourceGeneratedPathValidationInterval)
             {
                 return true;
             }
         }
 
-        return false;
+        if (!File.Exists(path))
+        {
+            lock (_sourceGeneratedCacheLock)
+            {
+                _sourceGeneratedPathValidationUtc.Remove(path);
+            }
+            return false;
+        }
+
+        lock (_sourceGeneratedCacheLock)
+        {
+            _sourceGeneratedPathValidationUtc[path] = now;
+        }
+        return true;
+    }
+
+    private void RemoveSourceGeneratedEntryUnderLock(string key, string path)
+    {
+        if (!_sourceGeneratedIndex.TryGetValue(key, out var entries))
+        {
+            return;
+        }
+
+        for (var i = entries.Count - 1; i >= 0; i--)
+        {
+            if (entries[i].Path.Equals(path, _uriComparison))
+            {
+                entries.RemoveAt(i);
+            }
+        }
+
+        if (entries.Count == 0)
+        {
+            _sourceGeneratedIndex.Remove(key);
+        }
+
+        _sourceGeneratedPathValidationUtc.Remove(path);
+    }
+
+    private void RemoveSourceGeneratedUriCacheEntriesForPathUnderLock(string path)
+    {
+        List<string>? staleUris = null;
+        foreach (var kvp in _sourceGeneratedUriCache)
+        {
+            if (!kvp.Value.Equals(path, _uriComparison))
+            {
+                continue;
+            }
+
+            staleUris ??= new List<string>();
+            staleUris.Add(kvp.Key);
+        }
+
+        if (staleUris == null)
+        {
+            return;
+        }
+
+        foreach (var staleUri in staleUris)
+        {
+            _sourceGeneratedUriCache.Remove(staleUri);
+        }
     }
 
     private IEnumerable<string> EnumerateObjDirectories(string rootPath)
@@ -727,6 +809,7 @@ public partial class RazorLanguageServer
                 _sourceGeneratedIndex = newIndex;
                 _sourceGeneratedIndexState = SourceGeneratedIndexState.FullScan;
                 _sourceGeneratedIndexLastFullScan = scanTime;
+                _sourceGeneratedPathValidationUtc = CreateSourceGeneratedPathValidationMap(newIndex, scanTime);
             }
         }
         catch (OperationCanceledException)
@@ -779,6 +862,21 @@ public partial class RazorLanguageServer
         }
 
         index[key] = new List<SourceGeneratedEntry> { candidate };
+    }
+
+    private Dictionary<string, DateTime> CreateSourceGeneratedPathValidationMap(
+        Dictionary<string, List<SourceGeneratedEntry>> index,
+        DateTime validatedAtUtc)
+    {
+        var map = new Dictionary<string, DateTime>(_uriComparer);
+        foreach (var entries in index.Values)
+        {
+            foreach (var entry in entries)
+            {
+                map[entry.Path] = validatedAtUtc;
+            }
+        }
+        return map;
     }
 
     private static bool IsBetterSourceGeneratedEntry(SourceGeneratedEntry candidate, SourceGeneratedEntry existing)

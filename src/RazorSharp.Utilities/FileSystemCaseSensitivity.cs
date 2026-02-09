@@ -23,7 +23,8 @@ public static class FileSystemCaseSensitivity
         }
         catch
         {
-            return OperatingSystem.IsMacOS();
+            // Conservative fallback: when probing fails, assume case-sensitive.
+            return false;
         }
         finally
         {

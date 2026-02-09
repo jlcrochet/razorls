@@ -215,7 +215,8 @@ static void PrintHelp()
 
         The server communicates via Language Server Protocol over stdin/stdout.
 
-        Before first use, you must download dependencies:
+        Dependencies are downloaded automatically in the background on first use.
+        Manual download is optional and can be run ahead of time:
           razorsharp --download-dependencies
         """);
 }

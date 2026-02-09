@@ -54,11 +54,66 @@ public class RazorLanguageServerTelemetryTests
         }
     }
 
-    private static void InvokePrivateMethod(object target, string methodName, string argument)
+    [Fact]
+    public async Task DroppedNotifications_TracksPerMethodCounts()
+    {
+        using var loggerFactory = LoggerFactory.Create(builder => builder.SetMinimumLevel(LogLevel.Warning));
+        using var deps = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), "1.0.0-test");
+        var server = new RazorLanguageServer(loggerFactory, deps);
+
+        try
+        {
+            InvokePrivateMethod(server, "RecordDroppedRoslynNotification", "workspace/didChangeWatchedFiles");
+            InvokePrivateMethod(server, "RecordDroppedRoslynNotification", "workspace/didChangeWatchedFiles");
+            InvokePrivateMethod(server, "RecordDroppedRoslynNotification", "window/logMessage");
+
+            var counts = server.GetDroppedNotificationCountsForTests();
+
+            Assert.Equal(2, counts["workspace/didChangeWatchedFiles"]);
+            Assert.Equal(1, counts["window/logMessage"]);
+        }
+        finally
+        {
+            await server.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task LogTelemetrySummary_IncludesQueueAndMethodBreakdown()
+    {
+        var provider = new TestLoggerProvider();
+        using var loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.SetMinimumLevel(LogLevel.Debug);
+            builder.AddProvider(provider);
+        });
+        using var deps = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), "1.0.0-test");
+        var server = new RazorLanguageServer(loggerFactory, deps);
+
+        try
+        {
+            server.SetNotificationQueueSnapshotForTests(notificationDepth: 3, notificationPeak: 7, priorityDepth: 1, priorityPeak: 2);
+
+            InvokePrivateMethod(server, "RecordDroppedRoslynNotification", "workspace/didChangeWatchedFiles");
+            InvokePrivateMethod(server, "RecordDroppedRoslynNotification", "workspace/didChangeWatchedFiles");
+            InvokePrivateMethod(server, "LogTelemetrySummary");
+
+            Assert.Contains(provider.Entries, entry =>
+                entry.Level == LogLevel.Debug &&
+                entry.Message.Contains("notificationQueuePeak=", StringComparison.Ordinal) &&
+                entry.Message.Contains("droppedRoslynByMethod=workspace/didChangeWatchedFiles:2", StringComparison.Ordinal));
+        }
+        finally
+        {
+            await server.DisposeAsync();
+        }
+    }
+
+    private static void InvokePrivateMethod(object target, string methodName, params object?[] args)
     {
         var method = target.GetType().GetMethod(methodName, BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(method);
-        method!.Invoke(target, new object?[] { argument });
+        method!.Invoke(target, args);
     }
 
     private static void SetPrivateField(object target, string fieldName, object? value)
