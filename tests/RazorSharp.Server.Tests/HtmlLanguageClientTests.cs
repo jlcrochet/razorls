@@ -42,4 +42,33 @@ public class HtmlLanguageClientTests
         Assert.NotNull(projection);
         Assert.Null(projection!.Content);
     }
+
+    [Fact]
+    public void BuildLaunchCommand_UsesNodeForJavaScriptServer()
+    {
+        var (fileName, args) = HtmlLanguageClient.BuildLaunchCommandForTests("/tmp/html-ls.js", isWindows: false);
+
+        Assert.Equal("node", fileName);
+        Assert.Equal(["/tmp/html-ls.js", "--stdio"], args);
+    }
+
+    [Fact]
+    public void BuildLaunchCommand_UsesCmdForWindowsCmdScripts()
+    {
+        var serverPath = @"C:\tools\vscode-html-language-server.cmd";
+        var (fileName, args) = HtmlLanguageClient.BuildLaunchCommandForTests(serverPath, isWindows: true);
+
+        Assert.Equal("cmd.exe", fileName);
+        Assert.Equal(["/d", "/s", "/c", $"\"{serverPath}\" --stdio"], args);
+    }
+
+    [Fact]
+    public void BuildLaunchCommand_UsesExecutableDirectlyForNativeBinary()
+    {
+        var serverPath = "/usr/local/bin/vscode-html-language-server";
+        var (fileName, args) = HtmlLanguageClient.BuildLaunchCommandForTests(serverPath, isWindows: false);
+
+        Assert.Equal(serverPath, fileName);
+        Assert.Equal(["--stdio"], args);
+    }
 }

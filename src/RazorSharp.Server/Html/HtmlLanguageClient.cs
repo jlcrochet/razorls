@@ -27,6 +27,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     bool _restartAttempted;
     string? _rootUri;
     Func<object, Task>? _didOpenOverrideForTests;
+    Func<object, Task>? _didChangeOverrideForTests;
     string? _htmlServerPathOverrideForTests;
     StringComparer _uriComparer = StringComparer.Ordinal;
 
@@ -34,6 +35,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     readonly Dictionary<string, HtmlProjection> _projections = new();
     // Secondary index for O(1) lookup by Razor URI
     Dictionary<string, string> _razorUriToChecksum;
+    readonly HashSet<string> _openedRazorUris;
     // Lock for atomic updates to both projection dictionaries
     readonly Lock _projectionsLock = new();
 
@@ -50,6 +52,7 @@ public class HtmlLanguageClient : IAsyncDisposable
     {
         _logger = logger;
         _razorUriToChecksum = new Dictionary<string, string>(_uriComparer);
+        _openedRazorUris = new HashSet<string>(_uriComparer);
     }
 
     public bool IsRunning => _process != null && !_process.HasExited;
@@ -77,6 +80,7 @@ public class HtmlLanguageClient : IAsyncDisposable
         lock (_projectionsLock)
         {
             _razorUriToChecksum = new Dictionary<string, string>(_uriComparer);
+            _openedRazorUris.Clear();
         }
     }
 
@@ -160,17 +164,14 @@ public class HtmlLanguageClient : IAsyncDisposable
             CreateNoWindow = true
         };
 
-        if (serverPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase))
+        var launch = BuildLaunchCommand(
+            serverPath,
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
+        psi.FileName = launch.FileName;
+        foreach (var arg in launch.Args)
         {
-            psi.FileName = "node";
-            psi.ArgumentList.Add(serverPath);
+            psi.ArgumentList.Add(arg);
         }
-        else
-        {
-            psi.FileName = serverPath;
-        }
-
-        psi.ArgumentList.Add("--stdio");
 
         try
         {
@@ -298,7 +299,8 @@ public class HtmlLanguageClient : IAsyncDisposable
         }
 
         // Store the projection even if HTML LS failed to start
-        if (_rpc == null || !_initialized)
+        var canSendWithoutRpc = _didOpenOverrideForTests != null || _didChangeOverrideForTests != null;
+        if (!_initialized || (_rpc == null && !canSendWithoutRpc))
         {
             lock (_projectionsLock)
             {
@@ -312,6 +314,7 @@ public class HtmlLanguageClient : IAsyncDisposable
 
                 _projections[checksum] = new HtmlProjection(razorUri, checksum, 1, htmlContent);
                 _razorUriToChecksum[razorUri] = checksum;
+                _openedRazorUris.Remove(razorUri);
             }
             return;
         }
@@ -320,6 +323,7 @@ public class HtmlLanguageClient : IAsyncDisposable
 
         // Atomically check and update projections
         HtmlProjection? existingByUri = null;
+        bool openedInCurrentSession;
         int newVersion = 1;
         lock (_projectionsLock)
         {
@@ -327,6 +331,7 @@ public class HtmlLanguageClient : IAsyncDisposable
             {
                 _projections.TryGetValue(existingChecksum, out existingByUri);
             }
+            openedInCurrentSession = _openedRazorUris.Contains(razorUri);
 
             if (existingByUri != null)
             {
@@ -339,11 +344,11 @@ public class HtmlLanguageClient : IAsyncDisposable
             _razorUriToChecksum[razorUri] = checksum;
         }
 
-        if (existingByUri != null)
+        if (existingByUri != null && openedInCurrentSession)
         {
             try
             {
-                await _rpc.NotifyWithParameterObjectAsync("textDocument/didChange", new
+                await SendDidChangeAsync(new
                 {
                     textDocument = new { uri = virtualUri, version = newVersion },
                     contentChanges = new[] { new { text = htmlContent } }
@@ -361,16 +366,20 @@ public class HtmlLanguageClient : IAsyncDisposable
         {
             try
             {
-                await _rpc.NotifyWithParameterObjectAsync("textDocument/didOpen", new
+                await SendDidOpenAsync(new
                 {
                     textDocument = new
                     {
                         uri = virtualUri,
                         languageId = "html",
-                        version = 1,
+                        version = newVersion,
                         text = htmlContent
                     }
                 }).ConfigureAwait(false);
+                lock (_projectionsLock)
+                {
+                    _openedRazorUris.Add(razorUri);
+                }
             }
             catch (Exception ex)
             {
@@ -444,13 +453,10 @@ public class HtmlLanguageClient : IAsyncDisposable
                 }
             };
 
-            if (_didOpenOverrideForTests != null)
+            await SendDidOpenAsync(payload).ConfigureAwait(false);
+            lock (_projectionsLock)
             {
-                await _didOpenOverrideForTests(payload).ConfigureAwait(false);
-            }
-            else
-            {
-                await _rpc!.NotifyWithParameterObjectAsync("textDocument/didOpen", payload).ConfigureAwait(false);
+                _openedRazorUris.Add(projection.RazorUri);
             }
         }
     }
@@ -600,6 +606,11 @@ public class HtmlLanguageClient : IAsyncDisposable
         _didOpenOverrideForTests = overrideFunc;
     }
 
+    internal void SetDidChangeOverrideForTests(Func<object, Task> overrideFunc)
+    {
+        _didChangeOverrideForTests = overrideFunc;
+    }
+
     internal void SetInitializedForTests(bool initialized)
     {
         _initialized = initialized;
@@ -640,9 +651,29 @@ public class HtmlLanguageClient : IAsyncDisposable
 
     internal bool IsStartAttemptedForTests() => _startAttempted;
 
+    internal static (string FileName, string[] Args) BuildLaunchCommandForTests(string serverPath, bool isWindows)
+        => BuildLaunchCommand(serverPath, isWindows);
+
     private static string GetVirtualHtmlUri(string razorUri)
     {
         return string.Concat(razorUri, VirtualHtmlSuffix);
+    }
+
+    private static (string FileName, string[] Args) BuildLaunchCommand(string serverPath, bool isWindows)
+    {
+        if (serverPath.EndsWith(".js", StringComparison.OrdinalIgnoreCase))
+        {
+            return ("node", [serverPath, "--stdio"]);
+        }
+
+        if (isWindows &&
+            (serverPath.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) ||
+             serverPath.EndsWith(".bat", StringComparison.OrdinalIgnoreCase)))
+        {
+            return ("cmd.exe", ["/d", "/s", "/c", $"\"{serverPath}\" --stdio"]);
+        }
+
+        return (serverPath, ["--stdio"]);
     }
 
     /// <summary>
@@ -768,6 +799,10 @@ public class HtmlLanguageClient : IAsyncDisposable
 
         _rpc?.Dispose();
         _rpc = null;
+        lock (_projectionsLock)
+        {
+            _openedRazorUris.Clear();
+        }
 
         if (_process != null)
         {
@@ -821,6 +856,7 @@ public class HtmlLanguageClient : IAsyncDisposable
         {
             _projections.Clear();
             _razorUriToChecksum.Clear();
+            _openedRazorUris.Clear();
         }
     }
 
@@ -914,6 +950,36 @@ public class HtmlLanguageClient : IAsyncDisposable
         _processCts?.Cancel();
         _processCts?.Dispose();
         _processCts = null;
+    }
+
+    private Task SendDidOpenAsync(object payload)
+    {
+        if (_didOpenOverrideForTests != null)
+        {
+            return _didOpenOverrideForTests(payload);
+        }
+
+        if (_rpc == null)
+        {
+            throw new InvalidOperationException("HTML RPC is not available.");
+        }
+
+        return _rpc.NotifyWithParameterObjectAsync("textDocument/didOpen", payload);
+    }
+
+    private Task SendDidChangeAsync(object payload)
+    {
+        if (_didChangeOverrideForTests != null)
+        {
+            return _didChangeOverrideForTests(payload);
+        }
+
+        if (_rpc == null)
+        {
+            throw new InvalidOperationException("HTML RPC is not available.");
+        }
+
+        return _rpc.NotifyWithParameterObjectAsync("textDocument/didChange", payload);
     }
 }
 

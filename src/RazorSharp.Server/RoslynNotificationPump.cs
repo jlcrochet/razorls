@@ -13,7 +13,10 @@ internal sealed class RoslynNotificationPump : IAsyncDisposable
     readonly Func<RoslynNotificationWorkItem, CancellationToken, Task> _handler;
     readonly Func<string, bool> _isHighPriority;
     readonly Channel<RoslynNotificationWorkItem> _priorityChannel;
-    readonly Channel<RoslynNotificationWorkItem> _channel;
+    readonly Lock _regularQueueLock = new();
+    readonly Queue<RoslynNotificationWorkItem> _regularQueue = new();
+    readonly SemaphoreSlim _regularQueueSignal = new(0);
+    readonly int _regularQueueCapacity;
     readonly CancellationTokenSource _cts = new();
     readonly Task _priorityTask;
     readonly Task _task;
@@ -22,25 +25,25 @@ internal sealed class RoslynNotificationPump : IAsyncDisposable
         ILogger logger,
         NotificationBackpressureTracker backpressure,
         Func<RoslynNotificationWorkItem, CancellationToken, Task> handler,
-        Func<string, bool> isHighPriority)
+        Func<string, bool> isHighPriority,
+        int regularQueueCapacity = 1024)
     {
         _logger = logger;
         _backpressure = backpressure;
         _handler = handler;
         _isHighPriority = isHighPriority;
+        if (regularQueueCapacity <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(regularQueueCapacity));
+        }
+        _regularQueueCapacity = regularQueueCapacity;
         _priorityChannel = Channel.CreateUnbounded<RoslynNotificationWorkItem>(new UnboundedChannelOptions
         {
             SingleReader = true,
             SingleWriter = false
         });
-        _channel = Channel.CreateBounded<RoslynNotificationWorkItem>(new BoundedChannelOptions(1024)
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropOldest
-        });
         _priorityTask = Task.Run(() => ProcessAsync(_priorityChannel.Reader, isPriorityQueue: true, _cts.Token));
-        _task = Task.Run(() => ProcessAsync(_channel.Reader, isPriorityQueue: false, _cts.Token));
+        _task = Task.Run(() => ProcessRegularAsync(_cts.Token));
     }
 
     public void Enqueue(RoslynNotificationWorkItem item, Action<string> onDropped)
@@ -59,13 +62,25 @@ internal sealed class RoslynNotificationPump : IAsyncDisposable
             return;
         }
 
-        if (!_channel.Writer.TryWrite(item))
+        RoslynNotificationWorkItem? dropped = null;
+        lock (_regularQueueLock)
         {
-            onDropped(item.Method);
-            return;
+            if (_regularQueue.Count >= _regularQueueCapacity)
+            {
+                dropped = _regularQueue.Dequeue();
+                _backpressure.Dequeue(isPriorityQueue: false);
+            }
+
+            _regularQueue.Enqueue(item);
+            _backpressure.Enqueue(isPriorityQueue: false);
         }
 
-        _backpressure.Enqueue(isPriorityQueue: false);
+        if (dropped.HasValue)
+        {
+            onDropped(dropped.Value.Method);
+        }
+
+        _regularQueueSignal.Release();
     }
 
     private async Task ProcessAsync(ChannelReader<RoslynNotificationWorkItem> reader, bool isPriorityQueue, CancellationToken ct)
@@ -91,10 +106,49 @@ internal sealed class RoslynNotificationPump : IAsyncDisposable
         }
     }
 
+    private async Task ProcessRegularAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (true)
+            {
+                await _regularQueueSignal.WaitAsync(ct);
+
+                while (TryDequeueRegular(out var item))
+                {
+                    _backpressure.Dequeue(isPriorityQueue: false);
+                    await _handler(item, ct);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected during shutdown
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing Roslyn notifications");
+        }
+    }
+
+    private bool TryDequeueRegular(out RoslynNotificationWorkItem item)
+    {
+        lock (_regularQueueLock)
+        {
+            if (_regularQueue.Count == 0)
+            {
+                item = default;
+                return false;
+            }
+
+            item = _regularQueue.Dequeue();
+            return true;
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         _priorityChannel.Writer.TryComplete();
-        _channel.Writer.TryComplete();
         _cts.Cancel();
 
         try
@@ -116,5 +170,6 @@ internal sealed class RoslynNotificationPump : IAsyncDisposable
         }
 
         _cts.Dispose();
+        _regularQueueSignal.Dispose();
     }
 }

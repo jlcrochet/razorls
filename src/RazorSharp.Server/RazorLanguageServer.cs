@@ -2287,6 +2287,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
         {
             // Extract arguments from the command params
             if (!@params.TryGetProperty("arguments", out var arguments) ||
+                arguments.ValueKind != JsonValueKind.Array ||
                 arguments.GetArrayLength() == 0)
             {
                 _logger.LogWarning("fixAllCodeAction: No arguments provided");
@@ -2298,9 +2299,21 @@ public partial class RazorLanguageServer : IAsyncDisposable
             // The argument should contain the code action to resolve with fix all scope
             // We'll take the first FixAllFlavors scope if available
             if (arg.TryGetProperty("FixAllFlavors", out var flavors) &&
+                flavors.ValueKind == JsonValueKind.Array &&
                 flavors.GetArrayLength() > 0)
             {
-                var scope = flavors[0].GetString() ?? "document";
+                var scopeValue = flavors[0];
+                if (scopeValue.ValueKind != JsonValueKind.String)
+                {
+                    _logger.LogWarning("fixAllCodeAction: FixAllFlavors[0] is not a string");
+                    return null;
+                }
+
+                var scope = scopeValue.GetString();
+                if (string.IsNullOrWhiteSpace(scope))
+                {
+                    scope = "document";
+                }
                 _logger.LogDebug("fixAllCodeAction: Using scope {Scope}", scope);
 
                 // Create resolve request with the scope
@@ -2329,6 +2342,11 @@ public partial class RazorLanguageServer : IAsyncDisposable
                         ct);
                     return SuccessResponse;
                 }
+            }
+            else
+            {
+                _logger.LogWarning("fixAllCodeAction: Missing or invalid FixAllFlavors");
+                return null;
             }
 
             _logger.LogWarning("fixAllCodeAction: Could not resolve fix all action");
@@ -2449,7 +2467,7 @@ public partial class RazorLanguageServer : IAsyncDisposable
                             relatedDocuments ??= new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
                             foreach (var property in related.EnumerateObject())
                             {
-                                relatedDocuments[property.Name] = property.Value.Clone();
+                                relatedDocuments[property.Name] = property.Value;
                             }
                         }
                     }

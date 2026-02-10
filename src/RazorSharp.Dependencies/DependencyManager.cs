@@ -52,6 +52,8 @@ public class DependencyManager : IDisposable
     internal Func<CancellationToken, Task<string?>>? GetLatestExtensionVersionOverride;
     internal Func<string, string, string, CancellationToken, Task>? DownloadUpdateOverride;
     internal Func<CancellationToken, Action<string>?, Task<bool>>? EnsureDependenciesOverride;
+    internal Func<string, string, CancellationToken, Action<string>?, Task>? DownloadRoslynLanguageServerOverride;
+    internal Func<string, string, CancellationToken, Action<string>?, Task>? DownloadRazorExtensionOverride;
     string? _pinnedRoslynVersion;
     string? _pinnedExtensionVersion;
 
@@ -121,6 +123,7 @@ public class DependencyManager : IDisposable
     /// <param name="onProgress">Optional callback for progress updates</param>
     public async Task<bool> EnsureDependenciesAsync(CancellationToken cancellationToken = default, Action<string>? onProgress = null)
     {
+        string? stagingRoot = null;
         try
         {
             if (EnsureDependenciesOverride != null)
@@ -175,14 +178,35 @@ public class DependencyManager : IDisposable
             }
 
             // Download Roslyn Language Server (platform-specific)
+            stagingRoot = Path.Combine(_basePath, "staging", $"ensure-{Guid.NewGuid():N}");
+            var stagingRoslynPath = Path.Combine(stagingRoot, "roslyn");
+            var stagingRazorExtensionPath = Path.Combine(stagingRoot, "razorExtension");
+            Directory.CreateDirectory(stagingRoot);
+
             _logger.LogInformation("Downloading Roslyn Language Server (version {Version})...", targetRoslynVersion);
             onProgress?.Invoke($"Downloading Roslyn Language Server ({targetRoslynVersion})...");
-            await DownloadRoslynLanguageServerAsync(targetRoslynVersion, RoslynPath, cancellationToken, onProgress);
+            await DownloadRoslynLanguageServerWithOverrideAsync(
+                targetRoslynVersion,
+                stagingRoslynPath,
+                cancellationToken,
+                onProgress);
 
             // Download Razor extension from VS Code C# extension
             _logger.LogInformation("Downloading Razor extension (version {Version})...", targetExtensionVersion);
             onProgress?.Invoke($"Downloading Razor extension ({targetExtensionVersion})...");
-            await DownloadRazorExtensionAsync(targetExtensionVersion, RazorExtensionPath, cancellationToken, onProgress);
+            await DownloadRazorExtensionWithOverrideAsync(
+                targetExtensionVersion,
+                stagingRazorExtensionPath,
+                cancellationToken,
+                onProgress);
+
+            if (!AreDependenciesCompleteAt(stagingRoslynPath, stagingRazorExtensionPath, logDesignTimeMissing: false))
+            {
+                throw new InvalidOperationException("Staged dependencies are incomplete.");
+            }
+
+            ReplaceDirectory(stagingRoslynPath, RoslynPath);
+            ReplaceDirectory(stagingRazorExtensionPath, RazorExtensionPath);
 
             SaveVersionInfo(expectedVersion, targetRoslynVersion, targetExtensionVersion);
 
@@ -194,10 +218,21 @@ public class DependencyManager : IDisposable
             onProgress?.Invoke("Dependencies downloaded successfully");
             return true;
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to ensure dependencies");
             return false;
+        }
+        finally
+        {
+            if (!string.IsNullOrEmpty(stagingRoot))
+            {
+                TryDeleteDirectory(stagingRoot);
+            }
         }
     }
 
@@ -576,6 +611,34 @@ public class DependencyManager : IDisposable
         {
             throw new InvalidOperationException($"Downloaded update {combinedVersion} is incomplete.");
         }
+    }
+
+    private Task DownloadRoslynLanguageServerWithOverrideAsync(
+        string version,
+        string destinationPath,
+        CancellationToken cancellationToken,
+        Action<string>? onProgress)
+    {
+        if (DownloadRoslynLanguageServerOverride != null)
+        {
+            return DownloadRoslynLanguageServerOverride(version, destinationPath, cancellationToken, onProgress);
+        }
+
+        return DownloadRoslynLanguageServerAsync(version, destinationPath, cancellationToken, onProgress);
+    }
+
+    private Task DownloadRazorExtensionWithOverrideAsync(
+        string version,
+        string destinationPath,
+        CancellationToken cancellationToken,
+        Action<string>? onProgress)
+    {
+        if (DownloadRazorExtensionOverride != null)
+        {
+            return DownloadRazorExtensionOverride(version, destinationPath, cancellationToken, onProgress);
+        }
+
+        return DownloadRazorExtensionAsync(version, destinationPath, cancellationToken, onProgress);
     }
 
     private async Task DownloadRoslynLanguageServerAsync(string version, string destinationPath, CancellationToken cancellationToken, Action<string>? onProgress = null)

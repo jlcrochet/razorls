@@ -297,6 +297,164 @@ public class DependencyManagerUpdateTests
     }
 
     [Fact]
+    public async Task EnsureDependenciesAsync_LeavesInstalledDependenciesUntouched_WhenStagedDownloadIsIncomplete()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var manager = new DependencyManager(CreateLogger(), "1.0.0-test", tempRoot);
+            WriteDependencyPayload(manager.RoslynPath, manager.RazorExtensionPath, "old");
+            WriteVersionInfo(manager.VersionFilePath, pendingVersion: null, version: "1.0.0+1.0.0");
+
+            manager.GetLatestRoslynVersionOverride = _ => Task.FromResult<string?>("2.0.0");
+            manager.GetLatestExtensionVersionOverride = _ => Task.FromResult<string?>("3.0.0");
+            string? stagedRoslynDestination = null;
+            string? stagedRazorDestination = null;
+
+            manager.DownloadRoslynLanguageServerOverride = (_, destinationPath, _, __) =>
+            {
+                stagedRoslynDestination = destinationPath;
+                Directory.CreateDirectory(destinationPath);
+                File.WriteAllText(
+                    Path.Combine(destinationPath, "Microsoft.CodeAnalysis.LanguageServer.dll"),
+                    "roslyn-new");
+                return Task.CompletedTask;
+            };
+
+            manager.DownloadRazorExtensionOverride = (_, destinationPath, _, __) =>
+            {
+                stagedRazorDestination = destinationPath;
+                Directory.CreateDirectory(destinationPath);
+                // Intentionally incomplete (missing Microsoft.VisualStudioCode.RazorExtension.dll).
+                File.WriteAllText(
+                    Path.Combine(destinationPath, "Microsoft.CodeAnalysis.Razor.Compiler.dll"),
+                    "compiler-new");
+                return Task.CompletedTask;
+            };
+
+            var result = await manager.EnsureDependenciesAsync(CancellationToken.None);
+
+            Assert.False(result);
+            Assert.Equal("roslyn-old", File.ReadAllText(Path.Combine(manager.RoslynPath, "Microsoft.CodeAnalysis.LanguageServer.dll")));
+            Assert.Equal("compiler-old", File.ReadAllText(Path.Combine(manager.RazorExtensionPath, "Microsoft.CodeAnalysis.Razor.Compiler.dll")));
+            Assert.Equal("extension-old", File.ReadAllText(Path.Combine(manager.RazorExtensionPath, "Microsoft.VisualStudioCode.RazorExtension.dll")));
+            Assert.Equal("1.0.0+1.0.0", ReadVersionInfo(manager.VersionFilePath).Version);
+
+            Assert.NotNull(stagedRoslynDestination);
+            Assert.NotNull(stagedRazorDestination);
+            AssertPathIsUnderStaging(tempRoot, stagedRoslynDestination!);
+            AssertPathIsUnderStaging(tempRoot, stagedRazorDestination!);
+            Assert.Empty(GetEnsureStagingDirectories(tempRoot));
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
+    public async Task EnsureDependenciesAsync_ReplacesInstalledDependencies_AfterSuccessfulStagedDownload()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var manager = new DependencyManager(CreateLogger(), "1.0.0-test", tempRoot);
+            WriteDependencyPayload(manager.RoslynPath, manager.RazorExtensionPath, "old");
+            WriteVersionInfo(manager.VersionFilePath, pendingVersion: null, version: "1.0.0+1.0.0");
+
+            manager.GetLatestRoslynVersionOverride = _ => Task.FromResult<string?>("2.0.0");
+            manager.GetLatestExtensionVersionOverride = _ => Task.FromResult<string?>("3.0.0");
+            string? stagedRoslynDestination = null;
+            string? stagedRazorDestination = null;
+
+            manager.DownloadRoslynLanguageServerOverride = (_, destinationPath, _, __) =>
+            {
+                stagedRoslynDestination = destinationPath;
+                Directory.CreateDirectory(destinationPath);
+                File.WriteAllText(
+                    Path.Combine(destinationPath, "Microsoft.CodeAnalysis.LanguageServer.dll"),
+                    "roslyn-new");
+                return Task.CompletedTask;
+            };
+
+            manager.DownloadRazorExtensionOverride = (_, destinationPath, _, __) =>
+            {
+                stagedRazorDestination = destinationPath;
+                Directory.CreateDirectory(destinationPath);
+                File.WriteAllText(
+                    Path.Combine(destinationPath, "Microsoft.CodeAnalysis.Razor.Compiler.dll"),
+                    "compiler-new");
+                File.WriteAllText(
+                    Path.Combine(destinationPath, "Microsoft.VisualStudioCode.RazorExtension.dll"),
+                    "extension-new");
+                return Task.CompletedTask;
+            };
+
+            var result = await manager.EnsureDependenciesAsync(CancellationToken.None);
+
+            Assert.True(result);
+            Assert.Equal("roslyn-new", File.ReadAllText(Path.Combine(manager.RoslynPath, "Microsoft.CodeAnalysis.LanguageServer.dll")));
+            Assert.Equal("compiler-new", File.ReadAllText(Path.Combine(manager.RazorExtensionPath, "Microsoft.CodeAnalysis.Razor.Compiler.dll")));
+            Assert.Equal("extension-new", File.ReadAllText(Path.Combine(manager.RazorExtensionPath, "Microsoft.VisualStudioCode.RazorExtension.dll")));
+            Assert.Equal("2.0.0+3.0.0", ReadVersionInfo(manager.VersionFilePath).Version);
+
+            Assert.NotNull(stagedRoslynDestination);
+            Assert.NotNull(stagedRazorDestination);
+            AssertPathIsUnderStaging(tempRoot, stagedRoslynDestination!);
+            AssertPathIsUnderStaging(tempRoot, stagedRazorDestination!);
+            Assert.Empty(GetEnsureStagingDirectories(tempRoot));
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
+    public async Task EnsureDependenciesAsync_ThrowsOperationCanceledException_WhenDownloadIsCanceled()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var manager = new DependencyManager(CreateLogger(), "1.0.0-test", tempRoot);
+            WriteDependencyPayload(manager.RoslynPath, manager.RazorExtensionPath, "old");
+            WriteVersionInfo(manager.VersionFilePath, pendingVersion: null, version: "1.0.0+1.0.0");
+
+            manager.GetLatestRoslynVersionOverride = _ => Task.FromResult<string?>("2.0.0");
+            manager.GetLatestExtensionVersionOverride = _ => Task.FromResult<string?>("3.0.0");
+
+            var razorDownloadCalled = false;
+            using var cts = new CancellationTokenSource();
+
+            manager.DownloadRoslynLanguageServerOverride = (_, _, token, __) =>
+            {
+                cts.Cancel();
+                token.ThrowIfCancellationRequested();
+                return Task.CompletedTask;
+            };
+
+            manager.DownloadRazorExtensionOverride = (_, _, _, __) =>
+            {
+                razorDownloadCalled = true;
+                return Task.CompletedTask;
+            };
+
+            await Assert.ThrowsAsync<OperationCanceledException>(() => manager.EnsureDependenciesAsync(cts.Token));
+
+            Assert.False(razorDownloadCalled);
+            Assert.Equal("roslyn-old", File.ReadAllText(Path.Combine(manager.RoslynPath, "Microsoft.CodeAnalysis.LanguageServer.dll")));
+            Assert.Equal("compiler-old", File.ReadAllText(Path.Combine(manager.RazorExtensionPath, "Microsoft.CodeAnalysis.Razor.Compiler.dll")));
+            Assert.Equal("extension-old", File.ReadAllText(Path.Combine(manager.RazorExtensionPath, "Microsoft.VisualStudioCode.RazorExtension.dll")));
+            Assert.Equal("1.0.0+1.0.0", ReadVersionInfo(manager.VersionFilePath).Version);
+            Assert.Empty(GetEnsureStagingDirectories(tempRoot));
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
     public async Task CheckForUpdatesAsync_RetriesAndSucceeds_WhenTransientFailureOccurs()
     {
         var tempRoot = CreateTempDir();
@@ -385,6 +543,35 @@ public class DependencyManagerUpdateTests
     {
         var loggerFactory = LoggerFactory.Create(builder => { });
         return loggerFactory.CreateLogger<DependencyManager>();
+    }
+
+    static void WriteDependencyPayload(string roslynPath, string razorExtensionPath, string marker)
+    {
+        Directory.CreateDirectory(roslynPath);
+        Directory.CreateDirectory(razorExtensionPath);
+        File.WriteAllText(Path.Combine(roslynPath, "Microsoft.CodeAnalysis.LanguageServer.dll"), $"roslyn-{marker}");
+        File.WriteAllText(Path.Combine(razorExtensionPath, "Microsoft.CodeAnalysis.Razor.Compiler.dll"), $"compiler-{marker}");
+        File.WriteAllText(Path.Combine(razorExtensionPath, "Microsoft.VisualStudioCode.RazorExtension.dll"), $"extension-{marker}");
+    }
+
+    static void AssertPathIsUnderStaging(string tempRoot, string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var stagingRoot = Path.GetFullPath(Path.Combine(tempRoot, "staging") + Path.DirectorySeparatorChar);
+        Assert.True(
+            fullPath.StartsWith(stagingRoot, StringComparison.OrdinalIgnoreCase),
+            $"Expected path '{fullPath}' to be under staging root '{stagingRoot}'.");
+    }
+
+    static string[] GetEnsureStagingDirectories(string tempRoot)
+    {
+        var stagingRoot = Path.Combine(tempRoot, "staging");
+        if (!Directory.Exists(stagingRoot))
+        {
+            return [];
+        }
+
+        return Directory.GetDirectories(stagingRoot, "ensure-*", SearchOption.TopDirectoryOnly);
     }
 
     static string CreateTempDir()

@@ -151,6 +151,86 @@ public class RazorLanguageServerDependencyTests
     }
 
     [Fact]
+    public async Task MissingDependencies_CanceledBackgroundDownload_DoesNotSendFailureNotification()
+    {
+        var tempRoot = CreateTempDir();
+        try
+        {
+            using var loggerFactory = LoggerFactory.Create(builder => { });
+            using var deps = new DependencyManager(loggerFactory.CreateLogger<DependencyManager>(), "test", tempRoot);
+            var server = new RazorLanguageServer(loggerFactory, deps);
+            var disposed = false;
+            try
+            {
+                var messages = new List<string>();
+                var ensureStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                deps.EnsureDependenciesOverride = async (ct, _) =>
+                {
+                    ensureStarted.TrySetResult(true);
+                    await Task.Delay(Timeout.Infinite, ct);
+                    return true;
+                };
+
+                server.SetClientNotificationOverrideForTests((method, @params) =>
+                {
+                    if (method != LspMethods.WindowShowMessage)
+                    {
+                        return Task.CompletedTask;
+                    }
+
+                    var element = @params is JsonElement json
+                        ? json
+                        : JsonSerializer.SerializeToElement(@params);
+
+                    if (element.TryGetProperty("message", out var messageProp) &&
+                        messageProp.ValueKind == JsonValueKind.String)
+                    {
+                        messages.Add(messageProp.GetString() ?? string.Empty);
+                    }
+
+                    return Task.CompletedTask;
+                });
+
+                var initParams = new InitializeParams
+                {
+                    Capabilities = new ClientCapabilities
+                    {
+                        Window = new WindowClientCapabilities
+                        {
+                            ShowMessage = new ShowMessageRequestClientCapabilities()
+                        }
+                    }
+                };
+
+                var initJson = JsonSerializer.SerializeToElement(initParams);
+                await server.HandleInitializeAsync(initJson, CancellationToken.None);
+                server.HandleInitialized();
+
+                var downloadTask = server.GetDependencyDownloadTaskForTests();
+                Assert.NotNull(downloadTask);
+                await AwaitOrTimeout(ensureStarted.Task, 1000, "Dependency ensure did not start.");
+                await server.DisposeAsync();
+                disposed = true;
+                await AwaitOrTimeout(downloadTask!, 2000, "Background dependency download did not complete.");
+
+                Assert.DoesNotContain(messages, message =>
+                    message.Contains("failed to download dependencies", StringComparison.OrdinalIgnoreCase));
+            }
+            finally
+            {
+                if (!disposed)
+                {
+                    await server.DisposeAsync();
+                }
+            }
+        }
+        finally
+        {
+            DeleteTempDir(tempRoot);
+        }
+    }
+
+    [Fact]
     public async Task InitializeAsync_AllowsNonFileRootUri()
     {
         var tempRoot = CreateTempDir();
