@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using RazorSharp.Dependencies;
+using RazorSharp.Protocol;
 using RazorSharp.Server.Configuration;
 using RazorSharp.Server.Utilities;
 
@@ -122,6 +123,7 @@ public class RoslynClient : IAsyncDisposable
                 {
                     kvp.Value.TrySetException(new IOException($"Roslyn process exited with code {exitCode}"));
                 }
+                _pendingRequests.Clear();
 
                 ProcessExited?.Invoke(this, exitCode);
             }
@@ -220,7 +222,12 @@ public class RoslynClient : IAsyncDisposable
         // Check if it's a request or notification from Roslyn
         if (root.TryGetProperty("method", out var methodProp))
         {
-            var method = methodProp.GetString()!;
+            var method = methodProp.GetString();
+            if (method == null)
+            {
+                _logger.LogWarning("Received message from Roslyn with null method name, ignoring");
+                return;
+            }
             JsonElement? @params = root.TryGetProperty("params", out var p) ? p.Clone() : null;
 
             _logger.LogDebug("Received from Roslyn: {Method}", method);
@@ -240,7 +247,7 @@ public class RoslynClient : IAsyncDisposable
                 _logger.LogDebug("Received request from Roslyn: {Method} (id:{Id})", method, reqId);
 
                 // Handle workspace/configuration specially
-                if (method == "workspace/configuration")
+                if (method == LspMethods.WorkspaceConfiguration)
                 {
                     _logger.LogDebug("Handling workspace/configuration request");
                     var result = HandleWorkspaceConfiguration(@params);
@@ -249,7 +256,7 @@ public class RoslynClient : IAsyncDisposable
                 }
 
                 // Handle client/registerCapability - accept all registrations
-                if (method == "client/registerCapability")
+                if (method == LspMethods.ClientRegisterCapability)
                 {
                     _logger.LogDebug("Accepting client/registerCapability request");
                     await SendResponseAsync(reqIdElement, new { });
@@ -257,7 +264,7 @@ public class RoslynClient : IAsyncDisposable
                 }
 
                 // Handle client/unregisterCapability - accept all unregistrations
-                if (method == "client/unregisterCapability")
+                if (method == LspMethods.ClientUnregisterCapability)
                 {
                     _logger.LogDebug("Accepting client/unregisterCapability request");
                     await SendResponseAsync(reqIdElement, new { });

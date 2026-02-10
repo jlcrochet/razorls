@@ -55,6 +55,7 @@ public static class LspMethods
     public const string TextDocumentDiagnostic = "textDocument/diagnostic";
 
     // Workspace
+    public const string WorkspaceConfiguration = "workspace/configuration";
     public const string WorkspaceSymbol = "workspace/symbol";
     public const string WorkspaceSymbolResolve = "workspaceSymbol/resolve";
     public const string WorkspaceDidChangeConfiguration = "workspace/didChangeConfiguration";
@@ -62,6 +63,10 @@ public static class LspMethods
     public const string WorkspaceExecuteCommand = "workspace/executeCommand";
     public const string WorkspaceApplyEdit = "workspace/applyEdit";
     public const string WorkspaceDiagnostic = "workspace/diagnostic";
+
+    // Client
+    public const string ClientRegisterCapability = "client/registerCapability";
+    public const string ClientUnregisterCapability = "client/unregisterCapability";
 
     // Window
     public const string WindowShowMessage = "window/showMessage";

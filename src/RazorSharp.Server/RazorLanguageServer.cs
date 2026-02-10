@@ -1455,43 +1455,54 @@ public partial class RazorLanguageServer : IAsyncDisposable
         }
 
         List<int>? lineIndex = null;
-        foreach (var change in changes.EnumerateArray())
+        try
         {
-            if (!change.TryGetProperty("text", out var textProp))
+            foreach (var change in changes.EnumerateArray())
             {
-                return false;
+                if (!change.TryGetProperty("text", out var textProp))
+                {
+                    return false;
+                }
+
+                var newText = textProp.GetString() ?? string.Empty;
+
+                if (!change.TryGetProperty("range", out var rangeProp) || rangeProp.ValueKind == JsonValueKind.Null)
+                {
+                    updatedText = newText;
+                    continue;
+                }
+
+                if (!TryGetRange(rangeProp, out var startLine, out var startCharacter, out var endLine, out var endCharacter))
+                {
+                    return false;
+                }
+
+                lineIndex ??= BuildLineStartIndex(updatedText);
+                if (!TryGetOffset(updatedText, lineIndex, startLine, startCharacter, out var startOffset) ||
+                    !TryGetOffset(updatedText, lineIndex, endLine, endCharacter, out var endOffset))
+                {
+                    return false;
+                }
+
+                if (startOffset > endOffset || startOffset < 0 || endOffset > updatedText.Length)
+                {
+                    return false;
+                }
+
+                updatedText = ApplyTextChange(updatedText, startOffset, endOffset, newText);
+                ListPool<int>.Return(lineIndex);
+                lineIndex = null;
             }
 
-            var newText = textProp.GetString() ?? string.Empty;
-
-            if (!change.TryGetProperty("range", out var rangeProp) || rangeProp.ValueKind == JsonValueKind.Null)
-            {
-                updatedText = newText;
-                continue;
-            }
-
-            if (!TryGetRange(rangeProp, out var startLine, out var startCharacter, out var endLine, out var endCharacter))
-            {
-                return false;
-            }
-
-            lineIndex ??= BuildLineStartIndex(updatedText);
-            if (!TryGetOffset(updatedText, lineIndex, startLine, startCharacter, out var startOffset) ||
-                !TryGetOffset(updatedText, lineIndex, endLine, endCharacter, out var endOffset))
-            {
-                return false;
-            }
-
-            if (startOffset > endOffset || startOffset < 0 || endOffset > updatedText.Length)
-            {
-                return false;
-            }
-
-            updatedText = ApplyTextChange(updatedText, startOffset, endOffset, newText);
-            lineIndex = null;
+            return true;
         }
-
-        return true;
+        finally
+        {
+            if (lineIndex != null)
+            {
+                ListPool<int>.Return(lineIndex);
+            }
+        }
     }
 
     private static string ApplyTextChange(string text, int startOffset, int endOffset, string newText)
@@ -1541,7 +1552,9 @@ public partial class RazorLanguageServer : IAsyncDisposable
 
     private static List<int> BuildLineStartIndex(string text)
     {
-        var lineStarts = new List<int> { 0 };
+        var estimated = Math.Max(4, text.Length / 40);
+        var lineStarts = ListPool<int>.Rent(estimated);
+        lineStarts.Add(0);
         var index = 0;
         while (index < text.Length)
         {
@@ -3394,14 +3407,6 @@ public partial class RazorLanguageServer : IAsyncDisposable
                 _logger.LogDebug("Replaying {Count} buffered changes for {Uri}", pendingChanges.Count, openState.Uri);
                 foreach (var change in pendingChanges)
                 {
-                    lock (_documentTrackingLock)
-                    {
-                        if (!_openDocuments.Contains(openState.Uri))
-                        {
-                            return;
-                        }
-                    }
-
                     await SendRoslynNotificationAsync(LspMethods.TextDocumentDidChange, change);
                 }
             }

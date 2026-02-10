@@ -198,8 +198,9 @@ public class LspMessageParser : IDisposable
                 var doc = JsonDocument.Parse(jsonBytes.AsMemory(0, _contentLength));
                 message = new PooledJsonDocument(doc, jsonBytes);
             }
-            catch (JsonException)
+            catch (JsonException ex)
             {
+                _onMalformedHeader?.Invoke($"Failed to parse JSON content: {ex.Message}");
                 Pool.Return(jsonBytes);
             }
             catch

@@ -11,6 +11,7 @@ public sealed class ArrayPoolBufferWriter : IBufferWriter<byte>, IDisposable
 {
     const int DefaultInitialCapacity = 256;
     const int MaxRetainedBufferSize = 1024 * 1024;
+    const int MaxBufferSize = 256 * 1024 * 1024;
     static readonly ArrayPool<byte> Pool = ArrayPool<byte>.Shared;
 
     byte[] _buffer;
@@ -77,6 +78,11 @@ public sealed class ArrayPoolBufferWriter : IBufferWriter<byte>, IDisposable
         var newSize = _buffer.Length;
         var required = _written + sizeHint;
         while (newSize < required) newSize *= 2;
+
+        if (newSize > MaxBufferSize)
+        {
+            throw new InvalidOperationException($"Buffer growth would exceed maximum size of {MaxBufferSize} bytes (requested: {required}).");
+        }
 
         var newBuffer = Pool.Rent(newSize);
         _buffer.AsSpan(0, _written).CopyTo(newBuffer);
